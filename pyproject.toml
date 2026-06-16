@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mewcode"
+name = "newcode"
 version = "0.1.0"
-description = "Minimal terminal AI conversation loop for MewCode."
+description = "Minimal terminal AI conversation loop for Newcode."
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0.0",
@@ -18,7 +18,7 @@ test = [
 ]
 
 [project.scripts]
-mewcode = "mewcode.cli:main"
+newcode = "newcode.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

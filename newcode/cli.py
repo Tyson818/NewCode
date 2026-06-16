@@ -6,10 +6,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
-from mewcode.config import ConfigError, load_config, resolve_api_key
-from mewcode.providers.base import ChatProvider, ProviderError
-from mewcode.providers.deepseek import DeepSeekProvider
-from mewcode.session import ChatSession
+from newcode.config import ConfigError, load_config, resolve_api_key
+from newcode.providers.base import ChatProvider, ProviderError
+from newcode.providers.deepseek import DeepSeekProvider
+from newcode.session import ChatSession
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -17,7 +17,7 @@ EXIT_COMMANDS = {"/exit", "/quit", "exit"}
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="mewcode")
+    parser = argparse.ArgumentParser(prog="newcode")
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
@@ -47,7 +47,7 @@ def run_conversation(
     output: TextIO = sys.stdout,
     error_output: TextIO = sys.stderr,
 ) -> int:
-    print("MewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
+    print("Newcode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
 
     while True:
         try:
@@ -68,7 +68,7 @@ def run_conversation(
 
         session.add_user_message(text)
         chunks: list[str] = []
-        print("MewCode> ", end="", file=output, flush=True)
+        print("Newcode> ", end="", file=output, flush=True)
         try:
             for chunk in provider.stream_chat(session.messages):
                 chunks.append(chunk)

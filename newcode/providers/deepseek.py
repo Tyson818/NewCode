@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-from mewcode.config import AppConfig
-from mewcode.providers.base import ProviderError
-from mewcode.session import ChatMessage
+from newcode.config import AppConfig
+from newcode.providers.base import ProviderError
+from newcode.session import ChatMessage
 
 
 class DeepSeekProvider:

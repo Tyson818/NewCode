@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from typing import Protocol
 
-from mewcode.session import ChatMessage
+from newcode.session import ChatMessage
 
 
 class ProviderError(Exception):

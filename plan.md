@@ -1,7 +1,7 @@
-# MewCode Minimal Conversation Loop Plan
+# Newcode Minimal Conversation Loop Plan
 
 ## Architecture Overview
-MewCode 本阶段采用分层结构，保持纯对话闭环的最小范围：
+Newcode 本阶段采用分层结构，保持纯对话闭环的最小范围：
 
 - CLI 层负责终端启动、输入循环、退出处理、流式打印和中文错误展示。
 - Session 层负责维护当前进程内的多轮消息历史。
@@ -129,18 +129,18 @@ def run_conversation(provider: ChatProvider, session: ChatSession) -> int:
 
 ## Module Design
 
-### `mewcode.cli`
+### `newcode.cli`
 **Responsibility:** 程序入口和终端交互编排。
 
 **Public Interface:**
 - `main(argv: list[str] | None = None) -> int`
 - `run_conversation(provider: ChatProvider, session: ChatSession) -> int`
 
-**Dependencies:** `mewcode.config`、`mewcode.session`、`mewcode.providers.deepseek`、`mewcode.providers.base`
+**Dependencies:** `newcode.config`、`newcode.session`、`newcode.providers.deepseek`、`newcode.providers.base`
 
 **Spec Ownership:** F1、F2、F3、F5、F6、F7、F8
 
-### `mewcode.config`
+### `newcode.config`
 **Responsibility:** YAML 配置读取、默认值合并、配置校验、API Key 环境变量解析。
 
 **Public Interface:**
@@ -153,7 +153,7 @@ def run_conversation(provider: ChatProvider, session: ChatSession) -> int:
 
 **Spec Ownership:** F7、F9
 
-### `mewcode.session`
+### `newcode.session`
 **Responsibility:** 当前进程内的多轮会话历史管理。
 
 **Public Interface:**
@@ -167,7 +167,7 @@ def run_conversation(provider: ChatProvider, session: ChatSession) -> int:
 
 **Spec Ownership:** F4、F5
 
-### `mewcode.providers.base`
+### `newcode.providers.base`
 **Responsibility:** Provider 抽象接口和统一异常。
 
 **Public Interface:**
@@ -178,24 +178,24 @@ def run_conversation(provider: ChatProvider, session: ChatSession) -> int:
 
 **Spec Ownership:** F10
 
-### `mewcode.providers.deepseek`
+### `newcode.providers.deepseek`
 **Responsibility:** 使用 OpenAI SDK 调用 DeepSeek OpenAI-compatible Chat Completions，并提供流式文本片段。
 
 **Public Interface:**
 - `DeepSeekProvider(config: AppConfig, api_key: str)`
 - `DeepSeekProvider.stream_chat(messages: Sequence[ChatMessage]) -> Iterator[str]`
 
-**Dependencies:** `openai`、`mewcode.config`、`mewcode.session`、`mewcode.providers.base`
+**Dependencies:** `openai`、`newcode.config`、`newcode.session`、`newcode.providers.base`
 
 **Spec Ownership:** F2、F3、F8、F10
 
-### `mewcode.__main__`
-**Responsibility:** 支持 `python -m mewcode` 启动。
+### `newcode.__main__`
+**Responsibility:** 支持 `python -m newcode` 启动。
 
 **Public Interface:**
-- 调用 `mewcode.cli.main`
+- 调用 `newcode.cli.main`
 
-**Dependencies:** `mewcode.cli`
+**Dependencies:** `newcode.cli`
 
 **Spec Ownership:** F1
 
@@ -212,8 +212,8 @@ def run_conversation(provider: ChatProvider, session: ChatSession) -> int:
 
 ### Startup
 ```text
-python -m mewcode
-    -> mewcode.__main__
+python -m newcode
+    -> newcode.__main__
     -> cli.main
     -> config.load_config
     -> config.resolve_api_key
@@ -253,12 +253,12 @@ CLI 读取输入
 ## File Organization
 
 ```text
-mewcode/
+newcode/
 +-- pyproject.toml                  - 项目元数据、运行入口和依赖声明
 +-- config.yaml                     - 默认本地配置示例，不包含 API Key
-+-- mewcode/
++-- newcode/
 |   +-- __init__.py                 - 包标识和版本信息
-|   +-- __main__.py                 - python -m mewcode 入口
+|   +-- __main__.py                 - python -m newcode 入口
 |   +-- cli.py                      - 终端输入循环、流式打印和错误展示
 |   +-- config.py                   - YAML 配置加载和环境变量凭据读取
 |   +-- session.py                  - 会话历史和消息结构
@@ -282,7 +282,7 @@ mewcode/
 
 | Decision | Choice | Reason |
 |----------|--------|--------|
-| CLI 启动方式 | 支持 `python -m mewcode`，并在 `pyproject.toml` 中声明 `mewcode` 命令 | 兼顾未安装时的直接运行和后续正式命令入口 |
+| CLI 启动方式 | 支持 `python -m newcode`，并在 `pyproject.toml` 中声明 `newcode` 命令 | 兼顾未安装时的直接运行和后续正式命令入口 |
 | Provider 接口 | 使用同步 `Iterator[str]` 流式接口 | 终端最小闭环不需要异步运行时，测试和输出更直接 |
 | DeepSeek 调用 | 使用 OpenAI SDK 的 Chat Completions，配置 `api_key` 和 `base_url`，请求开启 `stream=True` | 满足 OpenAI-compatible 和 DeepSeek API 约定，保留未来 Provider 替换空间 |
 | 配置格式 | 使用 YAML，默认字段为 `model`、`base_url`、`api_key_env` | 符合 spec 对 YAML 配置的要求，字段最小 |
@@ -298,13 +298,13 @@ mewcode/
 
 | Requirement | Architectural Owner |
 |-------------|---------------------|
-| F1 | `mewcode.cli`、`mewcode.__main__` |
-| F2 | `mewcode.cli`、`mewcode.providers.deepseek` |
-| F3 | `mewcode.cli`、`mewcode.providers.deepseek` |
-| F4 | `mewcode.session` |
-| F5 | `mewcode.cli`、`mewcode.session` |
-| F6 | `mewcode.cli` |
-| F7 | `mewcode.config`、`mewcode.cli` |
-| F8 | `mewcode.providers.base`、`mewcode.providers.deepseek`、`mewcode.cli` |
-| F9 | `mewcode.config` |
-| F10 | `mewcode.providers.base`、`mewcode.providers.deepseek` |
+| F1 | `newcode.cli`、`newcode.__main__` |
+| F2 | `newcode.cli`、`newcode.providers.deepseek` |
+| F3 | `newcode.cli`、`newcode.providers.deepseek` |
+| F4 | `newcode.session` |
+| F5 | `newcode.cli`、`newcode.session` |
+| F6 | `newcode.cli` |
+| F7 | `newcode.config`、`newcode.cli` |
+| F8 | `newcode.providers.base`、`newcode.providers.deepseek`、`newcode.cli` |
+| F9 | `newcode.config` |
+| F10 | `newcode.providers.base`、`newcode.providers.deepseek` |

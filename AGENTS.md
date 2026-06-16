@@ -1,6 +1,6 @@
-# MewCode
+# Newcode
 
-我正在构建一个终端 AI 编程助手（类似 Claude Code），项目名叫 MewCode，使用 Python 实现。
+我正在构建一个终端 AI 编程助手（类似 Claude Code），项目名叫 Newcode，使用 Python 实现。
 
 ## 语言
 
@@ -33,9 +33,9 @@ python -m unittest discover
 
 如果本项目是终端应用，开发完功能后，用 tmux 做端到端测试：
 
-1. 在 tmux 中启动 MewCode
+1. 在 tmux 中启动 Newcode
 2. 输入一段真实的对话请求
-3. 观察 MewCode 是否正确调用工具、生成回复
+3. 观察 Newcode 是否正确调用工具、生成回复
 4. 对照 checklist.md 逐项验收
 
 如果当前环境不能使用 tmux，需要说明原因，并给出我可以手动执行的测试命令。

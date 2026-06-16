@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from mewcode.config import (
+from newcode.config import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
     AppConfig,

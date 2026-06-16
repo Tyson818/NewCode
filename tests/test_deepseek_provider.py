@@ -2,10 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from mewcode.config import AppConfig
-from mewcode.providers.base import ProviderError
-from mewcode.providers.deepseek import DeepSeekProvider
-from mewcode.session import ChatMessage
+from newcode.config import AppConfig
+from newcode.providers.base import ProviderError
+from newcode.providers.deepseek import DeepSeekProvider
+from newcode.session import ChatMessage
 
 
 class FakeCompletions:

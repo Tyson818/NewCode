@@ -2,9 +2,9 @@ from io import StringIO
 
 import pytest
 
-from mewcode import cli
-from mewcode.providers.base import ProviderError
-from mewcode.session import ChatSession
+from newcode import cli
+from newcode.providers.base import ProviderError
+from newcode.session import ChatSession
 
 
 class FakeProvider:
@@ -68,7 +68,7 @@ def test_empty_input_does_not_call_provider():
     assert code == 0
     assert provider.calls == []
     assert recorder.prompts == ["你> ", "你> ", "你> "]
-    assert "MewCode 已启动" in output
+    assert "Newcode 已启动" in output
 
 
 def test_eof_exits_cleanly():
@@ -98,7 +98,7 @@ def test_streaming_output_and_history_are_preserved():
     code, output, error, _ = run_with_inputs(provider, ["你好", "/exit"], session)
 
     assert code == 0
-    assert "MewCode> 你好" in output
+    assert "Newcode> 你好" in output
     assert error == ""
     assert [message.role for message in session.messages] == ["user", "assistant"]
     assert [message.content for message in session.messages] == ["你好", "你好"]

@@ -1,6 +1,6 @@
 import pytest
 
-from mewcode.session import ChatMessage, ChatSession
+from newcode.session import ChatMessage, ChatSession
 
 
 def test_session_starts_empty():
@@ -14,12 +14,12 @@ def test_session_keeps_messages_in_order():
     session = ChatSession()
 
     session.add_user_message("你好")
-    session.add_assistant_message("你好，我是 MewCode")
+    session.add_assistant_message("你好，我是 Newcode")
     session.add_user_message("继续")
 
     assert session.to_provider_messages() == [
         {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "你好，我是 MewCode"},
+        {"role": "assistant", "content": "你好，我是 Newcode"},
         {"role": "user", "content": "继续"},
     ]
 

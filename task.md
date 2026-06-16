@@ -1,4 +1,4 @@
-# MewCode Minimal Conversation Loop Tasks
+# Newcode Minimal Conversation Loop Tasks
 
 ## File List
 
@@ -6,14 +6,14 @@
 |--------|------|----------------|
 | Create | `pyproject.toml` | 声明项目元数据、运行入口、运行依赖和测试配置 |
 | Create | `config.yaml` | 提供默认 YAML 配置示例，不包含真实 API Key |
-| Create | `mewcode/__init__.py` | 标识 Python 包和基础版本信息 |
-| Create | `mewcode/__main__.py` | 支持 `python -m mewcode` 启动 |
-| Create | `mewcode/cli.py` | 终端输入循环、流式打印、退出和错误展示 |
-| Create | `mewcode/config.py` | YAML 配置加载、默认值合并、配置校验和环境变量凭据读取 |
-| Create | `mewcode/session.py` | 会话消息结构和多轮历史管理 |
-| Create | `mewcode/providers/__init__.py` | Provider 包导出 |
-| Create | `mewcode/providers/base.py` | Provider 协议和统一异常 |
-| Create | `mewcode/providers/deepseek.py` | DeepSeek OpenAI-compatible 流式 Provider |
+| Create | `newcode/__init__.py` | 标识 Python 包和基础版本信息 |
+| Create | `newcode/__main__.py` | 支持 `python -m newcode` 启动 |
+| Create | `newcode/cli.py` | 终端输入循环、流式打印、退出和错误展示 |
+| Create | `newcode/config.py` | YAML 配置加载、默认值合并、配置校验和环境变量凭据读取 |
+| Create | `newcode/session.py` | 会话消息结构和多轮历史管理 |
+| Create | `newcode/providers/__init__.py` | Provider 包导出 |
+| Create | `newcode/providers/base.py` | Provider 协议和统一异常 |
+| Create | `newcode/providers/deepseek.py` | DeepSeek OpenAI-compatible 流式 Provider |
 | Create | `tests/test_config.py` | 配置加载和凭据错误测试 |
 | Create | `tests/test_session.py` | 多轮消息历史测试 |
 | Create | `tests/test_cli.py` | CLI 输入循环、退出、错误和流式输出测试 |
@@ -21,7 +21,7 @@
 
 ## T1: 创建项目骨架和包入口占位
 
-**Files:** `pyproject.toml`, `mewcode/__init__.py`, `mewcode/__main__.py`, `mewcode/providers/__init__.py`
+**Files:** `pyproject.toml`, `newcode/__init__.py`, `newcode/__main__.py`, `newcode/providers/__init__.py`
 
 **Depends On:** None
 
@@ -32,7 +32,7 @@
 4. 明确声明测试依赖 `pytest`。
 5. 在 `__main__.py` 中保留调用 CLI 入口的最小结构。
 
-**Validation:** Run `python -m compileall mewcode`; expect all created package files compile without syntax errors.
+**Validation:** Run `python -m compileall newcode`; expect all created package files compile without syntax errors.
 
 ## T2: 创建默认 YAML 配置示例
 
@@ -51,7 +51,7 @@
 
 ## T3: 实现会话历史结构
 
-**Files:** `mewcode/session.py`, `tests/test_session.py`
+**Files:** `newcode/session.py`, `tests/test_session.py`
 
 **Depends On:** T1
 
@@ -66,7 +66,7 @@
 
 ## T4: 实现 Provider 基础接口
 
-**Files:** `mewcode/providers/base.py`, `mewcode/providers/__init__.py`
+**Files:** `newcode/providers/base.py`, `newcode/providers/__init__.py`
 
 **Depends On:** T1, T3
 
@@ -75,11 +75,11 @@
 2. 定义 `ProviderError`，用于统一模型服务层错误。
 3. 在 Provider 包中导出基础接口和异常。
 
-**Validation:** Run `python -m compileall mewcode/providers`; expect provider package compiles without syntax errors.
+**Validation:** Run `python -m compileall newcode/providers`; expect provider package compiles without syntax errors.
 
 ## T5: 实现配置加载和凭据解析
 
-**Files:** `mewcode/config.py`, `tests/test_config.py`
+**Files:** `newcode/config.py`, `tests/test_config.py`
 
 **Depends On:** T1, T2
 
@@ -95,7 +95,7 @@
 
 ## T6: 实现 DeepSeek Provider 流式调用
 
-**Files:** `mewcode/providers/deepseek.py`, `tests/test_deepseek_provider.py`
+**Files:** `newcode/providers/deepseek.py`, `tests/test_deepseek_provider.py`
 
 **Depends On:** T3, T4, T5
 
@@ -111,7 +111,7 @@
 
 ## T7: 实现 CLI 启动和配置错误路径
 
-**Files:** `mewcode/cli.py`, `mewcode/__main__.py`, `tests/test_cli.py`
+**Files:** `newcode/cli.py`, `newcode/__main__.py`, `tests/test_cli.py`
 
 **Depends On:** T4, T5, T6
 
@@ -119,14 +119,14 @@
 1. 实现 `main(argv=None)`，加载默认配置文件。
 2. 在启动时解析 API Key，并创建 DeepSeek Provider 和 ChatSession。
 3. 配置错误或凭据错误时打印中文错误并返回非零退出码。
-4. 确保 `python -m mewcode` 调用 `main()`。
+4. 确保 `python -m newcode` 调用 `main()`。
 5. 编写测试覆盖配置错误时不会创建 Provider 或发起请求。
 
 **Validation:** Run `python -m pytest tests/test_cli.py -k "config or startup"`; expect startup and config error tests pass.
 
 ## T8: 实现终端对话循环和退出处理
 
-**Files:** `mewcode/cli.py`, `tests/test_cli.py`
+**Files:** `newcode/cli.py`, `tests/test_cli.py`
 
 **Depends On:** T3, T4, T7
 
@@ -141,7 +141,7 @@
 
 ## T9: 实现流式打印和历史更新
 
-**Files:** `mewcode/cli.py`, `tests/test_cli.py`
+**Files:** `newcode/cli.py`, `tests/test_cli.py`
 
 **Depends On:** T3, T4, T8
 
@@ -156,7 +156,7 @@
 
 ## T10: 实现模型请求失败后的恢复
 
-**Files:** `mewcode/cli.py`, `tests/test_cli.py`
+**Files:** `newcode/cli.py`, `tests/test_cli.py`
 
 **Depends On:** T4, T8, T9
 
@@ -171,7 +171,7 @@
 
 ## T11: 运行全量自动化验证
 
-**Files:** `pyproject.toml`, `mewcode/**`, `tests/**`
+**Files:** `pyproject.toml`, `newcode/**`, `tests/**`
 
 **Depends On:** T1, T2, T3, T4, T5, T6, T7, T8, T9, T10
 
@@ -181,7 +181,7 @@
 3. 若 pytest 不可用，按项目规则改用 `python -m unittest discover` 并记录原因。
 4. 确认自动化测试不依赖真实 DeepSeek API Key 或网络。
 
-**Validation:** Run `python -m compileall mewcode` and `python -m pytest`; expect both commands pass.
+**Validation:** Run `python -m compileall newcode` and `python -m pytest`; expect both commands pass.
 
 ## Execution Order
 
