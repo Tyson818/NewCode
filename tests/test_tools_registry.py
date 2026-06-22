@@ -52,3 +52,36 @@ def test_registry_converts_to_openai_tools_schema():
             },
         }
     ]
+
+
+def test_run_command_schema_guides_windows_commands():
+    registry = create_default_registry()
+    tools = {
+        tool["function"]["name"]: tool["function"]
+        for tool in registry.to_openai_tools()
+    }
+
+    description = tools["run_command"]["description"]
+    command_description = tools["run_command"]["parameters"]["properties"]["command"]["description"]
+
+    assert "Windows" in description
+    assert "dir" in description
+    assert "Get-ChildItem" in description
+    assert "不要默认使用 ls" in description
+    assert "Windows" in command_description
+    assert "dir" in command_description
+
+
+def test_find_files_schema_guides_file_listing():
+    registry = create_default_registry()
+    tools = {
+        tool["function"]["name"]: tool["function"]
+        for tool in registry.to_openai_tools()
+    }
+
+    description = tools["find_files"]["description"]
+
+    assert "列出" in description
+    assert "查找" in description
+    assert "优先使用" in description
+    assert "而不是 shell 命令" in description

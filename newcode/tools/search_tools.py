@@ -12,7 +12,11 @@ class FindFilesTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="find_files",
-            description="在工作区内按 glob 模式查找文件。",
+            description=(
+                "用于列出/查找工作区文件，按 glob 模式返回匹配文件。"
+                "当用户要求列文件、查找文件、查看项目根目录文件时，优先使用该工具，"
+                "而不是 shell 命令。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {

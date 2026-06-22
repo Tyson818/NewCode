@@ -9,7 +9,7 @@ from typing import TextIO
 from newcode.config import ConfigError, load_config, resolve_api_key
 from newcode.providers.base import ChatProvider, ProviderError, ProviderEvent, TextDelta, ToolCallEvent
 from newcode.providers.deepseek import DeepSeekProvider
-from newcode.session import ChatSession
+from newcode.session import ChatMessage, ChatSession
 from newcode.tools.executor import execute_tool_call, make_failure_result
 from newcode.tools.registry import ToolRegistry, create_default_registry
 from newcode.tools.types import ToolCall, ToolContext, ToolResult
@@ -17,6 +17,11 @@ from newcode.tools.types import ToolCall, ToolContext, ToolResult
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
 EXIT_COMMANDS = {"/exit", "/quit", "exit"}
+FINAL_ANSWER_INSTRUCTION = (
+    "你现在处于最终回答阶段。工具已经执行完毕。"
+    "禁止再次调用工具，禁止输出 DSML/tool_calls 标记。"
+    "请只根据上一条 tool 消息中的工具执行结果，用自然语言回答用户。"
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,9 +115,13 @@ def run_conversation(
                 tool_context=tool_context,
             )
             try:
+                final_messages = [
+                    *session.messages,
+                    ChatMessage(role="user", content=FINAL_ANSWER_INSTRUCTION),
+                ]
                 final_response = _consume_provider_events(
                     provider.stream_chat(
-                        session.messages,
+                        final_messages,
                         tools=None,
                         allow_tool_calls=False,
                     ),
