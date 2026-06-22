@@ -1,222 +1,272 @@
-# Newcode Minimal Conversation Loop Tasks
+# NewCode Tool System Tasks
 
 ## File List
 
 | Action | File | Responsibility |
 |--------|------|----------------|
-| Create | `pyproject.toml` | 声明项目元数据、运行入口、运行依赖和测试配置 |
-| Create | `config.yaml` | 提供默认 YAML 配置示例，不包含真实 API Key |
-| Create | `newcode/__init__.py` | 标识 Python 包和基础版本信息 |
-| Create | `newcode/__main__.py` | 支持 `python -m newcode` 启动 |
-| Create | `newcode/cli.py` | 终端输入循环、流式打印、退出和错误展示 |
-| Create | `newcode/config.py` | YAML 配置加载、默认值合并、配置校验和环境变量凭据读取 |
-| Create | `newcode/session.py` | 会话消息结构和多轮历史管理 |
-| Create | `newcode/providers/__init__.py` | Provider 包导出 |
-| Create | `newcode/providers/base.py` | Provider 协议和统一异常 |
-| Create | `newcode/providers/deepseek.py` | DeepSeek OpenAI-compatible 流式 Provider |
-| Create | `tests/test_config.py` | 配置加载和凭据错误测试 |
-| Create | `tests/test_session.py` | 多轮消息历史测试 |
-| Create | `tests/test_cli.py` | CLI 输入循环、退出、错误和流式输出测试 |
-| Create | `tests/test_deepseek_provider.py` | DeepSeek Provider 请求参数和异常转换测试 |
+| Modify | `newcode/session.py` | 扩展消息结构，支持工具调用和工具结果历史 |
+| Modify | `newcode/providers/base.py` | 定义 Provider 事件和工具调用响应抽象 |
+| Modify | `newcode/providers/deepseek.py` | 支持 tools 参数和流式工具调用解析 |
+| Modify | `newcode/config.py` | 新增工具工作区和超时配置 |
+| Modify | `newcode/cli.py` | 编排一次工具调用、工具结果回灌和最终回复 |
+| Create | `newcode/tools/__init__.py` | 工具包导出 |
+| Create | `newcode/tools/types.py` | 工具通用类型和接口 |
+| Create | `newcode/tools/workspace.py` | 工作区路径解析和越界保护 |
+| Create | `newcode/tools/registry.py` | 工具注册中心和默认工具集合 |
+| Create | `newcode/tools/executor.py` | 工具执行、异常转换、敏感值遮蔽 |
+| Create | `newcode/tools/file_tools.py` | 读文件、写文件、原文替换工具 |
+| Create | `newcode/tools/search_tools.py` | 按模式找文件和搜代码内容 |
+| Create | `newcode/tools/command_tool.py` | 非交互式命令执行工具 |
+| Create | `tests/test_tools_file.py` | 文件工具测试 |
+| Create | `tests/test_tools_search.py` | 搜索工具测试 |
+| Create | `tests/test_tools_command.py` | 命令工具测试 |
+| Create | `tests/test_tools_registry.py` | 注册中心和 schema 测试 |
+| Create | `tests/test_tools_executor.py` | 执行器错误处理测试 |
+| Create | `tests/test_provider_tool_calls.py` | Provider 流式工具调用解析测试 |
+| Create | `tests/test_cli_tool_flow.py` | CLI 一次工具调用回灌测试 |
 
-## T1: 创建项目骨架和包入口占位
+## T1: 定义工具系统通用类型
 
-**Files:** `pyproject.toml`, `newcode/__init__.py`, `newcode/__main__.py`, `newcode/providers/__init__.py`
+**Files:** `newcode/tools/types.py`, `newcode/tools/__init__.py`
 
 **Depends On:** None
 
 **Steps:**
-1. 创建基础 Python 包目录和 Provider 子包目录。
-2. 在 `pyproject.toml` 中声明项目名、Python 版本要求、运行入口和依赖范围。
-3. 声明运行依赖 `openai` 和 `PyYAML`。
-4. 明确声明测试依赖 `pytest`。
-5. 在 `__main__.py` 中保留调用 CLI 入口的最小结构。
+1. 定义工具元信息、工具调用、工具结果、工具错误、工具上下文类型。
+2. 定义统一工具协议，包含元信息和执行方法。
+3. 确保工具结果可以稳定转换为 JSON 字符串。
+4. 在工具包入口导出核心类型。
 
-**Validation:** Run `python -m compileall newcode`; expect all created package files compile without syntax errors.
+**Validation:** Run `python -m compileall newcode/tools`; expect tools package compiles without syntax errors.
 
-## T2: 创建默认 YAML 配置示例
+## T2: 实现工作区路径保护
 
-**Files:** `config.yaml`
+**Files:** `newcode/tools/workspace.py`, `tests/test_tools_executor.py`
 
 **Depends On:** T1
 
 **Steps:**
-1. 添加默认 `model`、`base_url` 和 `api_key_env` 字段。
-2. 设置默认 `model` 为 `deepseek-chat`。
-3. 设置默认 `base_url` 为 `https://api.deepseek.com`。
-4. 设置默认 `api_key_env` 为 `DEEPSEEK_API_KEY`。
-5. 确认配置文件不包含真实 API Key。
+1. 实现工作区根目录解析。
+2. 实现用户路径到真实路径的解析。
+3. 阻止越过工作区根目录的路径。
+4. 默认阻止访问 `.git` 内部路径。
+5. 为正常路径、越界路径、`.git` 路径添加测试。
 
-**Validation:** Run `Select-String -Path config.yaml -Pattern "sk-|api_key:|DEEPSEEK_API_KEY"`; expect only `DEEPSEEK_API_KEY` appears and no literal API key field appears.
+**Validation:** Run `python -m pytest tests/test_tools_executor.py -k "workspace or path"`; expect path safety tests pass.
 
-## T3: 实现会话历史结构
+## T3: 实现文件工具
+
+**Files:** `newcode/tools/file_tools.py`, `tests/test_tools_file.py`
+
+**Depends On:** T1, T2
+
+**Steps:**
+1. 实现 `read_file` 工具，读取工作区内 UTF-8 文本文件。
+2. 实现 `write_file` 工具，创建父目录并写入 UTF-8 文本。
+3. 实现 `replace_in_file` 工具，按原文唯一匹配替换。
+4. 确保匹配零次或多次时不写文件并返回失败结果。
+5. 添加读取成功、文件不存在、写入成功、替换成功、替换零次、替换多次、越界路径测试。
+
+**Validation:** Run `python -m pytest tests/test_tools_file.py`; expect all file tool tests pass.
+
+## T4: 实现搜索工具
+
+**Files:** `newcode/tools/search_tools.py`, `tests/test_tools_search.py`
+
+**Depends On:** T1, T2
+
+**Steps:**
+1. 实现 `find_files`，按 glob 模式返回工作区内匹配文件。
+2. 实现 `search_code`，按文本查询返回文件、行号和匹配行。
+3. 默认跳过 `.git`、`.venv`、`__pycache__` 等目录。
+4. 限制返回结果数量，避免超大输出。
+5. 添加有匹配、无匹配、目录跳过、结果限制测试。
+
+**Validation:** Run `python -m pytest tests/test_tools_search.py`; expect all search tool tests pass.
+
+## T5: 实现命令执行工具
+
+**Files:** `newcode/tools/command_tool.py`, `tests/test_tools_command.py`
+
+**Depends On:** T1, T2
+
+**Steps:**
+1. 实现非交互式命令执行，工作目录固定为项目根目录。
+2. 捕获 exit code、stdout、stderr。
+3. 支持默认超时和参数指定超时。
+4. 超时返回结构化失败结果。
+5. 非零退出码返回 `command_failed`，并保留 stdout/stderr。
+6. 添加成功命令、失败命令、超时命令、空命令参数测试。
+
+**Validation:** Run `python -m pytest tests/test_tools_command.py`; expect all command tool tests pass.
+
+## T6: 实现工具注册中心
+
+**Files:** `newcode/tools/registry.py`, `tests/test_tools_registry.py`
+
+**Depends On:** T3, T4, T5
+
+**Steps:**
+1. 实现工具注册、按名查找和重复名称拒绝。
+2. 实现工具列表转 OpenAI-compatible tools schema。
+3. 实现默认注册中心，登记六个核心工具。
+4. 测试六个工具名称存在。
+5. 测试 schema 包含名称、描述和参数定义。
+
+**Validation:** Run `python -m pytest tests/test_tools_registry.py`; expect registry and schema tests pass.
+
+## T7: 实现统一工具执行器
+
+**Files:** `newcode/tools/executor.py`, `tests/test_tools_executor.py`
+
+**Depends On:** T1, T6
+
+**Steps:**
+1. 实现按工具名查找并执行工具调用。
+2. 未知工具返回 `unknown_tool`。
+3. 参数不合法返回 `invalid_arguments`。
+4. 捕获工具异常并返回 `execution_error`。
+5. 对结果中的敏感值做遮蔽。
+6. 确保成功和失败结果都可 JSON 序列化。
+
+**Validation:** Run `python -m pytest tests/test_tools_executor.py`; expect executor tests pass.
+
+## T8: 扩展会话消息结构
 
 **Files:** `newcode/session.py`, `tests/test_session.py`
 
 **Depends On:** T1
 
 **Steps:**
-1. 定义 `ChatMessage`，只允许当前阶段需要的 `user` 和 `assistant` 角色。
-2. 定义 `ChatSession`，按顺序保存当前进程内消息。
-3. 添加用户消息和助手消息追加行为。
-4. 添加转换为 Provider 请求消息的行为。
-5. 编写测试覆盖空初始历史、追加顺序和转换结果。
+1. 扩展消息角色支持 `tool`。
+2. 支持 assistant 工具调用消息。
+3. 支持 tool 结果消息。
+4. 保持原有 user / assistant 文本消息行为。
+5. 更新 provider 消息转换格式。
+6. 扩展现有会话测试，覆盖工具调用和工具结果。
 
-**Validation:** Run `python -m pytest tests/test_session.py`; expect all session tests pass.
+**Validation:** Run `python -m pytest tests/test_session.py`; expect original and tool session tests pass.
 
-## T4: 实现 Provider 基础接口
+## T9: 定义 Provider 事件模型
 
-**Files:** `newcode/providers/base.py`, `newcode/providers/__init__.py`
+**Files:** `newcode/providers/base.py`
 
-**Depends On:** T1, T3
+**Depends On:** T1, T8
 
 **Steps:**
-1. 定义 `ChatProvider` 协议，暴露同步 `stream_chat(...) -> Iterator[str]`。
-2. 定义 `ProviderError`，用于统一模型服务层错误。
-3. 在 Provider 包中导出基础接口和异常。
+1. 定义文本增量事件。
+2. 定义工具调用完成事件。
+3. 更新 Provider 协议支持 tools 和是否允许工具调用。
+4. 保持 ProviderError 行为不变。
 
-**Validation:** Run `python -m compileall newcode/providers`; expect provider package compiles without syntax errors.
+**Validation:** Run `python -m compileall newcode/providers`; expect providers package compiles.
 
-## T5: 实现配置加载和凭据解析
+## T10: 实现 DeepSeek 流式工具调用解析
+
+**Files:** `newcode/providers/deepseek.py`, `tests/test_provider_tool_calls.py`, `tests/test_deepseek_provider.py`
+
+**Depends On:** T8, T9
+
+**Steps:**
+1. 请求模型时支持传入 tools schema。
+2. 支持不允许工具调用的最终回复请求。
+3. 解析普通 `delta.content` 为文本增量事件。
+4. 解析并拼接 `delta.tool_calls` 中的名称和参数碎片。
+5. 在流结束后输出完整工具调用事件。
+6. JSON 参数解析失败时返回可识别错误事件。
+7. 更新原有 Provider 测试适配事件模型。
+
+**Validation:** Run `python -m pytest tests/test_provider_tool_calls.py tests/test_deepseek_provider.py`; expect provider tests pass without network requests.
+
+## T11: 扩展配置加载
 
 **Files:** `newcode/config.py`, `tests/test_config.py`
 
-**Depends On:** T1, T2
+**Depends On:** T1
 
 **Steps:**
-1. 定义 `AppConfig` 和 `ConfigError`。
-2. 实现从 YAML 文件读取配置。
-3. 合并默认 `base_url` 和 `api_key_env`。
-4. 校验 `model`、`base_url`、`api_key_env` 必须非空且类型正确。
-5. 实现只从指定环境变量读取 API Key。
-6. 编写测试覆盖正常配置、缺失文件、无效字段、缺失环境变量和空环境变量。
+1. 新增可选 `workspace_root` 配置。
+2. 新增可选 `tool_timeout_seconds` 配置。
+3. 新增可选 `command_timeout_seconds` 配置。
+4. 为缺省值、合法值、非法类型和非法数值添加测试。
+5. 保持 API Key 只从环境变量读取。
 
-**Validation:** Run `python -m pytest tests/test_config.py`; expect all config tests pass.
+**Validation:** Run `python -m pytest tests/test_config.py`; expect config tests pass.
 
-## T6: 实现 DeepSeek Provider 流式调用
+## T12: 实现 CLI 工具调用编排
 
-**Files:** `newcode/providers/deepseek.py`, `tests/test_deepseek_provider.py`
+**Files:** `newcode/cli.py`, `tests/test_cli_tool_flow.py`, `tests/test_cli.py`
 
-**Depends On:** T3, T4, T5
-
-**Steps:**
-1. 使用 `AppConfig` 和 API Key 初始化 OpenAI SDK 客户端。
-2. 将 `ChatMessage` 历史转换为 OpenAI-compatible Chat Completions 消息。
-3. 使用配置中的模型名和服务地址发起 `stream=True` 请求。
-4. 从流式响应中提取非空文本片段并逐个 yield。
-5. 将 SDK 或网络异常转换为 `ProviderError`。
-6. 编写测试通过 mock 验证请求参数、流式片段输出和异常转换。
-
-**Validation:** Run `python -m pytest tests/test_deepseek_provider.py`; expect all DeepSeek Provider tests pass without real network requests.
-
-## T7: 实现 CLI 启动和配置错误路径
-
-**Files:** `newcode/cli.py`, `newcode/__main__.py`, `tests/test_cli.py`
-
-**Depends On:** T4, T5, T6
+**Depends On:** T6, T7, T8, T10, T11
 
 **Steps:**
-1. 实现 `main(argv=None)`，加载默认配置文件。
-2. 在启动时解析 API Key，并创建 DeepSeek Provider 和 ChatSession。
-3. 配置错误或凭据错误时打印中文错误并返回非零退出码。
-4. 确保 `python -m newcode` 调用 `main()`。
-5. 编写测试覆盖配置错误时不会创建 Provider 或发起请求。
+1. 启动时创建默认工具注册中心和工具上下文。
+2. 用户输入后，第一次模型请求传入工具列表并允许工具调用。
+3. 如果只收到文本增量，保持原流式输出和历史追加行为。
+4. 如果收到一个工具调用，执行工具并追加 assistant tool call 和 tool result。
+5. 工具结果回灌后发起第二次模型请求，禁止继续工具调用。
+6. 如果收到多个工具调用，生成结构化失败工具结果并进入最终回复请求。
+7. 如果最终回复继续请求工具，不继续执行，并给出清楚错误。
+8. 保持 ProviderError 后可恢复。
 
-**Validation:** Run `python -m pytest tests/test_cli.py -k "config or startup"`; expect startup and config error tests pass.
+**Validation:** Run `python -m pytest tests/test_cli_tool_flow.py tests/test_cli.py`; expect CLI tool flow and v0.1 CLI tests pass.
 
-## T8: 实现终端对话循环和退出处理
+## T13: 增加越界与敏感信息回归测试
 
-**Files:** `newcode/cli.py`, `tests/test_cli.py`
+**Files:** `tests/test_tools_executor.py`, `tests/test_cli_tool_flow.py`
 
-**Depends On:** T3, T4, T7
-
-**Steps:**
-1. 实现启动提示和输入提示。
-2. 忽略空白输入并重新提示。
-3. 支持 `/exit`、`/quit` 和 `exit` 结束会话。
-4. 处理 EOF 和键盘中断并干净退出。
-5. 编写测试覆盖普通退出、空输入、EOF 和键盘中断。
-
-**Validation:** Run `python -m pytest tests/test_cli.py -k "exit or empty or eof or interrupt"`; expect loop control tests pass.
-
-## T9: 实现流式打印和历史更新
-
-**Files:** `newcode/cli.py`, `tests/test_cli.py`
-
-**Depends On:** T3, T4, T8
+**Depends On:** T7, T12
 
 **Steps:**
-1. 用户输入非空消息后追加到会话历史。
-2. 调用 Provider 并将每个文本片段立即打印到终端。
-3. 收集完整助手回复，并在成功结束后追加到会话历史。
-4. 一轮结束后打印清晰换行并回到下一轮输入提示。
-5. 编写测试使用假 Provider 验证流式片段顺序、flush 行为和历史内容。
+1. 测试工具结果不会包含配置的 API Key 明文。
+2. 测试文件工具不能读取工作区外文件。
+3. 测试命令工具输出中的敏感值被遮蔽。
+4. 测试工具异常不会导致 CLI 崩溃。
 
-**Validation:** Run `python -m pytest tests/test_cli.py -k "stream or history"`; expect streaming and history tests pass.
+**Validation:** Run `python -m pytest tests/test_tools_executor.py tests/test_cli_tool_flow.py -k "sensitive or outside or crash"`; expect safety regression tests pass.
 
-## T10: 实现模型请求失败后的恢复
+## T14: 运行全量自动化验证
 
-**Files:** `newcode/cli.py`, `tests/test_cli.py`
+**Files:** `newcode/**`, `tests/**`
 
-**Depends On:** T4, T8, T9
-
-**Steps:**
-1. 捕获 Provider 抛出的 `ProviderError`。
-2. 以中文展示错误，不输出 API Key 或敏感底层信息。
-3. 请求失败时不追加助手消息。
-4. 错误后回到下一轮输入提示，允许用户继续输入或退出。
-5. 编写测试覆盖失败恢复和历史不污染。
-
-**Validation:** Run `python -m pytest tests/test_cli.py -k "provider_error or recover"`; expect provider failure recovery tests pass.
-
-## T11: 运行全量自动化验证
-
-**Files:** `pyproject.toml`, `newcode/**`, `tests/**`
-
-**Depends On:** T1, T2, T3, T4, T5, T6, T7, T8, T9, T10
+**Depends On:** T1-T13
 
 **Steps:**
 1. 运行 Python 语法编译检查。
-2. 运行完整 pytest 测试套件。
-3. 若 pytest 不可用，按项目规则改用 `python -m unittest discover` 并记录原因。
-4. 确认自动化测试不依赖真实 DeepSeek API Key 或网络。
+2. 运行完整 pytest。
+3. 确认测试不需要真实 DeepSeek API Key。
+4. 如果 pytest 不可用，按项目规则记录原因并运行 unittest fallback。
 
-**Validation:** Run `python -m compileall newcode` and `python -m pytest`; expect both commands pass.
+**Validation:** Run `python -m compileall newcode` and `python -m pytest`; expect both pass.
+
+## T15: 端到端手动验证
+
+**Files:** runtime behavior
+
+**Depends On:** T14
+
+**Steps:**
+1. 检查当前环境是否可用 tmux。
+2. 如果可用，在 tmux 中启动 `python -m newcode`。
+3. 输入一个读取项目文件的请求，观察是否触发工具并基于结果回复。
+4. 输入一个修改文件请求，观察是否按唯一匹配策略处理。
+5. 输入 `/exit`，确认干净退出。
+6. 如果当前环境不能使用 tmux，记录原因并给出手动测试命令。
+
+**Validation:** Run `tmux -V`; if available run the documented tmux scenario, otherwise provide manual commands and limitation reason.
 
 ## Execution Order
 
 ```text
-T1 -> T2 -> T5 ----\
- |      \           \
- |       -> T3 -> T4 -> T6 -> T7 -> T8 -> T9 -> T10 -> T11
- |                  /
- +-----------------/
+T1
+ |
+T2 --------\
+ |          \
+T3           \
+T4            -> T6 -> T7 ----\
+T5 ---------/                  \
+                                -> T12 -> T13 -> T14 -> T15
+T8 -> T9 -> T10 ---------------/
+ |
+T11 ---------------------------/
 ```
-
-## Traceability
-
-| Plan Component | Tasks |
-|----------------|-------|
-| Project packaging and startup | T1, T7, T11 |
-| YAML configuration and API Key resolution | T2, T5, T7 |
-| Session history | T3, T9 |
-| Provider abstraction | T4 |
-| DeepSeek OpenAI-compatible Provider | T6 |
-| CLI conversation loop | T7, T8, T9, T10 |
-| Automated tests | T3, T5, T6, T7, T8, T9, T10, T11 |
-
-## Acceptance Coverage Preview
-
-| Spec Acceptance | Covered By |
-|-----------------|------------|
-| AC1 | T7, T8, T11 |
-| AC2 | T6, T9, T11 |
-| AC3 | T6, T9, T11 |
-| AC4 | T3, T9, T11 |
-| AC5 | T8, T9, T11 |
-| AC6 | T8, T11 |
-| AC7 | T5, T7, T11 |
-| AC8 | T10, T11 |
-| AC9 | T2, T5, T7, T11 |
-| AC10 | T4, T6, T9, T11 |
-| AC11 | T11 and the later `checklist.md` end-to-end checks |

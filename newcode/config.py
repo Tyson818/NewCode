@@ -10,6 +10,9 @@ import yaml
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEFAULT_WORKSPACE_ROOT = "."
+DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
 
 
 class ConfigError(Exception):
@@ -21,6 +24,9 @@ class AppConfig:
     model: str
     base_url: str = DEFAULT_BASE_URL
     api_key_env: str = DEFAULT_API_KEY_ENV
+    workspace_root: str = DEFAULT_WORKSPACE_ROOT
+    tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS
+    command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS
 
 
 def load_config(path: Path) -> AppConfig:
@@ -43,11 +49,29 @@ def load_config(path: Path) -> AppConfig:
     model = raw.get("model")
     base_url = raw.get("base_url", DEFAULT_BASE_URL)
     api_key_env = raw.get("api_key_env", DEFAULT_API_KEY_ENV)
+    workspace_root = raw.get("workspace_root", DEFAULT_WORKSPACE_ROOT)
+    tool_timeout_seconds = raw.get(
+        "tool_timeout_seconds",
+        DEFAULT_TOOL_TIMEOUT_SECONDS,
+    )
+    command_timeout_seconds = raw.get(
+        "command_timeout_seconds",
+        DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    )
 
     return AppConfig(
         model=_require_non_empty_string(model, "model"),
         base_url=_require_non_empty_string(base_url, "base_url"),
         api_key_env=_require_non_empty_string(api_key_env, "api_key_env"),
+        workspace_root=_require_non_empty_string(workspace_root, "workspace_root"),
+        tool_timeout_seconds=_require_positive_number(
+            tool_timeout_seconds,
+            "tool_timeout_seconds",
+        ),
+        command_timeout_seconds=_require_positive_number(
+            command_timeout_seconds,
+            "command_timeout_seconds",
+        ),
     )
 
 
@@ -63,3 +87,9 @@ def _require_non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"配置项 {field_name} 必须是非空字符串")
     return value.strip()
+
+
+def _require_positive_number(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ConfigError(f"配置项 {field_name} 必须是正数")
+    return float(value)

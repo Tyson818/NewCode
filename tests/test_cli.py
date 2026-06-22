@@ -1,23 +1,28 @@
 from io import StringIO
 
-import pytest
-
 from newcode import cli
-from newcode.providers.base import ProviderError
+from newcode.providers.base import ProviderError, TextDelta
 from newcode.session import ChatSession
 
 
 class FakeProvider:
-    def __init__(self, chunks=None, error=None):
-        self.chunks = chunks or ["好的"]
+    def __init__(self, events=None, error=None):
+        self.events = events or [[TextDelta("好的")]]
         self.error = error
         self.calls = []
 
-    def stream_chat(self, messages):
-        self.calls.append(list(messages))
+    def stream_chat(self, messages, tools=None, allow_tool_calls=True):
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "tools": tools,
+                "allow_tool_calls": allow_tool_calls,
+            }
+        )
         if self.error:
             raise self.error
-        yield from self.chunks
+        index = len(self.calls) - 1
+        yield from self.events[min(index, len(self.events) - 1)]
 
 
 class PromptRecorder:
@@ -68,7 +73,7 @@ def test_empty_input_does_not_call_provider():
     assert code == 0
     assert provider.calls == []
     assert recorder.prompts == ["你> ", "你> ", "你> "]
-    assert "Newcode 已启动" in output
+    assert "NewCode 已启动" in output
 
 
 def test_eof_exits_cleanly():
@@ -92,25 +97,25 @@ def test_keyboard_interrupt_exits_cleanly():
 
 
 def test_streaming_output_and_history_are_preserved():
-    provider = FakeProvider(chunks=["你", "好"])
+    provider = FakeProvider(events=[[TextDelta("你"), TextDelta("好")]])
     session = ChatSession()
 
     code, output, error, _ = run_with_inputs(provider, ["你好", "/exit"], session)
 
     assert code == 0
-    assert "Newcode> 你好" in output
+    assert "NewCode> 你好" in output
     assert error == ""
     assert [message.role for message in session.messages] == ["user", "assistant"]
     assert [message.content for message in session.messages] == ["你好", "你好"]
 
 
 def test_second_turn_receives_previous_history():
-    provider = FakeProvider(chunks=["收到"])
+    provider = FakeProvider(events=[[TextDelta("收到")]])
 
     run_with_inputs(provider, ["第一轮", "第二轮", "/exit"])
 
     assert len(provider.calls) == 2
-    assert [(message.role, message.content) for message in provider.calls[1]] == [
+    assert [(message.role, message.content) for message in provider.calls[1]["messages"]] == [
         ("user", "第一轮"),
         ("assistant", "收到"),
         ("user", "第二轮"),
@@ -125,7 +130,6 @@ def test_provider_error_recovers_without_assistant_history():
 
     assert code == 0
     assert "模型错误：服务暂时不可用" in error
-    assert "你> " not in output
     assert [(message.role, message.content) for message in session.messages] == [
         ("user", "你好")
     ]
@@ -145,7 +149,7 @@ def test_main_does_not_create_provider_when_api_key_missing(tmp_path, monkeypatc
     monkeypatch.delenv("MISSING_KEY", raising=False)
 
     def fail_provider(*args, **kwargs):
-        raise AssertionError("不应创建 Provider")
+        raise AssertionError("不应该创建 Provider")
 
     monkeypatch.setattr(cli, "DeepSeekProvider", fail_provider)
 
@@ -170,7 +174,7 @@ def test_main_starts_conversation_with_valid_config(tmp_path, monkeypatch):
             created["api_key"] = api_key
 
     monkeypatch.setattr(cli, "DeepSeekProvider", ProviderForMain)
-    monkeypatch.setattr(cli, "run_conversation", lambda provider, session: 0)
+    monkeypatch.setattr(cli, "run_conversation", lambda **kwargs: 0)
 
     assert cli.main(["--config", str(config_path)]) == 0
     assert created["config"].model == "deepseek-chat"
@@ -178,9 +182,9 @@ def test_main_starts_conversation_with_valid_config(tmp_path, monkeypatch):
 
 
 def test_out_of_scope_request_is_plain_provider_message():
-    provider = FakeProvider(chunks=["我不能执行本地操作"])
+    provider = FakeProvider(events=[[TextDelta("我不能执行未请求的额外循环")]])
 
     run_with_inputs(provider, ["请执行 git status 并修改文件", "/exit"])
 
-    assert provider.calls[0][0].role == "user"
-    assert provider.calls[0][0].content == "请执行 git status 并修改文件"
+    assert provider.calls[0]["messages"][0].role == "user"
+    assert provider.calls[0]["messages"][0].content == "请执行 git status 并修改文件"

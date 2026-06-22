@@ -5,6 +5,8 @@ import pytest
 from newcode.config import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
+    DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    DEFAULT_TOOL_TIMEOUT_SECONDS,
     AppConfig,
     ConfigError,
     load_config,
@@ -20,13 +22,25 @@ def write_config(path: Path, text: str) -> Path:
 def test_load_config_reads_valid_yaml(tmp_path):
     config_path = write_config(
         tmp_path / "config.yaml",
-        "model: deepseek-chat\nbase_url: https://api.deepseek.com\napi_key_env: DEEPSEEK_API_KEY\n",
+        "\n".join(
+            [
+                "model: deepseek-chat",
+                "base_url: https://api.deepseek.com",
+                "api_key_env: DEEPSEEK_API_KEY",
+                "workspace_root: .",
+                "tool_timeout_seconds: 10",
+                "command_timeout_seconds: 20",
+            ]
+        ),
     )
 
     assert load_config(config_path) == AppConfig(
         model="deepseek-chat",
         base_url="https://api.deepseek.com",
         api_key_env="DEEPSEEK_API_KEY",
+        workspace_root=".",
+        tool_timeout_seconds=10.0,
+        command_timeout_seconds=20.0,
     )
 
 
@@ -37,6 +51,9 @@ def test_load_config_applies_defaults(tmp_path):
 
     assert config.base_url == DEFAULT_BASE_URL
     assert config.api_key_env == DEFAULT_API_KEY_ENV
+    assert config.workspace_root == "."
+    assert config.tool_timeout_seconds == DEFAULT_TOOL_TIMEOUT_SECONDS
+    assert config.command_timeout_seconds == DEFAULT_COMMAND_TIMEOUT_SECONDS
 
 
 def test_load_config_rejects_missing_file(tmp_path):
@@ -52,6 +69,9 @@ def test_load_config_rejects_missing_file(tmp_path):
         "model: 123\n",
         "model: deepseek-chat\nbase_url: ''\n",
         "model: deepseek-chat\napi_key_env: []\n",
+        "model: deepseek-chat\nworkspace_root: []\n",
+        "model: deepseek-chat\ntool_timeout_seconds: 0\n",
+        "model: deepseek-chat\ncommand_timeout_seconds: no\n",
         "- model\n- deepseek-chat\n",
     ],
 )
