@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from .command_tool import RunCommandTool
 from .file_tools import ReadFileTool, ReplaceInFileTool, WriteFileTool
 from .search_tools import FindFilesTool, SearchCodeTool
 from .types import Tool
+
+
+READ_ONLY_TOOLS = frozenset({"read_file", "find_files", "search_code"})
+SIDE_EFFECT_TOOLS = frozenset({"write_file", "replace_in_file", "run_command"})
 
 
 class ToolRegistry:
@@ -22,7 +28,17 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools)
 
-    def to_openai_tools(self) -> list[dict[str, object]]:
+    def is_read_only(self, name: str) -> bool:
+        return name in READ_ONLY_TOOLS
+
+    def has_side_effects(self, name: str) -> bool:
+        return name in SIDE_EFFECT_TOOLS
+
+    def to_openai_tools(
+        self,
+        tool_names: Iterable[str] | None = None,
+    ) -> list[dict[str, object]]:
+        allowed_names = set(tool_names) if tool_names is not None else None
         return [
             {
                 "type": "function",
@@ -33,6 +49,7 @@ class ToolRegistry:
                 },
             }
             for tool in self._tools.values()
+            if allowed_names is None or tool.spec.name in allowed_names
         ]
 
 

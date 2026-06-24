@@ -54,6 +54,10 @@ def run_with_inputs(provider, values, session=None):
     return code, output.getvalue(), error.getvalue(), recorder
 
 
+def non_system_messages(messages):
+    return [message for message in messages if message.role != "system"]
+
+
 def test_exit_commands_end_session():
     for command in ("/exit", "/quit", "exit"):
         provider = FakeProvider()
@@ -115,7 +119,7 @@ def test_second_turn_receives_previous_history():
     run_with_inputs(provider, ["第一轮", "第二轮", "/exit"])
 
     assert len(provider.calls) == 2
-    assert [(message.role, message.content) for message in provider.calls[1]["messages"]] == [
+    assert [(message.role, message.content) for message in non_system_messages(provider.calls[1]["messages"])] == [
         ("user", "第一轮"),
         ("assistant", "收到"),
         ("user", "第二轮"),
@@ -186,5 +190,6 @@ def test_out_of_scope_request_is_plain_provider_message():
 
     run_with_inputs(provider, ["请执行 git status 并修改文件", "/exit"])
 
-    assert provider.calls[0]["messages"][0].role == "user"
-    assert provider.calls[0]["messages"][0].content == "请执行 git status 并修改文件"
+    messages = non_system_messages(provider.calls[0]["messages"])
+    assert messages[0].role == "user"
+    assert messages[0].content == "请执行 git status 并修改文件"

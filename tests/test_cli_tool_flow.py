@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from io import StringIO
 from types import SimpleNamespace
 import sys
@@ -6,7 +8,6 @@ from newcode import cli
 from newcode.config import AppConfig
 from newcode.providers.base import TextDelta, ToolCallEvent
 from newcode.providers.deepseek import (
-    DISALLOWED_TOOL_CALL_TEXT,
     DSML_TOOL_CALLS_END,
     DSML_TOOL_CALLS_START,
     DeepSeekProvider,
@@ -29,7 +30,7 @@ class FakeProvider:
                 "allow_tool_calls": allow_tool_calls,
             }
         )
-        yield from self.event_batches[len(self.calls) - 1]
+        yield from self.event_batches[min(len(self.calls) - 1, len(self.event_batches) - 1)]
 
 
 class PromptRecorder:
@@ -42,7 +43,7 @@ class PromptRecorder:
         return self.values.pop(0)
 
 
-def run_flow(provider, tmp_path):
+def run_flow(provider, tmp_path, prompt="读文件"):
     output = StringIO()
     error = StringIO()
     session = ChatSession()
@@ -51,7 +52,7 @@ def run_flow(provider, tmp_path):
         session,
         registry=create_default_registry(),
         tool_context=ToolContext(workspace_root=tmp_path, sensitive_values=("secret-value",)),
-        input_func=PromptRecorder(["读文件", "/exit"]),
+        input_func=PromptRecorder([prompt, "/exit"]),
         output=output,
         error_output=error,
     )
@@ -85,9 +86,8 @@ def test_cli_executes_one_tool_call_and_feeds_result_back(tmp_path):
     assert "读到了文件内容" in output
     assert provider.calls[0]["tools"]
     assert provider.calls[0]["allow_tool_calls"] is True
-    assert provider.calls[1]["tools"] is None
-    assert provider.calls[1]["allow_tool_calls"] is False
-    assert_final_answer_instruction(provider.calls[1]["messages"][-1])
+    assert provider.calls[1]["tools"]
+    assert provider.calls[1]["allow_tool_calls"] is True
     assert [message.role for message in session.messages] == [
         "user",
         "assistant",
@@ -97,10 +97,7 @@ def test_cli_executes_one_tool_call_and_feeds_result_back(tmp_path):
     assert "文件内容" in session.messages[2].content
 
 
-    assert all(cli.FINAL_ANSWER_INSTRUCTION != message.content for message in session.messages)
-
-
-def test_cli_returns_failure_for_multiple_tool_calls_without_executing_both(tmp_path):
+def test_cli_executes_multiple_tool_calls_without_old_single_tool_limit(tmp_path):
     (tmp_path / "a.txt").write_text("A", encoding="utf-8")
     (tmp_path / "b.txt").write_text("B", encoding="utf-8")
     provider = FakeProvider(
@@ -113,52 +110,41 @@ def test_cli_returns_failure_for_multiple_tool_calls_without_executing_both(tmp_
                     ]
                 )
             ],
-            [TextDelta("本阶段不能一次执行多个工具")],
+            [TextDelta("两个文件都读完了")],
         ]
     )
 
     _, output, _, session = run_flow(provider, tmp_path)
 
-    assert "本阶段不能一次执行多个工具" in output
-    assert "multiple_tool_calls_not_supported" in session.messages[2].content
-    assert "multiple_tool_calls_not_supported" in session.messages[3].content
-    assert "A" not in session.messages[2].content
-    assert "B" not in session.messages[3].content
+    assert "两个文件都读完了" in output
+    assert "multiple_tool_calls_not_supported" not in session.messages[2].content
+    assert "A" in session.messages[2].content
+    assert "B" in session.messages[3].content
 
 
-def test_cli_does_not_loop_when_final_response_requests_tool(tmp_path):
+def test_cli_stops_instead_of_looping_forever_when_model_keeps_requesting_tools(tmp_path):
+    (tmp_path / "a.txt").write_text("ok", encoding="utf-8")
     provider = FakeProvider(
         [
             [
                 ToolCallEvent(
                     [
                         ToolCall(
-                            id="call_1",
+                            id=f"call_{index}",
                             name="read_file",
-                            arguments={"path": "missing.txt"},
-                            raw_arguments='{"path": "missing.txt"}',
+                            arguments={"path": "a.txt"},
                         )
                     ]
                 )
-            ],
-            [
-                ToolCallEvent(
-                    [
-                        ToolCall(
-                            id="call_2",
-                            name="read_file",
-                            arguments={"path": "again.txt"},
-                        )
-                    ]
-                )
-            ],
+            ]
+            for index in range(1, 10)
         ]
     )
 
     _, output, _, _ = run_flow(provider, tmp_path)
 
-    assert len(provider.calls) == 2
-    assert "本阶段不会继续执行" in output
+    assert len(provider.calls) == 8
+    assert "已达到最大迭代次数" in output
 
 
 def test_cli_masks_sensitive_tool_result(tmp_path):
@@ -193,7 +179,7 @@ class FakeCompletions:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return self.streams[len(self.calls) - 1]
+        return self.streams[min(len(self.calls) - 1, len(self.streams) - 1)]
 
 
 class FakeClient:
@@ -211,25 +197,57 @@ def content_chunk(content):
     )
 
 
-def assert_final_answer_instruction(message):
-    content = message["content"] if isinstance(message, dict) else message.content
-    role = message["role"] if isinstance(message, dict) else message.role
-    assert role == "user"
-    assert "最终回答阶段" in content
-    assert "禁止再次调用工具" in content
-    assert "禁止输出 DSML/tool_calls" in content
-    assert "自然语言回答" in content
+def provider_tool_messages(messages):
+    return [message for message in messages if message["role"] == "tool"]
+
+
+def dsml_tag(name: str, closing: bool = False) -> str:
+    tag = DSML_TOOL_CALLS_START
+    tag = tag.replace("tool_calls", name)
+    if closing:
+        tag = tag.replace("<", "</", 1)
+    return tag
+
+
+def dsml_invoke_start(name: str) -> str:
+    return dsml_tag(f'invoke name="{name}"')
+
+
+def dsml_parameter(name: str, value: str, *, is_string: bool = True) -> str:
+    string_value = "true" if is_string else "false"
+    tag_name = f'parameter name="{name}" string="{string_value}"'
+    return (
+        f"{dsml_tag(tag_name)}"
+        f"{value}"
+        f"{dsml_tag('parameter', closing=True)}"
+    )
+
+
+def run_deepseek_flow(provider, tmp_path):
+    output = StringIO()
+    error = StringIO()
+    session = ChatSession()
+    code = cli.run_conversation(
+        provider,
+        session,
+        registry=create_default_registry(),
+        tool_context=ToolContext(workspace_root=tmp_path),
+        input_func=PromptRecorder(["请使用工具列出当前项目根目录下的文件。", "/exit"]),
+        output=output,
+        error_output=error,
+    )
+    return code, output.getvalue(), error.getvalue(), session
 
 
 def test_cli_parses_deepseek_dsml_runs_command_and_hides_dsml(tmp_path):
     command = f'"{sys.executable}" -c "print(\'tool-ok\')"'
     dsml = (
-        "<｜｜DSML｜｜tool_calls>"
-        '<｜｜DSML｜｜invoke name="run_command">'
-        f'<｜｜DSML｜｜parameter name="command" string="true">{command}</｜｜DSML｜｜parameter>'
-        '<｜｜DSML｜｜parameter name="timeout_seconds" string="false">10</｜｜DSML｜｜parameter>'
-        "</｜｜DSML｜｜invoke>"
-        "</｜｜DSML｜｜tool_calls>"
+        f"{DSML_TOOL_CALLS_START}"
+        f"{dsml_invoke_start('run_command')}"
+        f"{dsml_parameter('command', command)}"
+        f"{dsml_parameter('timeout_seconds', '10', is_string=False)}"
+        f"{dsml_tag('invoke', closing=True)}"
+        f"{DSML_TOOL_CALLS_END}"
     )
     completions = FakeCompletions(
         [
@@ -242,41 +260,28 @@ def test_cli_parses_deepseek_dsml_runs_command_and_hides_dsml(tmp_path):
         api_key="secret",
         client=FakeClient(completions),
     )
-    output = StringIO()
-    error = StringIO()
-    session = ChatSession()
 
-    code = cli.run_conversation(
-        provider,
-        session,
-        registry=create_default_registry(),
-        tool_context=ToolContext(workspace_root=tmp_path),
-        input_func=PromptRecorder(["请使用工具列出当前项目根目录下的文件。", "/exit"]),
-        output=output,
-        error_output=error,
-    )
+    code, output, error, session = run_deepseek_flow(provider, tmp_path)
 
     assert code == 0
-    assert error.getvalue() == ""
-    assert "<｜｜DSML｜｜tool_calls>" not in output.getvalue()
-    assert "命令已经执行，输出是 tool-ok。" in output.getvalue()
+    assert error == ""
+    assert "DSML" not in output
+    assert "命令已经执行，输出是 tool-ok。" in output
     assert len(completions.calls) == 2
     assert completions.calls[0]["tool_choice"] == "auto"
-    assert completions.calls[1].get("tools") is None
-    assert completions.calls[1].get("tool_choice") is None
-    assert_final_answer_instruction(completions.calls[1]["messages"][-1])
-    tool_message = completions.calls[1]["messages"][2]
+    assert completions.calls[1]["tool_choice"] == "auto"
+    tool_message = provider_tool_messages(completions.calls[1]["messages"])[0]
     assert tool_message["role"] == "tool"
     assert "tool-ok" in tool_message["content"]
-    assert all(cli.FINAL_ANSWER_INSTRUCTION != message.content for message in session.messages)
+    assert sum(message.role == "tool" for message in session.messages) == 1
 
 
 def test_cli_hides_dsml_when_start_marker_is_split_across_chunks(tmp_path):
     command = f'"{sys.executable}" -c "print(\'split-ok\')"'
     dsml_body = (
-        '<｜｜DSML｜｜invoke name="run_command">'
-        f'<｜｜DSML｜｜parameter name="command" string="true">{command}</｜｜DSML｜｜parameter>'
-        "</｜｜DSML｜｜invoke>"
+        f"{dsml_invoke_start('run_command')}"
+        f"{dsml_parameter('command', command)}"
+        f"{dsml_tag('invoke', closing=True)}"
         f"{DSML_TOOL_CALLS_END}"
     )
     completions = FakeCompletions(
@@ -295,83 +300,15 @@ def test_cli_hides_dsml_when_start_marker_is_split_across_chunks(tmp_path):
         api_key="secret",
         client=FakeClient(completions),
     )
-    output = StringIO()
-    error = StringIO()
-    session = ChatSession()
 
-    code = cli.run_conversation(
-        provider,
-        session,
-        registry=create_default_registry(),
-        tool_context=ToolContext(workspace_root=tmp_path),
-        input_func=PromptRecorder(["请使用工具列出当前项目根目录下的文件。", "/exit"]),
-        output=output,
-        error_output=error,
-    )
+    code, output, error, session = run_deepseek_flow(provider, tmp_path)
 
     assert code == 0
-    assert error.getvalue() == ""
-    assert "DSML" not in output.getvalue()
-    assert "命令已经执行，输出是 split-ok。" in output.getvalue()
+    assert error == ""
+    assert "DSML" not in output
+    assert "命令已经执行，输出是 split-ok。" in output
     assert len(completions.calls) == 2
-    assert_final_answer_instruction(completions.calls[1]["messages"][-1])
-    tool_message = completions.calls[1]["messages"][2]
+    tool_message = provider_tool_messages(completions.calls[1]["messages"])[0]
     assert tool_message["role"] == "tool"
     assert "split-ok" in tool_message["content"]
-    assert all(cli.FINAL_ANSWER_INSTRUCTION != message.content for message in session.messages)
-
-
-def test_cli_does_not_execute_dsml_returned_during_final_response(tmp_path):
-    first_command = f'"{sys.executable}" -c "print(\'first-ok\')"'
-    second_command = f'"{sys.executable}" -c "print(\'second-should-not-run\')"'
-    first_dsml = (
-        f"{DSML_TOOL_CALLS_START}"
-        '<｜｜DSML｜｜invoke name="run_command">'
-        f'<｜｜DSML｜｜parameter name="command" string="true">{first_command}</｜｜DSML｜｜parameter>'
-        "</｜｜DSML｜｜invoke>"
-        f"{DSML_TOOL_CALLS_END}"
-    )
-    second_dsml = (
-        f"{DSML_TOOL_CALLS_START}"
-        '<｜｜DSML｜｜invoke name="run_command">'
-        f'<｜｜DSML｜｜parameter name="command" string="true">{second_command}</｜｜DSML｜｜parameter>'
-        "</｜｜DSML｜｜invoke>"
-        f"{DSML_TOOL_CALLS_END}"
-    )
-    completions = FakeCompletions(
-        [
-            [content_chunk(first_dsml)],
-            [content_chunk(second_dsml)],
-        ]
-    )
-    provider = DeepSeekProvider(
-        AppConfig(model="deepseek-chat"),
-        api_key="secret",
-        client=FakeClient(completions),
-    )
-    output = StringIO()
-    error = StringIO()
-    session = ChatSession()
-
-    code = cli.run_conversation(
-        provider,
-        session,
-        registry=create_default_registry(),
-        tool_context=ToolContext(workspace_root=tmp_path),
-        input_func=PromptRecorder(["请使用工具列出当前项目根目录下的文件。", "/exit"]),
-        output=output,
-        error_output=error,
-    )
-
-    assert code == 0
-    assert error.getvalue() == ""
-    assert len(completions.calls) == 2
-    assert completions.calls[1].get("tools") is None
-    assert completions.calls[1].get("tool_choice") is None
-    assert_final_answer_instruction(completions.calls[1]["messages"][-1])
-    assert DISALLOWED_TOOL_CALL_TEXT in output.getvalue()
-    assert "DSML" not in output.getvalue()
     assert sum(message.role == "tool" for message in session.messages) == 1
-    assert "first-ok" in session.messages[2].content
-    assert "second-should-not-run" not in session.messages[2].content
-    assert all(cli.FINAL_ANSWER_INSTRUCTION != message.content for message in session.messages)

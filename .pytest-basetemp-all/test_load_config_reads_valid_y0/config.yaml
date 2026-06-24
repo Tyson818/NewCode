@@ -1,0 +1,6 @@
+model: deepseek-chat
+base_url: https://api.deepseek.com
+api_key_env: DEEPSEEK_API_KEY
+workspace_root: .
+tool_timeout_seconds: 10
+command_timeout_seconds: 20

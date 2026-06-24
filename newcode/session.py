@@ -6,7 +6,7 @@ from typing import Literal
 from newcode.tools.types import ToolCall, ToolResult
 
 
-Role = Literal["user", "assistant", "tool"]
+Role = Literal["system", "user", "assistant", "tool"]
 
 
 @dataclass(frozen=True)
@@ -17,8 +17,8 @@ class ChatMessage:
     tool_call_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.role not in ("user", "assistant", "tool"):
-            raise ValueError("消息角色只支持 user、assistant 或 tool")
+        if self.role not in ("system", "user", "assistant", "tool"):
+            raise ValueError("消息角色只支持 system、user、assistant 或 tool")
         if self.content is not None and not isinstance(self.content, str):
             raise TypeError("消息内容必须是字符串或 None")
         if self.role == "tool" and not self.tool_call_id:

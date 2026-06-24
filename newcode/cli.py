@@ -2,26 +2,33 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
+from newcode.agent import (
+    AgentFinalAnswer,
+    AgentLoop,
+    AgentStopped,
+    AgentTextDelta,
+    AgentToolCallStarted,
+    AgentToolError,
+    AgentUsage,
+    StopReason,
+)
+from newcode.agent.mode import AgentMode
 from newcode.config import ConfigError, load_config, resolve_api_key
-from newcode.providers.base import ChatProvider, ProviderError, ProviderEvent, TextDelta, ToolCallEvent
+from newcode.providers.base import ChatProvider
 from newcode.providers.deepseek import DeepSeekProvider
-from newcode.session import ChatMessage, ChatSession
-from newcode.tools.executor import execute_tool_call, make_failure_result
+from newcode.session import ChatSession
 from newcode.tools.registry import ToolRegistry, create_default_registry
-from newcode.tools.types import ToolCall, ToolContext, ToolResult
+from newcode.tools.types import ToolContext
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
 EXIT_COMMANDS = {"/exit", "/quit", "exit"}
-FINAL_ANSWER_INSTRUCTION = (
-    "你现在处于最终回答阶段。工具已经执行完毕。"
-    "禁止再次调用工具，禁止输出 DSML/tool_calls 标记。"
-    "请只根据上一条 tool 消息中的工具执行结果，用自然语言回答用户。"
-)
+PLAN_COMMAND = "/plan"
+DO_COMMAND = "/do"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,6 +78,8 @@ def run_conversation(
 ) -> int:
     registry = registry or create_default_registry()
     tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
+    mode = AgentMode.DO
+
     print("NewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
 
     while True:
@@ -89,119 +98,74 @@ def run_conversation(
         if text in EXIT_COMMANDS:
             print("已结束对话。", file=output)
             return 0
+        if text == PLAN_COMMAND:
+            mode = AgentMode.PLAN
+            print("已切换到 Plan Mode。", file=output)
+            continue
+        if text == DO_COMMAND:
+            mode = AgentMode.DO
+            print("已切换到 Do Mode。", file=output)
+            continue
 
-        session.add_user_message(text)
         print("NewCode> ", end="", file=output, flush=True)
+        loop = AgentLoop(
+            provider=provider,
+            session=session,
+            registry=registry,
+            tool_context=tool_context,
+        )
 
         try:
-            first_response = _consume_provider_events(
-                provider.stream_chat(
-                    session.messages,
-                    tools=registry.to_openai_tools(),
-                    allow_tool_calls=True,
-                ),
+            _consume_agent_events(
+                loop.run(text, mode=mode),
                 output=output,
+                error_output=error_output,
             )
-        except ProviderError as exc:
-            print("", file=output)
-            print(f"模型错误：{exc.message}", file=error_output)
-            continue
-
-        if first_response.tool_calls:
-            _handle_tool_calls(
-                first_response.tool_calls,
-                session=session,
-                registry=registry,
-                tool_context=tool_context,
-            )
-            try:
-                final_messages = [
-                    *session.messages,
-                    ChatMessage(role="user", content=FINAL_ANSWER_INSTRUCTION),
-                ]
-                final_response = _consume_provider_events(
-                    provider.stream_chat(
-                        final_messages,
-                        tools=None,
-                        allow_tool_calls=False,
-                    ),
-                    output=output,
-                )
-            except ProviderError as exc:
-                print("", file=output)
-                print(f"模型错误：{exc.message}", file=error_output)
-                continue
-
-            if final_response.tool_calls:
-                message = "模型在最终回复阶段继续请求工具，本阶段不会继续执行。"
-                print(message, end="", file=output, flush=True)
-                session.add_assistant_message(message)
-            elif final_response.text.strip():
-                session.add_assistant_message(final_response.text)
-            print("", file=output)
-            continue
-
-        if first_response.text.strip():
-            session.add_assistant_message(first_response.text)
+        except KeyboardInterrupt:
+            print("\n已中断当前任务。", file=output)
         print("", file=output)
 
 
-class _ModelResponse:
-    def __init__(self) -> None:
-        self.text_parts: list[str] = []
-        self.tool_calls: list[ToolCall] = []
-
-    @property
-    def text(self) -> str:
-        return "".join(self.text_parts)
-
-
-def _consume_provider_events(
-    events: Iterable[ProviderEvent],
+def _consume_agent_events(
+    events,
     *,
     output: TextIO,
-) -> _ModelResponse:
-    response = _ModelResponse()
-    for event in events:
-        if isinstance(event, TextDelta):
-            response.text_parts.append(event.text)
-            print(event.text, end="", file=output, flush=True)
-        elif isinstance(event, ToolCallEvent):
-            response.tool_calls.extend(event.tool_calls)
-    return response
-
-
-def _handle_tool_calls(
-    tool_calls: list[ToolCall],
-    *,
-    session: ChatSession,
-    registry: ToolRegistry,
-    tool_context: ToolContext,
+    error_output: TextIO,
 ) -> None:
-    session.add_assistant_tool_calls(tool_calls)
-    if len(tool_calls) != 1:
-        for tool_call in tool_calls:
-            session.add_tool_result(
-                tool_call.id,
-                make_failure_result(
-                    tool_call.name,
-                    "multiple_tool_calls_not_supported",
-                    "本阶段每轮只支持一次工具调用",
-                    {"requested_count": len(tool_calls)},
-                    context=tool_context,
-                ),
-            )
-        return
+    printed_text = False
+    for event in events:
+        if isinstance(event, AgentTextDelta):
+            printed_text = True
+            print(event.text, end="", file=output, flush=True)
+            continue
 
-    tool_call = tool_calls[0]
-    if tool_call.name == "__tool_call_parse_error__":
-        result = make_failure_result(
-            tool_call.name,
-            "tool_call_parse_error",
-            "模型输出的工具参数不是有效 JSON 对象",
-            {"raw_arguments": tool_call.raw_arguments},
-            context=tool_context,
-        )
-    else:
-        result = execute_tool_call(tool_call, registry, tool_context)
-    session.add_tool_result(tool_call.id, result)
+        if isinstance(event, AgentToolCallStarted):
+            print(
+                f"\n[工具] {event.tool_call.name}",
+                file=output,
+                flush=True,
+            )
+            continue
+
+        if isinstance(event, AgentToolError):
+            print(
+                f"\n[工具错误] {event.code}: {event.message}",
+                file=output,
+                flush=True,
+            )
+            continue
+
+        if isinstance(event, AgentStopped):
+            if event.reason is StopReason.PROVIDER_ERROR:
+                print(f"模型错误：{event.message}", file=error_output)
+            else:
+                print(f"\n已停止：{event.message}", file=output, flush=True)
+            continue
+
+        if isinstance(event, AgentFinalAnswer):
+            if event.content and not printed_text:
+                print(event.content, end="", file=output, flush=True)
+            continue
+
+        if isinstance(event, AgentUsage):
+            continue
