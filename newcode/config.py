@@ -7,12 +7,15 @@ from typing import Any
 
 import yaml
 
+from newcode.permissions.types import PermissionMode
+
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEFAULT_WORKSPACE_ROOT = "."
 DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
+DEFAULT_PERMISSION_MODE = PermissionMode.DEFAULT
 
 
 class ConfigError(Exception):
@@ -27,6 +30,7 @@ class AppConfig:
     workspace_root: str = DEFAULT_WORKSPACE_ROOT
     tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS
     command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS
+    permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
 
 
 def load_config(path: Path) -> AppConfig:
@@ -58,6 +62,7 @@ def load_config(path: Path) -> AppConfig:
         "command_timeout_seconds",
         DEFAULT_COMMAND_TIMEOUT_SECONDS,
     )
+    permission_mode = raw.get("permission_mode", DEFAULT_PERMISSION_MODE.value)
 
     return AppConfig(
         model=_require_non_empty_string(model, "model"),
@@ -72,6 +77,7 @@ def load_config(path: Path) -> AppConfig:
             command_timeout_seconds,
             "command_timeout_seconds",
         ),
+        permission_mode=_parse_permission_mode(permission_mode),
     )
 
 
@@ -93,3 +99,14 @@ def _require_positive_number(value: Any, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ConfigError(f"配置项 {field_name} 必须是正数")
     return float(value)
+
+
+def _parse_permission_mode(value: Any) -> PermissionMode:
+    if isinstance(value, PermissionMode):
+        return value
+    mode = _require_non_empty_string(value, "permission_mode")
+    try:
+        return PermissionMode(mode)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in PermissionMode)
+        raise ConfigError(f"配置项 permission_mode 必须是以下之一：{allowed}") from exc

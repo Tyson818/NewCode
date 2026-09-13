@@ -8,3 +8,5 @@ __pycache__/
 .beval/
 .jbeval/
 .env
+.pytest-basetemp-*/
+Newcode.lnk

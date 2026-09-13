@@ -6,6 +6,8 @@ import sys
 
 from newcode import cli
 from newcode.config import AppConfig
+from newcode.permissions.manager import PermissionManager
+from newcode.permissions.types import PermissionMode
 from newcode.providers.base import TextDelta, ToolCallEvent
 from newcode.providers.deepseek import (
     DSML_TOOL_CALLS_END,
@@ -55,6 +57,7 @@ def run_flow(provider, tmp_path, prompt="读文件"):
         input_func=PromptRecorder([prompt, "/exit"]),
         output=output,
         error_output=error,
+        permission_manager=PermissionManager(mode=PermissionMode.TRUSTED),
     )
     return code, output.getvalue(), error.getvalue(), session
 
@@ -235,6 +238,7 @@ def run_deepseek_flow(provider, tmp_path):
         input_func=PromptRecorder(["请使用工具列出当前项目根目录下的文件。", "/exit"]),
         output=output,
         error_output=error,
+        permission_manager=PermissionManager(mode=PermissionMode.TRUSTED),
     )
     return code, output.getvalue(), error.getvalue(), session
 

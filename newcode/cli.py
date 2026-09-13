@@ -18,6 +18,15 @@ from newcode.agent import (
 )
 from newcode.agent.mode import AgentMode
 from newcode.config import ConfigError, load_config, resolve_api_key
+from newcode.mcp.adapter import MCPToolAdapter
+from newcode.mcp.config import load_mcp_config
+from newcode.mcp.manager import MCPManager
+from newcode.mcp.naming import MCPToolSchemaError, validate_input_schema
+from newcode.mcp.runtime import MCPRuntime
+from newcode.permissions.confirmer import CliPermissionConfirmer, PermissionConfirmer
+from newcode.permissions.loader import PermissionRulesLoadResult, load_permission_rules
+from newcode.permissions.manager import PermissionManager
+from newcode.permissions.types import PermissionMode
 from newcode.providers.base import ChatProvider
 from newcode.providers.deepseek import DeepSeekProvider
 from newcode.session import ChatSession
@@ -40,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    mcp_runtime = None
+    mcp_manager = None
     try:
         config = load_config(Path(args.config))
         api_key = resolve_api_key(config.api_key_env)
@@ -51,6 +62,21 @@ def main(argv: list[str] | None = None) -> int:
             command_timeout_seconds=config.command_timeout_seconds,
             sensitive_values=(api_key,),
         )
+        permission_rules = load_permission_rules(tool_context.workspace_root)
+        mcp_config = load_mcp_config(tool_context.workspace_root)
+        mcp_runtime = MCPRuntime()
+        mcp_manager = MCPManager(mcp_config.servers.values(), runtime=mcp_runtime)
+        for name, error in mcp_config.errors.items():
+            print(f"MCP server unavailable ({name}): {error.code}", file=sys.stderr)
+        for name, descriptors in mcp_manager.discover_all().items():
+            config_entry = mcp_config.servers[name]
+            for descriptor in descriptors:
+                try:
+                    validate_input_schema(descriptor.input_schema)
+                    adapter = MCPToolAdapter(mcp_manager, config_entry, descriptor)
+                    registry.register(adapter, read_only=False, do_visible=True)
+                except (MCPToolSchemaError, ValueError):
+                    print(f"MCP tool unavailable ({name}): mcp_tool_schema_invalid", file=sys.stderr)
     except ConfigError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 1
@@ -58,12 +84,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"启动失败：{exc}", file=sys.stderr)
         return 1
 
-    return run_conversation(
-        provider=provider,
-        session=ChatSession(),
-        registry=registry,
-        tool_context=tool_context,
-    )
+    try:
+        return run_conversation(
+            provider=provider,
+            session=ChatSession(),
+            registry=registry,
+            tool_context=tool_context,
+            permission_mode=config.permission_mode,
+            permission_rules=permission_rules,
+        )
+    finally:
+        if mcp_manager is not None:
+            mcp_manager.shutdown()
+        if mcp_runtime is not None:
+            mcp_runtime.shutdown()
 
 
 def run_conversation(
@@ -75,9 +109,19 @@ def run_conversation(
     input_func: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
     error_output: TextIO = sys.stderr,
+    permission_manager: PermissionManager | None = None,
+    permission_confirmer: PermissionConfirmer | None = None,
+    permission_mode: PermissionMode = PermissionMode.DEFAULT,
+    permission_rules: PermissionRulesLoadResult | None = None,
 ) -> int:
     registry = registry or create_default_registry()
     tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
+    permission_manager = permission_manager or _build_permission_manager(
+        mode=permission_mode,
+        rules=permission_rules,
+        confirmer=permission_confirmer
+        or CliPermissionConfirmer(input_func=input_func, output=output),
+    )
     mode = AgentMode.DO
 
     print("NewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
@@ -113,6 +157,7 @@ def run_conversation(
             session=session,
             registry=registry,
             tool_context=tool_context,
+            permission_manager=permission_manager,
         )
 
         try:
@@ -169,3 +214,21 @@ def _consume_agent_events(
 
         if isinstance(event, AgentUsage):
             continue
+
+
+def _build_permission_manager(
+    *,
+    mode: PermissionMode,
+    rules: PermissionRulesLoadResult | None,
+    confirmer: PermissionConfirmer,
+) -> PermissionManager:
+    if rules is None:
+        return PermissionManager(mode=mode, confirmer=confirmer)
+    return PermissionManager(
+        mode=mode,
+        local_project_rules=rules.local_project_rules,
+        project_rules=rules.project_rules,
+        user_global_rules=rules.user_global_rules,
+        rule_load_errors=rules.errors,
+        confirmer=confirmer,
+    )

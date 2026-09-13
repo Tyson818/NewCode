@@ -31,6 +31,19 @@ def test_default_registry_contains_core_tools():
     ]
 
 
+def test_default_registry_exports_core_tool_schema_names_unchanged():
+    registry = create_default_registry()
+
+    assert {tool["function"]["name"] for tool in registry.to_openai_tools()} == {
+        "read_file",
+        "write_file",
+        "replace_in_file",
+        "run_command",
+        "find_files",
+        "search_code",
+    }
+
+
 def test_registry_rejects_duplicate_names():
     registry = ToolRegistry()
     registry.register(DummyTool())

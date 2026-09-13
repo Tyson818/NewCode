@@ -14,7 +14,6 @@ from newcode.agent import (
     AgentToolResult,
     StopReason,
 )
-from newcode.agent.loop import NEWCODE_SYSTEM_PROMPT
 from newcode.agent.mode import AgentMode
 from newcode.providers.base import ProviderError, ProviderEvent, TextDelta, ToolCallEvent
 from newcode.session import ChatSession
@@ -55,6 +54,22 @@ class StreamingErrorProvider:
         self.calls += 1
         yield TextDelta("partial")
         raise ProviderError("stream failed")
+
+
+class SpyPromptBuilder:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def build_messages(self, session_messages, context):
+        self.calls.append(
+            {
+                "session_messages": list(session_messages),
+                "context": context,
+            }
+        )
+        return [
+            *session_messages,
+        ]
 
 
 @dataclass
@@ -112,6 +127,27 @@ def tool_messages(messages):
     return [message for message in messages if message.role == "tool"]
 
 
+def system_messages(messages):
+    return [message for message in messages if message.role == "system"]
+
+
+def assert_prompt_messages(messages, *, iteration: int):
+    systems = system_messages(messages)
+    assert len(systems) >= 2
+    assert "NewCode" in systems[0].content
+    assert "不要自称" in systems[0].content
+    assert "Claude" in systems[0].content
+    assert "ChatGPT" in systems[0].content
+    assert "Codex" in systems[0].content
+    assert "<system-reminder>" in systems[1].content
+    assert f"{iteration}/8" in systems[1].content
+
+
+def assert_session_has_no_prompt_pollution(session):
+    assert all(message.role != "system" for message in session.messages)
+    assert all("<system-reminder>" not in (message.content or "") for message in session.messages)
+
+
 def test_config_defaults():
     config = AgentLoopConfig()
 
@@ -135,10 +171,36 @@ def test_plain_chat_outputs_text_final_answer_and_session(tmp_path):
     assert session.messages[0].content == "打个招呼"
     assert session.messages[1].content == "你好"
     assert len(provider.calls) == 1
-    assert provider.calls[0]["messages"][0].role == "system"
-    assert provider.calls[0]["messages"][0].content == NEWCODE_SYSTEM_PROMPT
-    assert "NewCode" in provider.calls[0]["messages"][0].content
-    assert "不要自称 Claude、ChatGPT、Codex" in provider.calls[0]["messages"][0].content
+    assert_prompt_messages(provider.calls[0]["messages"], iteration=1)
+    assert_session_has_no_prompt_pollution(session)
+
+
+def test_agent_loop_uses_injected_prompt_builder_with_context(tmp_path):
+    provider = FakeProvider([[TextDelta("ok")]])
+    session = ChatSession()
+    prompt_builder = SpyPromptBuilder()
+    loop = AgentLoop(
+        provider=provider,
+        session=session,
+        registry=make_registry(),
+        tool_context=ToolContext(workspace_root=tmp_path),
+        config=AgentLoopConfig(max_iterations=3),
+        prompt_builder=prompt_builder,
+    )
+
+    events = list(loop.run("规划", mode=AgentMode.PLAN))
+
+    assert events[-1] == AgentFinalAnswer("ok")
+    assert len(prompt_builder.calls) == 1
+    context = prompt_builder.calls[0]["context"]
+    assert context.mode is AgentMode.PLAN
+    assert context.iteration == 1
+    assert context.max_iterations == 3
+    assert context.environment.workspace_root == str(tmp_path)
+    assert context.environment.platform
+    assert prompt_builder.calls[0]["session_messages"] == session.messages[:-1]
+    assert provider.calls[0]["messages"] == prompt_builder.calls[0]["session_messages"]
+    assert_session_has_no_prompt_pollution(session)
 
 
 def test_single_tool_call_runs_tool_and_continues_to_final_answer(tmp_path):
@@ -168,6 +230,14 @@ def test_single_tool_call_runs_tool_and_continues_to_final_answer(tmp_path):
     assert session.messages[1].tool_calls[0].id == "call_1"
     assert session.messages[2].tool_call_id == "call_1"
     assert "arguments" in session.messages[2].content
+    assert_prompt_messages(provider.calls[0]["messages"], iteration=1)
+    assert_prompt_messages(provider.calls[1]["messages"], iteration=2)
+    assert [message.role for message in provider.calls[1]["messages"][-3:]] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert_session_has_no_prompt_pollution(session)
 
 
 def test_multiple_tool_rounds_continue_until_final_answer(tmp_path):
@@ -192,6 +262,10 @@ def test_multiple_tool_rounds_continue_until_final_answer(tmp_path):
         if isinstance(event, AgentIterationStarted)
     ] == [1, 2, 3]
     assert events[-1] == AgentFinalAnswer("完成")
+    assert_prompt_messages(provider.calls[0]["messages"], iteration=1)
+    assert_prompt_messages(provider.calls[1]["messages"], iteration=2)
+    assert_prompt_messages(provider.calls[2]["messages"], iteration=3)
+    assert_session_has_no_prompt_pollution(loop.session)
 
 
 def test_max_iterations_stops(tmp_path):

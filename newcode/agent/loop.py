@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+import platform
 from typing import Any
 
 from newcode.agent.collector import StreamingTurnCollector
@@ -16,20 +17,18 @@ from newcode.agent.events import (
     AgentToolResult,
 )
 from newcode.agent.mode import AgentMode, allowed_tool_names, is_tool_allowed
-from newcode.agent.scheduler import ToolScheduler
+from newcode.agent.scheduler import ToolExecutionRecord, ToolScheduler
+from newcode.permissions.manager import PermissionManager
+from newcode.permissions.types import (
+    PermissionDecision,
+    PermissionDecisionValue,
+)
+from newcode.prompt import PromptBuildContext, PromptBuilder, PromptEnvironment
 from newcode.providers.base import ChatProvider, ProviderError
 from newcode.session import ChatMessage, ChatSession
 from newcode.tools.executor import execute_tool_call, make_failure_result
 from newcode.tools.registry import ToolRegistry, create_default_registry
 from newcode.tools.types import ToolCall, ToolContext, ToolResult
-
-
-NEWCODE_SYSTEM_PROMPT = (
-    "你是 NewCode。"
-    "不要自称 Claude、ChatGPT、Codex。"
-    "你是当前这个本地 CLI 编程助手。"
-)
-
 
 class AgentLoop:
     def __init__(
@@ -40,13 +39,17 @@ class AgentLoop:
         registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
         config: AgentLoopConfig | None = None,
+        prompt_builder: PromptBuilder | None = None,
+        permission_manager: PermissionManager | None = None,
     ) -> None:
         self.provider = provider
         self.session = session
         self.registry = registry or create_default_registry()
         self.tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
         self.config = config or AgentLoopConfig()
+        self.prompt_builder = prompt_builder or PromptBuilder()
         self.scheduler = ToolScheduler(self.registry)
+        self.permission_manager = permission_manager or PermissionManager()
 
     def run(
         self,
@@ -84,8 +87,8 @@ class AgentLoop:
             collector = StreamingTurnCollector()
             try:
                 provider_events = self.provider.stream_chat(
-                    self._provider_messages(),
-                    tools=self.registry.to_openai_tools(allowed_tool_names(mode)),
+                    self._provider_messages(mode, iteration),
+                    tools=self.registry.to_openai_tools(allowed_tool_names(mode, self.registry)),
                     allow_tool_calls=True,
                 )
             except ProviderError as exc:
@@ -150,10 +153,26 @@ class AgentLoop:
                 )
                 return
 
-            execution_records = self.scheduler.execute(
+            permission_records, allowed_tool_calls, allowed_indexes = self._precheck_permissions(
                 turn_result.tool_calls,
+            )
+
+            scheduled_records = self.scheduler.execute(
+                allowed_tool_calls,
                 self._execute_tool_call,
                 self._make_unknown_tool_result,
+            )
+            execution_records = [
+                ToolExecutionRecord(
+                    index=allowed_indexes[record.index],
+                    tool_call=record.tool_call,
+                    result=record.result,
+                )
+                for record in scheduled_records
+            ]
+            execution_records = sorted(
+                [*permission_records, *execution_records],
+                key=lambda record: record.index,
             )
 
             for record in execution_records:
@@ -215,11 +234,22 @@ class AgentLoop:
     def _execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         return execute_tool_call(tool_call, self.registry, self.tool_context)
 
-    def _provider_messages(self) -> list[ChatMessage]:
-        return [
-            ChatMessage(role="system", content=NEWCODE_SYSTEM_PROMPT),
-            *self.session.messages,
-        ]
+    def _provider_messages(
+        self,
+        mode: AgentMode,
+        iteration: int,
+    ) -> list[ChatMessage]:
+        context = PromptBuildContext(
+            mode=mode,
+            iteration=iteration,
+            max_iterations=self.config.max_iterations,
+            environment=PromptEnvironment(
+                workspace_root=str(self.tool_context.workspace_root),
+                platform=platform.system() or platform.platform(),
+            ),
+            permission_mode=self.permission_manager.mode.value,
+        )
+        return self.prompt_builder.build_messages(self.session.messages, context)
 
     def _make_unknown_tool_result(self, tool_call: ToolCall) -> ToolResult:
         return make_failure_result(
@@ -238,7 +268,7 @@ class AgentLoop:
         for tool_call in tool_calls:
             if self.registry.get(tool_call.name) is None:
                 continue
-            if not is_tool_allowed(tool_call.name, mode):
+            if not is_tool_allowed(tool_call.name, mode, self.registry):
                 return tool_call
         return None
 
@@ -252,6 +282,54 @@ class AgentLoop:
             "disallowed_tool",
             "当前模式不允许执行该工具。",
             {"tool_name": tool_call.name, "mode": mode.value},
+            context=self.tool_context,
+        )
+
+    def _precheck_permissions(
+        self,
+        tool_calls: list[ToolCall],
+    ) -> tuple[list[ToolExecutionRecord], list[ToolCall], list[int]]:
+        denied_records: list[ToolExecutionRecord] = []
+        allowed_tool_calls: list[ToolCall] = []
+        allowed_indexes: list[int] = []
+
+        for index, tool_call in enumerate(tool_calls):
+            if self.registry.get(tool_call.name) is None:
+                allowed_tool_calls.append(tool_call)
+                allowed_indexes.append(index)
+                continue
+
+            decision = self.permission_manager.check(tool_call, self.tool_context, self.registry.get(tool_call.name))
+            if decision.decision is PermissionDecisionValue.ALLOW:
+                allowed_tool_calls.append(tool_call)
+                allowed_indexes.append(index)
+                continue
+
+            denied_records.append(
+                ToolExecutionRecord(
+                    index=index,
+                    tool_call=tool_call,
+                    result=self._make_permission_denied_result(tool_call, decision),
+                )
+            )
+
+        return denied_records, allowed_tool_calls, allowed_indexes
+
+    def _make_permission_denied_result(
+        self,
+        tool_call: ToolCall,
+        decision: PermissionDecision,
+    ) -> ToolResult:
+        return make_failure_result(
+            tool_call.name,
+            "permission_denied",
+            decision.reason,
+            {
+                "permission_layer": decision.layer.value,
+                "risk_level": decision.risk_level.value,
+                "matched_rule": decision.matched_rule,
+                "decision_reason": decision.reason,
+            },
             context=self.tool_context,
         )
 

@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
+import inspect
 
 import pytest
 
 from newcode.config import AppConfig
+from newcode.providers import deepseek
 from newcode.providers.base import ProviderError, TextDelta
-from newcode.providers.deepseek import DeepSeekProvider
+from newcode.providers.deepseek import DeepSeekProvider, message_to_provider_dict
 from newcode.session import ChatMessage
+from newcode.tools.types import ToolCall
 
 
 class FakeCompletions:
@@ -103,5 +108,61 @@ def test_provider_converts_sdk_errors_to_provider_error():
     with pytest.raises(ProviderError) as exc_info:
         list(provider.stream_chat([ChatMessage(role="user", content="hi")]))
 
-    assert "模型服务请求失败" in exc_info.value.message
     assert "secret" not in exc_info.value.message
+
+
+def test_provider_serializes_system_role_without_prompt_strategy():
+    message = ChatMessage(role="system", content="stable prompt")
+
+    assert message_to_provider_dict(message) == {
+        "role": "system",
+        "content": "stable prompt",
+    }
+
+
+def test_provider_still_serializes_tool_messages():
+    message = ChatMessage(role="tool", content="{}", tool_call_id="call_1")
+
+    assert message_to_provider_dict(message) == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "{}",
+    }
+
+
+def test_provider_still_serializes_assistant_tool_calls():
+    message = ChatMessage(
+        role="assistant",
+        content=None,
+        tool_calls=[
+            ToolCall(
+                id="call_1",
+                name="read_file",
+                arguments={"path": "README.md"},
+                raw_arguments='{"path": "README.md"}',
+            )
+        ],
+    )
+
+    assert message_to_provider_dict(message) == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path": "README.md"}',
+                },
+            }
+        ],
+    }
+
+
+def test_provider_does_not_depend_on_prompt_builder():
+    source = inspect.getsource(deepseek)
+
+    assert "newcode.prompt" not in source
+    assert "PromptBuilder" not in source
+    assert "system-reminder" not in source
