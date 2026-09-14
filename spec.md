@@ -1,362 +1,155 @@
-# Chapter 7：MCP Client —— 让 NewCode 接入外部工具生态
+# Chapter 8：Context Management —— 让 NewCode 在有限预算内持续工作
 
 ## 背景
 
-NewCode 已具备六个内置工具、Tool Registry、同步 Tool executor、AgentLoop、ToolScheduler、Plan Mode / Do Mode、Prompt System 和 Permission System。当前 Tool Registry 只能登记本地工具，模型不能发现或调用外部 MCP Server 的 tools。
+长会话中的上下文主要由工具结果增长。大段文件、搜索结果、编译输出和命令输出会很快挤占模型窗口，导致请求失败或迫使模型丢失重要的近期工作状态。用户原始消息通常包含目标、约束和澄清，价值高于可重新读取的工具输出，因此压缩必须优先处理工具结果，并尽可能保留用户原文。
 
-本章新增 MCP Client：NewCode 启动时从配置发现 MCP Server，独立连接并获取 tools；成功发现的远端工具被适配为现有 Tool 后注册到 Tool Registry。模型调用 MCP tool 时，仍通过现有 tool schema、AgentLoop、Permission System、ToolScheduler 和 ToolResult 链路工作，不理解 transport、JSON-RPC 或连接生命周期。
-
-本章统一使用 NewCode，不使用 MewCode。
+本章提供两层、按请求前触发的上下文管理：第一层把过大的工具结果脱离会话正文；第二层在会话整体逼近模型窗口时，将可压缩的较早历史归纳为结构化摘要。它不是长期记忆、语义检索或模型训练机制。
 
 ## 目标
 
-- 支持 stdio 和 Streamable HTTP transport。
-- 使用官方 MCP Python SDK 管理协议兼容、transport、tools/list、tools/call 和 shutdown。
-- 支持多 server 配置、连接缓存、工具发现、调用和故障隔离。
-- 将 MCP name、description、inputSchema、arguments、result、error 映射为现有 Tool 抽象。
-- MCP tool 与内置 tool 一样经过 Plan/Do Mode、Permission System、ToolScheduler 和 Tool executor。
-- 不允许远端工具覆盖内置工具或其他 server 的工具。
-- 一个 server 失败不影响内置工具、其他健康 server 或 CLI 启动。
+- 在每一次面向主模型的请求前，控制单条消息和整个会话的估算上下文大小。
+- 用户原始消息优先以原文保留；不得因第一层压缩而改写用户消息。
+- 让被外置的工具细节可由模型通过正常读取工具重新取得，而不是鼓励模型根据摘要臆测。
+- 以安全、可追溯、可熔断的方式执行摘要，不使摘要失败演变为请求循环。
+- 不引入精确 tokenizer、机器学习式摘要策略或隐式外部网络访问。
 
-## 非目标
+## 固定预算与近似估算
 
-本章只实现 MCP tools，不实现 MCP resources、resource templates、prompts、sampling、tasks、Apps、MCP Server、legacy SSE、自动重连、health checking、复杂 OAuth、network sandbox、MCP 专属复杂 UI、项目指令、自动记忆、真实 Skill 加载或自动化评估。
+本章的有效上下文窗口固定为 **64,000 token**。后续若模型能力变化，只能通过明确、受审查的产品配置改变该预算；不得从模型名称、远端响应或猜测中自动推断窗口。
 
-本章不因远端 tool 的名字或 description 看起来只读，就给予只读或低风险信任。
+不引入精确 tokenizer。估算必须可复现，并按以下规则计算：
 
-## 当前代码约束
+1. 将待发送的每条消息及其中的结构化内容序列化为稳定的 JSON 形式，按 Unicode 字符数计数。
+2. 字符估算为 `ceil(字符数 / 2)`；每条消息额外计 12 token，每个 tool call 或 tool result 额外计 24 token。
+3. 上述合计再乘以 1.20 并向上取整，作为保守的近似 token 数。
+4. 系统消息、摘要、边界消息、工具调用和工具结果均参与估算；外置文件本身不参与，留在会话中的预览参与。
 
-- ToolSpec、ToolRegistry 与 DeepSeekProvider 当前不校验 function name 的字符集或长度；Chapter 7 必须在 MCP adapter 注册前主动校验。
-- ToolRegistry 以工具名作为唯一键，重复注册会失败；当前只读/副作用分类仅覆盖六个内置工具，to_openai_tools() 按注册顺序导出。
-- Tool 是同步 run(arguments, context) 到 ToolResult 协议；Tool executor 已将异常转为结构化失败并仅遮蔽 ToolContext.sensitive_values。
-- AgentLoop 在 ToolScheduler 前做 Plan/Do Mode 与 PermissionManager 预检查，并回写工具结果；当前 Do Mode 白名单固定为六个内置工具。
-- ToolScheduler 只并发连续只读工具；所有非只读工具按模型原始顺序串行。
-- PermissionManager 优先级为 hard denylist、workspace sandbox、session/local/project/user rules、built-in policies、permission mode、HITL；当前 sandbox 只处理本地文件工具，hard denylist 只处理 run_command，rule matcher 只支持 command/path。
-- CLI 当前没有 MCP resource lifecycle 或 finally shutdown hook；本章必须新增。
-- 当前 pyproject.toml 没有 MCP dependency，AppConfig 没有 MCP server 配置。
+每次成功的主模型 API 响应若返回可信的 prompt/input usage，则该 usage 成为新的 **usage 锚点**，并记录其对应的会话版本。下一次估算使用“锚点 usage + 锚点之后新增或变更消息的近似值”。API 没有 prompt/input usage、usage 为负数或类型不合法时，不覆盖已有可信锚点。
 
-## 架构和边界
-
-调用链必须为：
-
-AgentLoop
--> Plan/Do Mode gate
--> PermissionManager
--> ToolScheduler / execute_tool_call
--> MCPToolAdapter.run
--> MCPManager.call_tool_sync
--> MCP SDK async client / transport
--> MCP Server
-
-新增 newcode.mcp 包：
-
-- config.py：配置、用户/项目加载合并、变量展开、配置错误。
-- types.py：MCPServerConfig、MCPServerStatus、MCPToolDescriptor。
-- naming.py：稳定 namespace 和冲突检测。
-- runtime.py：同步 Tool 到异步 SDK 的受控 runtime bridge。
-- manager.py：MCPManager，负责 startup、connection/client cache、discovery、call、shutdown。
-- adapter.py：MCPToolAdapter，实现既有 Tool 协议。
-
-MCPManager 和 adapter 不负责编排 AgentLoop、Prompt strategy、Provider logic 或 Permission policy。
-
-AgentLoop 保持模型循环、模式检查、权限预检查、调度和结果回写职责；不得实现 JSON-RPC、request id、pending response correlation、transport 或 SDK lifecycle。
-
-Provider 继续只负责 Chat Completions messages/tools 和 ProviderEvent。Provider 不得导入 newcode.mcp、连接 MCP Server、理解 MCP namespace、MCP error、PermissionManager、AgentMode、system-reminder 或 cache_control。
-
-Prompt System 不负责 MCP transport、connection 或 discovery。它可以增加稳定提示：外部工具同样受权限检查；不得注入 URL、headers、env、server status、远端 error 或 secret。
-
-## MCP 协议与 SDK 决策
-
-本章必须使用官方 MCP Python SDK，不自行实现 JSON-RPC 2.0 transport。
-
-当前项目尚未安装 MCP SDK；implementation 开始前必须选定并锁定一个官方 MCP Python SDK 版本，并以该版本公开 API 验证 stdio、Streamable HTTP、协议兼容、tools/list 分页、tools/call 和 shutdown 行为。手写 JSON-RPC 会额外承担 request id、pending correlation、error response、取消与关闭，也会把传统 initialize 到 tools/list 到 tools/call 错误固化为唯一生命周期。
-
-NewCode 不得硬编码必须先调用传统 initialize。若锁定 SDK 的公开兼容模式支持传统 initialize/session server 和现代无传统 initialize/session server，应由 SDK 完成相应协商；若其公开 API 不支持某种 server，应将该 server 标为不可用，不得以手写 fallback 扩大范围。
-
-本章只在 SDK 层覆盖 server discovery/protocol compatibility、tools/list（以锁定 SDK 版本公开分页 API 为准）和 tools/call。不实现 legacy SSE。Streamable HTTP headers 必须使用锁定 SDK 版本公开推荐的 HTTP client/transport 注入方式，不能依赖未验证或已过时的参数。
-
-## 同步 Tool 与异步 SDK
-
-MCPManager 必须拥有受控 async runtime bridge：
-
-- 独占 async runtime、SDK context、HTTP client、stdio subprocess 和 shutdown。
-- MCPToolAdapter.run 只能通过 MCPManager.call_tool_sync 发起同步等待调用。
-- adapter 不得自行创建 event loop、subprocess 或 HTTP client。
-- 同一 server 的 session 调用必须串行化；不得假定 SDK session 或远端 server 支持并发 in-flight request。
-- 成功 server 的连接在 NewCode 生命周期内缓存复用。
-- 本章不自动 reconnect；失效连接标记 unavailable，直到下次启动。
-- CLI 在 EOF、/exit、KeyboardInterrupt、启动后异常等所有退出路径的 finally 中调用 MCPManager.shutdown。
-
-## 配置
-
-### 配置位置与合并
-
-新增两层 MCP config：
-
-- 用户级：~/.newcode/mcp.yaml
-- 项目级：<workspace_root>/.newcode/mcp.yaml
-
-顶层为 mcp_servers map，示例：
-
-    mcp_servers:
-      local_server:
-        transport: stdio
-        command: python
-        args: [server.py]
-        env:
-          TOKEN: "${LOCAL_TOKEN}"
-
-      remote_server:
-        transport: streamable_http
-        url: "https://example.com/mcp"
-        headers:
-          Authorization: "Bearer ${REMOTE_TOKEN}"
-
-合并顺序为 user 到 project。同名 server 由项目级条目完整覆盖用户级条目，不做字段级 merge，避免 endpoint 与 credential 意外拼接。没有 mcp_servers 代表不使用外部 MCP tools，不是错误。
-
-### 校验和变量展开
-
-- server name 必须为稳定 ASCII 配置键，并满足 namespace 映射限制。
-- transport 只能为 stdio 或 streamable_http。
-- stdio 的 command 必填；args 是可选字符串列表；env 是可选字符串 map。
-- Streamable HTTP 的 url 必填且为 http/https URL；headers 是可选字符串 map。
-- 缺字段、错误类型、未知 transport 或 transport 不适用字段均为该 server 的配置错误。
-- env 和 headers 的字符串值支持一个或多个 ${VAR}。
-- 任一变量缺失或为空时，对应 server 为 mcp_config_error；不得把未展开占位符发给 server。
-- 展开后的 secret 只能留在 manager 私有运行时配置，绝不写入 session、prompt、ToolResult metadata、普通日志、CLI 输出或错误文本。
-- stdio 子进程继承当前进程环境，再由已验证、已展开的 config env 显式覆盖；MCPManager 必须把展开值纳入私有敏感值集合，避免它们进入结果、异常、诊断或日志。
-
-## Transport
-
-### stdio
-
-使用官方 SDK 的 stdio server parameters/transport 启动子进程，传入 command、args 和已验证 env。SDK context 负责关闭 stdin、等待进程并在需要时终止。server stderr 仅进入受控诊断位置，不得泄露 secret。
-
-### Streamable HTTP
-
-使用官方 SDK 的 Streamable HTTP transport。headers 通过锁定 SDK 版本公开要求的 HTTP client/transport 创建方式传递。MCPManager 拥有并在 shutdown 时关闭 HTTP client。URL credential、headers 和远端错误中的已知 secret 必须遮蔽。
-
-sse、legacy_sse 和其他未声明 transport 一律使该 server 配置错误；不得新增 SSE 分支。
-
-## MCPManager 生命周期和隔离
-
-CLI 启动顺序：
-
-1. 创建内置 ToolRegistry、ToolContext 和 PermissionManager。
-2. 加载、合并、校验 MCP config，展开环境变量。
-3. 创建 MCPManager。
-4. 对每个有效 server 独立连接并执行 tools/list discovery。
-5. 仅将成功发现且通过 schema/name 校验的 MCPToolAdapter 注册到 ToolRegistry。
-6. 保存 MCPServerStatus；失败只输出不含 secret 的简洁 server warning。
-7. 继续启动 CLI，即使所有 MCP server 失败。
-
-CLI 必须将 MCPManager 的整个启动后生命周期置于 finally：无论 EOF、/exit、KeyboardInterrupt、交互循环异常或启动后异常，均调用幂等 shutdown。启动前发生的配置错误仍不得阻止内置工具和 CLI；仅将对应 server 标记 unavailable。
-
-单 server 的配置、启动、协议协商、tools/list、单 tool schema 或命名失败不得回滚内置工具、其他 server 或同 server 的其他合法 tool。单个 schema/name 失败时跳过该 tool，继续注册同 server 的其余合法 tool。失败 server 在本进程标为 unavailable；本章不自动重试。
-
-每个 ready server 有独立 runtime/client/connection cache；同 server 的 tools/list 与 tools/call 复用 cache，不重复启动 subprocess 或创建 HTTP client。不同 server 不共享 session、headers、env、lock 或失败状态。tools/list 必须处理分页。
-
-远端 isError、SDK、transport、协议异常均转换为 ToolResult.failure，不能让 AgentLoop 崩溃。失效连接后调用返回 mcp_server_unavailable 或 mcp_call_failed，不自动 reconnect。
-
-shutdown 必须幂等：关闭每个 SDK context、HTTP client、stdio subprocess 并清空 cache；一个 server 关闭失败不阻止其他 server 关闭。
-
-## MCP Tool Adapter
-
-每个远端 MCP tool 对应一个 MCPToolAdapter，并实现现有同步 Tool 协议。
-
-- server config key 映射为 adapter server identity/metadata。
-- remote name 映射为原始 remote tool identity。
-- remote description 映射为 ToolSpec.description，并附带安全来源说明。
-- inputSchema 映射为 ToolSpec.parameters。
-- ToolCall.arguments 以原样 JSON object 传给 tools/call。
-- CallToolResult.content 和 structured_content 映射为 JSON-safe ToolResult.data。
-- CallToolResult.isError 映射为 ToolResult.failure，code 为 mcp_tool_error。
-- SDK/transport/protocol exception 映射为 ToolResult.failure，code 为 mcp_call_failed 或 mcp_server_unavailable。
-
-inputSchema 采用轻量结构校验，不新增 JSON Schema validator dependency：它必须是 JSON object，type 只能为 object 或省略，properties/required/additionalProperties 如存在必须是可转发的 JSON 值；不合格的单个 remote tool 不注册，错误码 mcp_tool_schema_invalid。adapter 保留 content block 的必要 type 和 structured content，不能伪造成功。metadata 只可含 mcp_server、mcp_tool、transport 等安全 identity。MCPManager 必须遮蔽该 server 展开的 secret；既有 Tool executor 继续遮蔽 ToolContext.sensitive_values。MCP failure 不是 ProviderError。
-
-### 调度分类
-
-远端 tool 的真实副作用和风险不能从 description/inputSchema 可靠判断。本章所有 MCPToolAdapter 固定为 Do Mode 可见、非只读、有副作用，必须由 ToolScheduler 串行执行。不得因名称含 read/search 而放入并发只读批次。
-
-ToolRegistry 必须从六个固定名称分类演进为内置默认分类加 adapter 显式分类，但六个内置工具的分类和行为必须不变。
-
-## 工具命名和冲突
-
-MCP tool 名既是 ToolRegistry key，又是 OpenAI-compatible function name，因此不使用带点号的 mcp 点 server 点 tool 格式。
-
-稳定名称格式：
-
-    mcp__{server_slug}__{tool_slug}__{identity_digest}
-
-- server_slug、tool_slug：小写 ASCII 安全展示片段，固定长度截断。
-- identity_digest：SHA-256 对 server_config_key、NUL、remote_tool_name 的 UTF-8 拼接取固定长度前缀。
-- NewCode 主动校验最终名只使用 ASCII [A-Za-z0-9_-]，且最大 64 字符；不依赖 Provider 进行校验。
-- slug 可以为满足 64 字符上限而截断；identity_digest 的固定长度不得截断。
-- 原始 server key 与 remote tool name 存在 adapter metadata。
-- 算法、截断、最大长度和 digest 长度固定并有单元测试。
-
-示例：
-
-    mcp__github__search_issues__4a1bc29d3e10
-
-相同 server key 与 remote tool name 跨启动生成同名；不同 server 的同名 remote tool 生成不同名；slug 相同但原始 identity 不同由 digest 区分。
-
-若生成名已存在、发生 digest 碰撞、超过长度限制或与内置工具冲突，拒绝注册该 MCP tool，记录 mcp_name_collision；绝不覆盖已有工具。ToolRegistry.register 的重复保护保留为最后防线，MCPManager 必须先主动检测。
-
-## Plan Mode 和 Do Mode
-
-- Plan Mode 继续只暴露 read_file、find_files、search_code。
-- Plan Mode 不暴露 MCP tool；即使模型伪造 namespaced MCP call，也按 disallowed_tool 拒绝，且不得执行权限确认或远端调用。
-- Do Mode 暴露六个内置工具和成功注册、标记为 Do-visible 的 MCP tools；这是对当前固定六工具 Do Mode 白名单的新增能力。
-- ToolRegistry 必须提供 mode-aware schema export 或等价可见性接口；AgentLoop 必须使用它，不能继续只使用固定 DO_TOOL_NAMES。
-- Plan Mode 限制优先于 PermissionMode、显式 allow rule、HITL 和 MCP Server。
-
-## Permission System 接入
-
-必经调用链：
-
-AgentLoop
--> Plan/Do Mode gate
--> PermissionManager.check
--> ToolScheduler
--> execute_tool_call
--> MCPToolAdapter
--> MCPManager / MCP Server
-
-adapter、CLI、Provider 和 PromptBuilder 不得绕过该链路直接调用远端 server。
-
-Permission normalizer 必须为 MCP adapter 产生 normalized_args：
-
-- mcp_server：原始 server config key。
-- mcp_tool：原始 remote tool name。
-- mcp_transport：stdio 或 streamable_http。
-- mcp_arguments：当次 JSON arguments，仅用于决策和调用，不进入 prompt 或普通日志。
-
-MCP 调用和内置工具一样先进入 PermissionManager；但当前 hard denylist 仅匹配 run_command、workspace sandbox 仅匹配本地文件工具，无法自动约束任意远端 MCP 参数或远端 server 自身环境。Chapter 7 不得声称它们已 sandbox 远端 server；必须新增 MCP 专属保守 built-in policy。
-
-PermissionMatch、YAML parser、rule matcher、SessionPermissionRules 和 CLI confirmation summary 必须扩展 mcp_server、mcp_server_glob、mcp_tool、mcp_tool_glob。规则仍以 namespaced ToolSpec.name 作为 tool，可再以 MCP identity 缩小范围：
-
-    rules:
-      - id: allow_github_issue_search
-        tool: "mcp__github__search_issues__4a1bc29d3e10"
-        match:
-          mcp_server: "github"
-          mcp_tool: "search_issues"
-        action: allow
-        reason: "Allow approved GitHub issue search"
-        risk_level: medium
-
-### 保守默认
-
-- 所有 MCP tool 先经过统一 PermissionManager；hard denylist 与 workspace sandbox 继续在其现有适用范围保护内置操作，session/local/project/user explicit rules 可通过新增 MCP identity match 规则匹配远端工具。
-- 远端行为无法可靠判定，因此新增 built-in external MCP policy：未命中 explicit allow/deny 的 MCP tool 一律返回 require_confirmation，risk_level 为 high。
-- 此 built-in policy 位于 explicit rules 之后、permission mode 之前；所有 permission mode，包括 permissive 和 trusted，均不得自动放行未知 MCP tool。只有明确 allow rule 或用户确认可以放行。
-- 用户选择 session confirmation 时，SessionPermissionRules 必须按 mcp_server 与 mcp_tool 创建 session allow rule；once confirmation 不持久化。
-- hard denylist、workspace sandbox、explicit deny 和 Plan Mode 在各自适用范围内不可被 MCP、permission mode、allow rule 或 HITL 绕过。
-- NewCode 不自动向 MCP Server 传递 workspace root，也不因 adapter 有 ToolContext 就授予远端 server 本地 filesystem 权限。
-- 外部 server 的自身环境不是 NewCode workspace sandbox 可技术控制范围；本章不从任意 inputSchema 猜测路径字段并声称远端已被 sandbox。
-
-权限拒绝时，AgentLoop 必须写回既有 permission_denied ToolResult observation，按原始 tool call 顺序写入 session 并回灌下一轮模型；拒绝不得触发远端 transport 或 tools/call。
-
-## 错误模型
-
-- mcp_config_error：配置、transport 或变量展开失败。
-- mcp_discovery_failed：连接、协议协商或 tools/list 失败。
-- mcp_tool_schema_invalid：单个 remote tool schema 无效。
-- mcp_name_collision：稳定名称冲突。
-- mcp_server_unavailable：server 未 ready、已关闭或连接失效。
-- mcp_call_failed：SDK、transport 或协议异常。
-- mcp_tool_error：远端 CallToolResult.isError 为 true。
-
-所有错误转为 ToolResult.failure，包含安全 server/tool identity 和稳定 code。不得含 headers、env、URL credential、token、完整 stack trace 或未遮蔽 secret。MCP failure 不能成为 ProviderError，也不能终止整个 AgentLoop。
-
-## 兼容边界
-
-- CLI 创建内置 registry 后创建 MCPManager、执行 discovery、注册成功 adapter，并在 finally 中 shutdown。
-- 单 server failure 只输出安全摘要，不阻止 CLI。
-- MCP config、connection status、headers、env、discovery payload、secret 不进入 session 或 prompt。
-- /plan、/do、/exit 的既有行为不变且不污染 session。
-- Prompt 可提醒外部工具受权限检查；真正安全边界仅在 Permission System。
-- Provider 不导入 MCP、PermissionManager、PromptBuilder、system-reminder 或 cache_control。
-- 不新增 cache_control 或任何 Provider 专属缓存策略。
-- 六个内置工具名称、schema、执行逻辑、workspace 限制和 run_command 安全能力保持不变。
+会话历史发生外置替换、摘要替换或其他压缩性重写后，旧锚点不再可比较，必须失效；在下一次获得可信 usage 前，使用整个当前会话的近似值。摘要请求自身的 usage 对象描述的是压缩前输入，不能作为压缩后主会话的 usage 锚点。
 
 ## 功能需求
 
-- F1：支持 stdio 和 Streamable HTTP，不支持 legacy SSE。
-- F2：使用锁定版本官方 MCP Python SDK 的公开兼容机制；NewCode 不手写 JSON-RPC。
-- F3：支持 user 到 project config merge；同名项目 server 完整覆盖用户 server。
-- F4：env/header 变量展开失败只使对应 server unavailable。
-- F5：MCPManager 缓存并隔离每个 server connection/client，退出释放资源。
-- F6：config、startup、discovery、schema、call failure 必须 server-isolated。
-- F7：adapter 映射 name、description、inputSchema、arguments、result、error。
-- F8：namespaced name 稳定、可测试，不静默覆盖。
-- F9：MCP tool 仅 Do Mode 可见；Do Mode 外部工具可见性是 Registry/AgentLoop 的新增能力，Plan Mode 永不执行。
-- F10：全部 MCP tool 串行调度。
-- F11：全部 MCP tool 先经过 PermissionManager；拒绝不得调用远端。
-- F12：未命中 explicit allow/deny 的 MCP tool 默认 require_confirmation；所有 permission mode 包括 trusted 都不能静默放行。
-- F12a：session confirmation 必须为 MCP server/tool identity 建立可匹配的 session allow rule。
-- F13：permission_denied 作为 tool observation 回灌模型。
-- F14：Provider、Prompt、AgentLoop 与内置六工具职责边界不退化。
+### F1：第一层——工具结果预防性外置
+
+每个工具结果在进入会话前必须先按本章估算。达到或超过 **8,000 token** 的单个工具结果必须外置。外置后，原位置仅保留一个安全预览和一个相对文件路径。
+
+若一条消息内全部工具结果合计达到或超过 **12,000 token**，按单个结果估算值从大到小依次外置，直到该消息低于 12,000 token。估算相同时，按原始 tool-call 出现顺序处理，确保结果稳定。已因 8,000 token 规则外置的结果不重复处理。
+
+预览最多保留 1,200 个已脱敏字符，必须说明原始结果已外置、给出相对路径和省略状态；预览不得伪装为完整结果。工具结果以外的消息内容、尤其是用户原始消息，不得被第一层改写。
+
+### F2：外置存储与可恢复性
+
+外置内容只写入 workspace sandbox 内的会话专用目录：`.newcode/context-artifacts/<session-id>/`。这是 Context Management 的内部受控写入，不经 Agent 工具调用、ToolScheduler 或模型 tool call；不得写入该 sandbox 路径之外的任意位置。文件名只能由单调序号和安全生成的标识组成，不得使用用户输入、远端名称、URL、命令或 secret 作为文件名。
+
+每个文件保存一个可 JSON 转发的记录，至少包含格式版本、产生顺序、原始工具身份、已脱敏内容、是否截断和安全的长度信息。单个外置文件最多保存 20 MiB 的已脱敏内容；超过上限时只保存前段内容并明确标记截断，绝不声称可恢复完整结果。
+
+外置目录仅用于当前会话：正常退出后清理当前会话目录；下次启动可清理超过 7 天的该专用目录中的陈旧会话，但不得删除该目录之外的任何工作区文件。文件必须以仅当前用户可读取的方式创建，受平台能力限制时至少不得主动放宽既有默认权限。
+
+外置写入、序列化或脱敏失败时，不得生成虚假的路径或丢弃原始会话内容。系统保留该结果，输出不含敏感内容的安全诊断，并允许后续第二层按其正常规则处理会话。
+
+### F3：敏感信息处理
+
+写入预览、外置文件、结构化摘要、边界消息、CLI 状态或压缩错误前，必须使用既有的敏感值集合遮蔽已知值，并递归遮蔽名称表明敏感性的字段值（包括 token、secret、password、credential、authorization、cookie、api key 及其大小写/常见分隔变体）。headers、环境变量、URL credential、完整堆栈、远端原始错误和未遮蔽 tool payload 不得进入这些位置。
+
+用户原始消息在会话中不因压缩而被重写；但当其内容被复制到摘要、预览或任何外置记录时，已知敏感值必须遮蔽。若内容无法安全地序列化或遮蔽，只能记录“内容因安全原因未保留”的说明，不能保留原文副本。
+
+### F4：第二层——整体历史结构化摘要
+
+每次主模型 API 请求前，在完成第一层之后估算完整会话。自动摘要阈值为 **51,000 token**（64,000 减 13,000 安全余量）。达到或超过该阈值时，系统必须在调用主模型前尝试第二层压缩。
+
+从会话尾部向前选择原始近期消息，直到同时保留：
+
+- 约 10,000 token 的近期内容；以及
+- 至少 5 条消息。
+
+该保留区域取两项要求所需范围的较大者，并不得打断一个 tool call 与其对应 tool result 的完整交换。保留区域内的用户消息必须保留完整原文；当前系统约束和本章规定的边界消息也必须保留。仅位于该区域之前的可压缩历史可被摘要替代，其中较早用户消息可被摘要替换，但仍有效的用户约束必须尽可能逐字摘录，并明确标记为“原文摘录”或“归纳”。若不存在可压缩历史，不发送摘要请求，继续以安全诊断说明无法进一步自动压缩。
+
+已有的较早摘要属于可压缩历史，新的摘要必须吸收其仍有效信息，避免摘要链无限增长。压缩成功后，以一个结构化摘要替换被选择的历史，并紧随其后加入一条边界消息：早期工具结果已被外置或摘要；需要代码、命令输出或文件细节时，必须通过正常读取工具访问所列路径，不得把摘要当作原始事实或据此臆测实现细节。
+
+### F5：摘要请求与固定摘要结构
+
+摘要模型请求不得声明、注册、提供或执行任何工具。其指令必须明确要求先生成分析草稿，再生成正式摘要；草稿只用于本次摘要过程，绝不写入会话、外置文件、日志、CLI 输出或后续模型输入。若服务只能返回同一文本响应，系统必须在保存前丢弃草稿部分，只保留通过格式校验的正式摘要；格式不合格视为本次摘要失败。
+
+正式摘要必须使用以下固定部分，缺少任一部分即为失败：
+
+1. **用户目标与原文约束**：尽可能逐字摘录仍适用的用户要求；不能逐字保留的内容必须明确标为归纳。
+2. **当前任务状态**：已完成、正在进行和未开始的工作。
+3. **关键事实与决策**：已确认的行为、接口约束、失败原因和理由。
+4. **文件与工具结果索引**：相关文件、已外置工具结果的安全相对路径、是否截断以及读取建议。
+5. **验证证据**：已运行命令、可观察结果、已知失败或跳过原因。
+6. **后续动作与未决问题**：下一步、阻塞项、需要用户确认的选择。
+7. **安全与边界**：权限、模式、敏感信息和任何不得越过的约束。
+
+摘要必须区分证据、推断和未确认信息；不得杜撰文件内容、工具输出、用户意图、测试结果或权限结论。它只能使用提供的历史和已脱敏的外置索引。
+
+### F6：手动压缩与熔断
+
+用户可通过 `/compact` 手动请求压缩。手动触发也必须先执行第一层外置，再评估第二层；只要存在可压缩历史，`/compact` 必须强制进行一次摘要，此强制规则优先于 **61,000 token**（64,000 减 3,000 安全余量）手动阈值。61,000 token 仅用于报告当前上下文状态和是否建议手动压缩，不得阻止已请求的强制摘要；没有可压缩历史时只给出安全状态，不调用摘要模型。
+
+连续 3 次摘要失败后，摘要熔断器打开：自动摘要停止，主模型请求不得在本次请求中反复重试摘要，原会话保持不变。一次成功摘要重置失败计数。熔断打开时，普通请求只报告安全、简短的状态；用户再次执行 `/compact` 可明确发起一次单独尝试，成功则关闭熔断，失败则维持熔断。任何单次请求最多执行一次摘要尝试。
+
+摘要失败、熔断状态、手动结果和无法压缩的状态不得包含 prompt、工具输出、secret、完整异常或远端错误细节。
+
+### F7：调用顺序与边界
+
+普通主模型请求必须严格按以下顺序执行：
+
+1. 接收并保留新的用户消息或工具结果。
+2. 对本次新增或变更的工具结果执行敏感值处理和第一层外置。
+3. 使用 usage 锚点与近似估算评估完整会话。
+4. 在自动阈值达到时，至多进行一次第二层摘要；成功后重新估算。
+5. 构造主模型请求并发送；收到可信 prompt/input usage 时更新锚点。
+
+`/compact` 使用相同的前两步和安全处理，但按手动规则决定或强制第二层摘要。摘要 API 调用不递归触发本章的主模型预检查，也不拥有工具能力。
+
+Context Management 不得改变 Provider 的职责，不得绕过 AgentLoop、Plan/Do gate、PermissionManager、ToolScheduler 或 Tool executor；它也不得读取外置文件、调用工具或访问网络来“补全”摘要。六个内置工具及已有 MCP、Permission、Prompt 行为必须保持兼容。
+
+## 非功能需求
+
+- 所有阈值比较在等于边界时触发，行为可预测、可单元测试。
+- 外置顺序、文件路径格式、摘要保留区和 usage 锚点失效规则在相同输入下必须稳定。
+- 压缩不能修改仍保留的用户原文、近期消息或工具调用/结果配对关系。
+- 正常自动压缩不得在一次主模型请求前重复发出摘要调用。
+- 诊断应足以解释“已外置、已摘要、无法压缩、摘要失败或熔断”，但不得泄露敏感数据。
+
+## 非目标
+
+- 精确 tokenizer、按模型自动推断上下文窗口、机器学习或质量评分驱动的摘要策略。
+- 向量数据库、跨会话长期记忆、语义检索、自动恢复被截断的外置文件。
+- 修改或摘要远端 MCP server 的状态、资源、prompts 或调用结果以外的协议数据。
+- 向摘要模型提供工具、让摘要模型读文件、二次检查代码或执行命令。
+- 复杂的存储加密密钥管理、云同步、跨设备共享或自动提交外置内容。
 
 ## 验收标准
 
-- AC1：stdio config 正确解析 command、args、env，并能由 SDK 管理启动/关闭。
-- AC2：HTTP config 正确解析 url、headers，并用锁定 SDK 版本公开推荐的方式传递 headers。
-- AC3：user/project config merge 正确；同名项目 server 完整覆盖用户 server。
-- AC4：变量可展开；缺失变量不发送未展开占位符且不泄露 secret。
-- AC5：多 server 独立 discovery；一个 server failure 不影响内置工具和其他健康 server。
-- AC6：tools/list 分页完整收集。
-- AC7：adapter schema、arguments、success mapping 正确。
-- AC8：isError 和 SDK/transport exception 都变为稳定 ToolResult failure。
-- AC9：不同 server 同名 tool、slug 冲突、内置工具冲突均不会静默覆盖。
-- AC10：稳定名称跨启动一致，名称只含 ASCII [A-Za-z0-9_-] 且最大 64 字符；仅 slug 截断，digest 不截断。
-- AC11：同 server 复用 connection/client cache；CLI finally 在 EOF、/exit、KeyboardInterrupt 和启动后异常时调用幂等 shutdown，清理 HTTP/stdio/runtime resource。
-- AC12：Plan Mode 不暴露且不执行 MCP tool；Do Mode 暴露成功注册 MCP tool。
-- AC13：MCP tool 不进入 read-only 并发批，调用和回写顺序稳定。
-- AC14：PermissionManager 在 MCP call 前生效；hard denylist、workspace sandbox、explicit deny、Plan Mode 不被削弱。
-- AC15：未命中 explicit allow/deny 的 MCP tool 在 strict/default/permissive/trusted 均不会静默放行，需要 explicit allow 或确认；session confirmation 可建立 MCP identity session rule。
-- AC16：permission_denied observation 回灌下一轮模型，且拒绝不调用远端。
-- AC17：CLI 管理 startup/shutdown，server failure 不阻止 CLI。
-- AC18：Provider 保持 MCP-independent。
-- AC19：六个内置工具名称、schema、分类、基本行为不变。
-- AC20：MCP 新测试和既有完整 pytest 一起通过。
+- AC1：单个工具结果估算值等于或超过 8,000 token 时被外置；会话中只保留不超过 1,200 个已脱敏字符的预览和安全相对路径。
+- AC2：一条消息的工具结果合计等于或超过 12,000 token 时，按大小降序、同值按原始顺序外置，直到低于阈值；用户原文和非工具消息不被第一层改写。
+- AC3：外置记录仅位于 workspace sandbox 内的会话专用目录，属于不经 Agent 工具调用的内部受控写入，命名不含用户输入或 secret，保存已脱敏 JSON-safe 内容，20 MiB 上限和截断状态可观察。
+- AC4：已知敏感值和敏感字段不会出现在预览、外置记录、摘要、边界消息、CLI 状态或压缩错误中；无法安全处理的内容不会被伪造为已保存。
+- AC5：近似估算在相同消息输入下稳定，包含消息和工具结构开销；可信 API prompt/input usage 成为锚点，后续只估算增量。
+- AC6：历史被外置或摘要替换后，旧 usage 锚点失效；不完整或不合法 usage 不覆盖可信锚点。
+- AC7：自动请求在估算达到 51,000 token 时最多摘要一次；61,000 token 仅用于手动状态/建议，且 `/compact` 在存在可压缩历史时优先强制一次压缩。
+- AC8：第二层保留最近约 10,000 token 且至少 5 条消息的较大范围，保留完整 tool-call/result 交换、系统约束和其中用户消息的完整原文；较早历史由一个新摘要替换，仍有效的较早用户约束标明为原文摘录或归纳。
+- AC9：正式摘要含全部七个固定部分、区分证据与推断；分析草稿不进入会话、文件、日志或后续请求，摘要请求零工具调用。
+- AC10：成功摘要后存在边界消息，明确要求通过正常读取工具重新获取文件/工具细节，且包含安全的外置索引。
+- AC11：三次连续摘要失败会打开熔断器，不改变原会话，不产生自动重试循环；成功会重置计数，用户手动重试的行为可观察。
+- AC12：外置写入失败、摘要格式失败、摘要 API 失败和无可压缩历史均以安全诊断处理，不使主会话崩溃或泄露原始内容。
+- AC13：每次主模型请求的执行顺序为第一层、估算、必要的第二层、主请求；摘要请求本身不递归触发该顺序。
+- AC14：完整回归验证证明既有 Prompt、Permission、MCP、Plan/Do、ToolScheduler、Provider 和六个内置工具行为不变。
 
 ## 测试范围
 
-至少覆盖：stdio config parsing、HTTP config parsing、user/project config merge、环境变量展开、missing variable、multiple MCP servers、one server failure isolation、tools/list discovery 与分页、adapter schema mapping、tools/call success、tools/call error、duplicate remote names、内置工具冲突、connection/client caching、shutdown cleanup、Permission System cannot be bypassed、AgentLoop can invoke MCP-adapted tool、Provider remains MCP-independent、六个工具不变和全量 pytest 回归。
+至少覆盖以下自动化测试，并全部使用 fake provider、fake clock、临时工作区和本地 fixture：
 
-建议新增：
-
-- tests/test_mcp_config.py
-- tests/test_mcp_manager.py
-- tests/test_mcp_adapter.py
-- tests/test_mcp_permissions.py
-- tests/test_agent_loop_mcp.py
-- tests/test_cli_mcp.py
-
-同时扩展 Provider、ToolRegistry、AgentLoop、CLI、Permission 与既有六工具回归测试。
-
-## 预计模块变更
-
-预计新增：
-
-- newcode/mcp/__init__.py
-- newcode/mcp/config.py
-- newcode/mcp/types.py
-- newcode/mcp/naming.py
-- newcode/mcp/runtime.py
-- newcode/mcp/manager.py
-- newcode/mcp/adapter.py
-
-预计修改：
-
-- pyproject.toml：添加并锁定官方 MCP Python SDK dependency；implementation 开始前依据该版本公开 API 确认 transport、compatibility 与分页调用。
-- newcode/tools/types.py、newcode/tools/registry.py、newcode/agent/mode.py：支持 adapter 显式分类和 Do Mode 外部工具可见性的 dynamic schema export。
-- newcode/agent/loop.py：仅接入 Registry 的 mode-aware export，不加入 MCP protocol。
-- newcode/permissions/normalizer.py、rules.py、modes.py、types.py、session.py、confirmer.py：增加 MCP identity、rule match、session allow 与 conservative built-in policy。
-- newcode/cli.py：MCPManager startup/discovery/shutdown，且以 finally 覆盖所有交互退出路径。
-- newcode/prompt/modules.py：仅可增加稳定的外部工具权限提醒。
-
-不得修改 Provider 职责，不得把 MCP transport 放进 PromptBuilder，不得改变六个内置工具的执行实现。
+- 近似估算的字符、消息、tool-call/result 开销、边界等于阈值和 usage 锚点增量/失效规则。
+- 单结果阈值、消息累计阈值、最大优先顺序、稳定同值顺序、预览长度和用户原文不变。
+- 外置目录/文件名安全性、workspace sandbox 内部受控写入且零 Agent 工具调用、JSON-safe 写入、20 MiB 截断、正常清理、陈旧目录范围限制以及写入失败回退。
+- 已知 secret、敏感字段、URL credential、headers、环境变量和异常文本的遮蔽；不得通过预览、摘要、边界消息或 CLI 诊断泄露。
+- 自动 51,000 token 触发、61,000 token 仅状态/建议、`/compact` 优先强制压缩、无可压缩历史和一次请求至多一次摘要。
+- 尾部保留约 10,000 token/至少 5 条消息的较大范围、近期用户原文保留、较早用户约束的原文摘录/归纳标记、tool-call/result 完整配对、已有摘要再摘要与边界消息。
+- 摘要 prompt 的零工具能力、七部分格式校验、草稿丢弃、证据/推断标识和摘要失败后的会话不变。
+- 三次失败熔断、成功重置、熔断后自动禁用、显式手动单次重试和无循环。
+- AgentLoop 端到端 fake 工具流：大型工具结果外置、接近窗口时摘要、模型按边界消息重新读取文件，且 Permission/Plan/Do/MCP 调用链未被绕过。
+- CLI `/compact`、安全状态提示、EOF、异常退出和现有完整 pytest 回归。

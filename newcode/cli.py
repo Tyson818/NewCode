@@ -17,6 +17,7 @@ from newcode.agent import (
     StopReason,
 )
 from newcode.agent.mode import AgentMode
+from newcode.context.manager import ContextManager
 from newcode.config import ConfigError, load_config, resolve_api_key
 from newcode.mcp.adapter import MCPToolAdapter
 from newcode.mcp.config import load_mcp_config
@@ -38,6 +39,7 @@ DEFAULT_CONFIG_PATH = Path("config.yaml")
 EXIT_COMMANDS = {"/exit", "/quit", "exit"}
 PLAN_COMMAND = "/plan"
 DO_COMMAND = "/do"
+COMPACT_COMMAND = "/compact"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,6 +115,7 @@ def run_conversation(
     permission_confirmer: PermissionConfirmer | None = None,
     permission_mode: PermissionMode = PermissionMode.DEFAULT,
     permission_rules: PermissionRulesLoadResult | None = None,
+    context_manager: ContextManager | None = None,
 ) -> int:
     registry = registry or create_default_registry()
     tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
@@ -122,11 +125,16 @@ def run_conversation(
         confirmer=permission_confirmer
         or CliPermissionConfirmer(input_func=input_func, output=output),
     )
+    context_manager = context_manager or ContextManager(
+        session,
+        tool_context.workspace_root,
+        tool_context.sensitive_values,
+    )
     mode = AgentMode.DO
 
     print("NewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
-
-    while True:
+    try:
+      while True:
         try:
             user_input = input_func("你> ")
         except EOFError:
@@ -150,6 +158,17 @@ def run_conversation(
             mode = AgentMode.DO
             print("已切换到 Do Mode。", file=output)
             continue
+        if text == COMPACT_COMMAND:
+            status = context_manager.manual_compact(
+                lambda prompt: _generate_summary(provider, prompt)
+            )
+            messages = {
+                "compacted": "上下文已压缩。",
+                "no_history": "没有可压缩的历史。",
+                "failed": "上下文压缩未完成。",
+            }
+            print(messages[status], file=output)
+            continue
 
         print("NewCode> ", end="", file=output, flush=True)
         loop = AgentLoop(
@@ -158,6 +177,7 @@ def run_conversation(
             registry=registry,
             tool_context=tool_context,
             permission_manager=permission_manager,
+            context_manager=context_manager,
         )
 
         try:
@@ -169,6 +189,25 @@ def run_conversation(
         except KeyboardInterrupt:
             print("\n已中断当前任务。", file=output)
         print("", file=output)
+    finally:
+        context_manager.cleanup()
+
+
+def _generate_summary(provider: ChatProvider, prompt: str) -> str:
+    from newcode.session import ChatMessage
+
+    parts: list[str] = []
+    for event in provider.stream_chat(
+        [
+            ChatMessage(role="system", content="你是上下文摘要器。"),
+            ChatMessage(role="user", content=prompt),
+        ],
+        tools=[],
+        allow_tool_calls=False,
+    ):
+        if hasattr(event, "text"):
+            parts.append(event.text)
+    return "".join(parts)
 
 
 def _consume_agent_events(

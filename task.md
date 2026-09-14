@@ -1,737 +1,417 @@
-# Chapter 7：MCP Client 任务拆分
+# Chapter 8：Context Management 任务拆分
 
 ## 全局执行约束
 
-- 本文只拆分任务，不代表已进入实现。
-- 不得手写 JSON-RPC、request id、pending correlation 或 legacy SSE。
-- 不得新增 MCP resources、prompts、sampling、tasks、Apps、自动重连、复杂 OAuth、network sandbox 或 MCP 专属 UI。
-- Provider 不得导入 newcode.mcp、Permission 或 Prompt；MCP 模块不得导入 Provider；AgentLoop 不得直接使用 SDK transport。
-- 六个内置工具名称、schema、分类、执行行为及 run_command 安全边界不得改变。
-- 所有 MCP tool 固定为有副作用、Do Mode 可见、串行执行；Plan Mode 不可见。
-- MCP config、env、headers、secret、连接细节和远端错误不得写入 session、prompt、ToolResult metadata 或普通日志。
-- 每个 Phase 完成后必须运行 compileall 与该 Phase 的 targeted pytest；通过后才能进入下一 Phase。
-- 使用系统临时目录作为 pytest basetemp，例如 "$env:TEMP\newcode-pytest-<phase>"，不得使用仓库内相对 basetemp 目录。
+- 仅在每个 Phase 的前置 targeted pytest 和 `python -m compileall newcode` 通过后进入下一 Phase。
+- 所有 pytest 使用系统 TEMP 的独立 `--basetemp`；不用仓库目录作为临时目录。
+- 摘要模型请求必须显式零工具调用，且不得递归触发 Context Management 压缩；一次自动或手动摘要请求最多尝试一次。
+- artifact 只允许 Context Management 在 workspace sandbox 内的 `.newcode/context-artifacts/<session-id>/` 写入；它不是 Agent 工具调用，禁止任意其他写入路径。
+- 近期保留区用户消息必须逐字保留；不得为压缩、预览或摘要改写它们。
+- 连续 3 次摘要失败打开熔断；熔断后关闭自动摘要，`/compact` 仅可显式单次重试。
+- Provider 不得导入或理解 Context Management；Context Management 不得调用 Agent 工具、MCP、PermissionManager、ToolScheduler 或网络。
+- 不实现精确 tokenizer、自动窗口探测、向量记忆、云同步、真实网络或机器学习式摘要优化。
 
-## Phase 1：SDK 版本锁定与 API 验证
+## Phase 1：会话版本、近似 token 与 usage 锚点
 
-### T1：选择并锁定官方 MCP Python SDK
+### T1：建立 Context Management 类型与会话版本
 
-前置条件：
-- Chapter 7 spec.md 与 plan.md 已批准。
-- 当前环境尚未安装 MCP SDK。
+**前置条件：** Chapter 8 的 `spec.md`、`plan.md` 已批准。
 
-修改/新增文件：
-- pyproject.toml
+**允许修改/新增：**
 
-实现动作：
-- 调研并选定满足 Python 版本约束的官方 MCP Python SDK。
-- 将依赖锁定为明确版本，不使用无上限版本范围。
-- 不引入 JSON Schema validator 或其他与本章无关依赖。
-- 记录本章依赖的公开 API：stdio、Streamable HTTP、tools/list、tools/call、关闭和兼容模式。
+- 新增 `newcode/context/__init__.py`、`newcode/context/types.py`
+- 修改 `newcode/session.py`
+- 新增 `tests/test_context_estimator.py`
+- 必要时仅修改 `tests/test_session.py`
 
-对应测试：
-- tests/test_mcp_sdk_compatibility.py 的 import/version 断言。
+**实现动作：**
 
-完成判定：
-- SDK 已声明为固定版本。
-- 未修改任何 Provider、AgentLoop、Registry、Permission、CLI 或 MCP runtime 文件。
+1. 定义 session id、会话版本、usage 锚点、估算和压缩状态的领域类型。
+2. 为 ChatSession 增加受控的版本读取/替换能力；任何压缩性替换递增版本，普通既有消息追加语义不变。
+3. 保持消息顺序、tool-call/result 配对和用户消息原文不变。
 
-不得跨越的边界：
-- 不实现 transport。
-- 不以私有 SDK API 或手写 JSON-RPC 补齐缺失能力。
+**对应测试：** 会话版本单调递增、追加回归、替换后顺序/配对不变。
 
-### T2：建立 SDK 公开 API 兼容测试
+**完成判定：** 无 Provider、文件系统或工具调用时可验证类型与 session 版本语义。
 
-前置条件：
-- T1 已完成，SDK 可在项目环境安装和导入。
+**不得跨越的边界：** 不实现估算、artifact、摘要或 AgentLoop 接入。
 
-修改/新增文件：
-- tests/test_mcp_sdk_compatibility.py
+### T2：实现稳定近似估算与 usage 锚点
 
-实现动作：
-- 用 SDK 官方测试支持、fake 或最小 fixture 验证公开 API。
-- 覆盖 stdio 参数入口、HTTP headers 注入入口、tools/list 分页形态、tools/call 成功/isError、async context cleanup。
-- 验证 SDK 的公开兼容模式，而不假设传统 initialize 是 NewCode 固定步骤。
-- 若 API 不满足 spec，停止并回到 T1 调整版本或提出规格修订。
+**前置条件：** T1 通过。
 
-对应测试：
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_sdk_compatibility.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase1"
+**允许修改/新增：**
 
-完成判定：
-- 兼容测试覆盖所有本章必需 SDK 表面。
-- Phase 1 未通过时，不得进入任何依赖 SDK 的后续工作。
+- 新增 `newcode/context/estimator.py`
+- 修改 `newcode/context/types.py`、`newcode/context/__init__.py`
+- 修改 `tests/test_context_estimator.py`
 
-不得跨越的边界：
-- 不创建 MCPManager、adapter 或 CLI 接入。
-- 不访问真实外网或第三方 MCP Server。
+**实现动作：**
 
-## Phase 2：配置、命名与 schema 纯逻辑
+1. 按稳定 JSON、`ceil(chars / 2)`、消息 12、tool 24 和 1.20 系数实现全量估算。
+2. 实现可信 prompt/input usage 锚点及锚点后增量估算。
+3. 会话版本变化时使锚点失效；非法、缺失、负数 usage 与摘要请求 usage 不得覆盖锚点。
 
-### T3：定义 MCP 核心类型与安全错误表示
+**对应测试：** Unicode、结构化消息、tool call/result、边界相等、稳定性、锚点增量、失效和非法 usage。
 
-前置条件：
-- Phase 1 已通过。
-
-修改/新增文件：
-- newcode/mcp/__init__.py
-- newcode/mcp/types.py
-- tests/test_mcp_config.py
+**完成判定：** 相同输入产生相同估算，且可独立证明锚点不会跨压缩性会话版本使用。
 
-实现动作：
-- 定义 MCPServerConfig、MCPServerStatus、MCPToolDescriptor。
-- 定义可按 server 收集的 MCP 配置/发现错误表示。
-- 定义私有敏感值持有方式，避免 dataclass repr、错误和状态对象泄露展开值。
+**不得跨越的边界：** 不引入 tokenizer 依赖、模型窗口探测或 Provider 修改。
 
-对应测试：
-- 核心类型构造、字段读取、错误按 server 隔离和安全 repr。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_config.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase2"
+**Phase 验证：**
 
-完成判定：
-- 类型模块不导入 Provider、AgentLoop、PermissionManager、CLI 或 MCP SDK runtime。
+```powershell
+.\.venv\Scripts\python.exe -m compileall newcode
+.\.venv\Scripts\python.exe -m pytest tests/test_context_estimator.py -q --basetemp "$env:TEMP\newcode-pytest-context-phase1"
+```
 
-不得跨越的边界：
-- 不读取文件、不启动 server、不写配置文件。
+## Phase 2：敏感信息遮蔽与安全 artifact 存储
 
-### T4：实现独立 MCP 配置加载与 user/project 合并
+### T3：实现 Context Management 脱敏
 
-前置条件：
-- T3 已完成。
+**前置条件：** Phase 1 通过。
 
-修改/新增文件：
-- newcode/mcp/config.py
-- tests/test_mcp_config.py
+**允许修改/新增：**
 
-实现动作：
-- 读取 ~/.newcode/mcp.yaml 与 workspace/.newcode/mcp.yaml。
-- 支持顶层 mcp_servers map。
-- 按 user 到 project 合并；项目同名 server 完整覆盖用户条目。
-- 校验 server key、transport、stdio command/args/env、HTTP url/headers 与字段类型。
-- 空或缺失 MCP config 视为无 MCP server，不是启动错误。
+- 新增 `newcode/context/redaction.py`、`tests/test_context_redaction.py`
+- 修改 `newcode/context/types.py`
 
-对应测试：
-- 无文件、空文件、用户配置、项目覆盖、多个 server、未知 transport、字段类型错误。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_config.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase2"
+**实现动作：**
 
-完成判定：
-- 配置错误仅归属对应 server，其他配置仍可用。
+1. 复用既有敏感值集合，并递归遮蔽敏感字段名及常见变体。
+2. 将相同规则用于预览、artifact、摘要、边界消息和安全诊断。
+3. 不可安全序列化/遮蔽的值只产生安全占位说明。
 
-不得跨越的边界：
-- 不修改既有 AppConfig/load_config 的 config.yaml 行为。
-- 不接入 CLI。
+**对应测试：** 嵌套 token/secret/password/credential/authorization/cookie/api key、headers、env、URL credential、异常文本和已知值均不泄露。
 
-### T5：实现变量展开、stdio 环境策略与 secret 脱敏输入
-
-前置条件：
-- T4 已完成。
+**完成判定：** 所有 Context Management 输出均不含 fixture secret。
 
-修改/新增文件：
-- newcode/mcp/config.py
-- tests/test_mcp_config.py
+**不得跨越的边界：** 不改写会话里的用户原始消息，不写文件，不接入工具或 CLI。
 
-实现动作：
-- 展开 env/header 文本中的一个或多个 ${VAR}。
-- 变量缺失或空值时将该 server 标记 mcp_config_error，不保留或发送占位符。
-- 明确 stdio 最终环境为当前进程环境加显式 env 覆盖。
-- 将展开值写入仅供 runtime 使用的敏感值集合。
-
-对应测试：
-- 多变量展开、缺失/空变量、headers/env 两类输入、异常文本与对象 repr 不泄露 secret。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_config.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase2"
+### T4：实现 sandbox 内 artifact 写入、截断与清理
 
-完成判定：
-- 不存在未展开 placeholder 被送入有效 server 配置。
+**前置条件：** T3 通过。
 
-不得跨越的边界：
-- 不创建 HTTP client 或 subprocess。
-- 不把 secret 加入 ToolContext.sensitive_values 以外的公共状态。
+**允许修改/新增：**
 
-### T6：实现稳定 MCP 工具命名与轻量 schema 校验
+- 新增 `newcode/context/artifacts.py`、`tests/test_context_artifacts.py`
+- 修改 `newcode/context/types.py`、`.gitignore`
 
-前置条件：
-- T3 已完成。
+**实现动作：**
 
-修改/新增文件：
-- newcode/mcp/naming.py
-- newcode/mcp/config.py 或独立 schema helper
-- tests/test_mcp_naming.py
-- tests/test_mcp_config.py
-
-实现动作：
-- 生成 mcp__server_slug__tool_slug__identity_digest。
-- 主动校验最终名仅含 ASCII [A-Za-z0-9_-] 且最多 64 字符。
-- 只截断 slug，固定 digest 不截断。
-- 校验 inputSchema 是 object，type 为 object 或省略，关键成员可 JSON 转发。
-- 产出稳定的 schema/name 错误码。
+1. 解析 workspace root，只允许 `.newcode/context-artifacts/<safe-session-id>/` 为写入根。
+2. 以内部序号/生成标识命名 JSON-safe、已脱敏记录，限制 20 MiB 并记录截断状态。
+3. 拒绝绝对路径、`..`、恶意 session id、符号链接逃逸及 sandbox 外目标。
+4. 支持当前会话清理和专用根内超过 7 天的陈旧会话清理；写入失败不生成虚假路径。
 
-对应测试：
-- 跨调用稳定性、不同 server 同名 tool、slug collision、非法名称、64 字符边界。
-- schema 合法、type 错误、非 object、不可转发字段。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_naming.py tests/test_mcp_config.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase2"
+**对应测试：** 正常写入、20 MiB 截断、相对路径、写入失败、JSON-safe 失败、路径逃逸、零 Agent 工具调用、清理范围。
 
-完成判定：
-- 不引入 JSON Schema validator 新依赖。
-- 纯函数可独立测试。
+**完成判定：** artifact 唯一位于 workspace sandbox 内，且 `.gitignore` 忽略运行时 artifact 根。
 
-不得跨越的边界：
-- 不向 ToolRegistry 注册任何工具。
+**不得跨越的边界：** 不向 TEMP、用户目录或模型指定路径写入；不接入 AgentLoop、摘要或 CLI。
 
-## Phase 3：stdio runtime、manager 与 discovery
+**Phase 验证：**
 
-### T7：实现受控 async runtime bridge
+```powershell
+.\.venv\Scripts\python.exe -m compileall newcode
+.\.venv\Scripts\python.exe -m pytest tests/test_context_redaction.py tests/test_context_artifacts.py -q --basetemp "$env:TEMP\newcode-pytest-context-phase2"
+```
 
-前置条件：
-- Phase 1 与 Phase 2 已通过。
+## Phase 3：第一层工具结果外置
 
-修改/新增文件：
-- newcode/mcp/runtime.py
-- tests/test_mcp_manager.py
+### T5：实现单结果阈值与安全预览
 
-实现动作：
-- 创建唯一的同步到异步 runtime bridge。
-- 规定 runtime 是 event loop、SDK context、stdio subprocess 和后续 HTTP client 的唯一 owner。
-- 提供可测试、可幂等 shutdown 的生命周期接口。
+**前置条件：** Phase 2 通过。
 
-对应测试：
-- 创建、单次执行、异常、重复 shutdown。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_manager.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase3"
+**允许修改/新增：**
 
-完成判定：
-- adapter 或未来调用方无需自行创建 event loop。
+- 新增 `newcode/context/prevention.py`、`tests/test_context_prevention.py`
+- 修改 `newcode/context/types.py`、`newcode/session.py`
 
-不得跨越的边界：
-- 不实现 Registry/AgentLoop/CLI 接入。
-- 不用私有 SDK API。
+**实现动作：**
 
-### T8：创建 MCPManager stdio connection 与单 server discovery
+1. 对工具结果按 Phase 1 估算；单结果 `>= 8,000 token` 时写入 artifact。
+2. 仅以最多 1,200 个已脱敏字符的预览、相对路径和截断/省略状态替换工具结果表示。
+3. 外置成功才替换消息并失效 usage 锚点；失败保留原结果及安全诊断。
 
-前置条件：
-- T7 已完成。
-- Phase 1 的 stdio API 测试已通过。
+**对应测试：** 8K 等值/临界值、预览长度、脱敏、失败原子性、用户原文与 tool-result 配对不变。
 
-修改/新增文件：
-- newcode/mcp/manager.py
-- newcode/mcp/types.py
-- tests/test_mcp_manager.py
+**完成判定：** 单工具结果的外置幂等，且不修改任何非工具内容。
 
-实现动作：
-- 为每个 server 建立独立状态、SDK context、session、lock 和安全错误摘要。
-- 使用锁定 SDK 的 stdio 公共 API 启动 server。
-- 以公开 API 执行 protocol compatibility 和 tools/list。
-- 将远端结果转为 MCPToolDescriptor，暂不适配/注册。
+**不得跨越的边界：** 不调用 SummaryGenerator、Provider 或 Agent 工具。
 
-对应测试：
-- 成功 discovery、启动 command 失败、协议错误、tools/list 错误。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_manager.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase3"
+### T6：实现单消息累计阈值与稳定选择顺序
 
-完成判定：
-- 单 server failure 不会终止 manager 对其他 server 的工作。
+**前置条件：** T5 通过。
 
-不得跨越的边界：
-- 不让 CLI 启动 manager。
-- 不注册 Tool。
+**允许修改/新增：**
 
-### T9：完善 tools/list 分页、stdio cache 与关闭
+- 修改 `newcode/context/prevention.py`、`tests/test_context_prevention.py`
+- 必要时修改 `newcode/context/types.py`
 
-前置条件：
-- T8 已完成。
+**实现动作：**
 
-修改/新增文件：
-- newcode/mcp/manager.py
-- tests/test_mcp_manager.py
+1. 单消息工具结果累计 `>= 12,000 token` 时，按估算值降序外置。
+2. 同值按原始 tool-call 顺序；已外置结果跳过，直至消息低于阈值。
+3. 保持所有用户消息、assistant 非工具文本、tool-call id 和结果顺序不变。
 
-实现动作：
-- 按锁定 SDK 的公开分页模式收集完整 tool 列表。
-- 为同 server discovery 重用 session/cache，不重复启动 subprocess。
-- 同一 server 保留串行 lock。
-- shutdown 关闭 stdio context 并清空 cache。
+**对应测试：** 多结果排序、同值稳定性、12K 等值、重复预处理幂等和未外置结果保留。
 
-对应测试：
-- 多页列表、重复 discovery、多个 stdio server、一个 server failure isolation、重复 shutdown。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_manager.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase3"
+**完成判定：** 选择顺序可复现，且不产生第二套 artifact/脱敏路径。
 
-完成判定：
-- stdio lifecycle 可独立人工验收：启动、发现、关闭，无遗留子进程。
+**不得跨越的边界：** 不发起第二层摘要，不修改 Prompt 或 CLI。
 
-不得跨越的边界：
-- 不实现 HTTP 或 tools/call。
+**Phase 验证：**
 
-## Phase 4：HTTP、多 server、call 和 cleanup
+```powershell
+.\.venv\Scripts\python.exe -m compileall newcode
+.\.venv\Scripts\python.exe -m pytest tests/test_context_prevention.py -q --basetemp "$env:TEMP\newcode-pytest-context-phase3"
+```
 
-### T10：实现 Streamable HTTP connection 与 discovery
+## Phase 4：第二层摘要、边界消息与熔断
 
-前置条件：
-- Phase 3 已通过。
-- Phase 1 已验证 HTTP 公开 API 与 headers 注入方式。
+### T7：实现近期保留选择与摘要输入
 
-修改/新增文件：
-- newcode/mcp/runtime.py
-- newcode/mcp/manager.py
-- tests/test_mcp_manager.py
+**前置条件：** Phase 3 通过。
 
-实现动作：
-- 创建每 server 独立 HTTP client/transport。
-- 仅在私有 runtime 注入已展开 headers。
-- 复用现有 discovery descriptor 流程。
-- HTTP discovery failure 仅使该 server unavailable。
+**允许修改/新增：**
 
-对应测试：
-- fake HTTP transport/endpoint、headers 注入、HTTP discovery 成功/失败、stdio+HTTP 隔离。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_manager.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase4"
+- 新增 `newcode/context/history.py`、`newcode/context/summary.py`
+- 新增 `tests/test_context_history.py`、`tests/test_context_summary.py`
+- 修改 `newcode/context/types.py`
 
-完成判定：
-- 无真实网络依赖，HTTP client 可独立关闭。
+**实现动作：**
 
-不得跨越的边界：
-- 不修改 CLI、Registry 或 Permission。
+1. 自动阈值为 51K；从尾部保留约 10K token 与至少 5 条消息所需的较大范围。
+2. 保留完整 tool-call/result 交换、系统约束、边界消息及近期保留区内用户消息的完整原文。
+3. 较早用户消息可摘要替换，但仍有效约束须尽量逐字摘录并标记“原文摘录”或“归纳”；已有摘要参与再摘要输入。
 
-### T11：实现 manager tools/call、cache 和失败映射
+**对应测试：** 51K 触发、无可压缩历史、尾部边界、完整交换、近期用户原文、旧摘要再摘要。
 
-前置条件：
-- T10 已完成。
+**完成判定：** 可压缩区与保留区选择稳定，且不改写近期用户消息。
 
-修改/新增文件：
-- newcode/mcp/manager.py
-- tests/test_mcp_manager.py
+**不得跨越的边界：** 不调用真实 Provider、网络、文件读取工具或 CLI。
 
-实现动作：
-- 提供 call_tool_sync(server, remote_name, arguments)。
-- 通过 runtime bridge 调用 SDK tools/call。
-- 区分 success、isError、SDK/transport exception、unavailable。
-- 同 server call 串行，连接失效不自动 reconnect。
-- 不泄露 headers/env/URL credentials/stack trace。
+### T8：实现零工具摘要格式、草稿丢弃与边界消息
 
-对应测试：
-- success、isError、异常、unavailable、同 server cache、不同 server 隔离。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_manager.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase4"
+**前置条件：** T7 通过。
 
-完成判定：
-- MCP manager failure 仅作为受控 MCP 层结果返回。
+**允许修改/新增：**
 
-不得跨越的边界：
-- 不直接生成 ToolResult，不接入 AgentLoop。
+- 修改 `newcode/context/summary.py`、`newcode/context/history.py`
+- 修改 `tests/test_context_summary.py`、`tests/test_context_history.py`
 
-### T12：实现多 server 幂等 shutdown 与状态报告
+**实现动作：**
 
-前置条件：
-- T11 已完成。
+1. 定义注入式 SummaryGenerator；摘要请求显式空工具集合，且跳过 ContextManager 的预处理入口，绝不递归压缩。
+2. 生成要求“先草稿、后正式摘要”的固定 prompt，并要求响应严格使用且仅使用以下可解析包络：`<analysis_draft>...</analysis_draft>` 后接 `<structured_summary>...</structured_summary>`。
+3. 解析器只提取、保存并校验 `structured_summary` 的内容；`analysis_draft` 与原始完整响应不得写入 session、artifact、日志或 CLI。
+4. 缺失任一包络、同一包络重复、包络顺序错误、两个包络之外存在非空内容，或 `structured_summary` 缺少七个固定章节、证据/推断/未确认标识时，均视为摘要失败，且会话保持不变。
+5. 成功时以已校验的 `structured_summary` 替换早期历史并插入要求重新读取 artifact 的安全边界消息。
 
-修改/新增文件：
-- newcode/mcp/manager.py
-- tests/test_mcp_manager.py
+**对应测试：** generator 接收零工具、每次请求最多一次尝试；正确双包络的 `structured_summary` 被保存；草稿和原始完整响应不存储；缺失包络、重复包络、错误顺序、包络外非空内容、七段缺失均失败；边界消息、安全索引和失败原子性。
 
-实现动作：
-- 汇总安全 MCPServerStatus。
-- 逐 server cleanup；一个 cleanup 失败不阻塞其余。
-- 清理 HTTP clients、stdio contexts、subprocess 与 cache。
-- 支持 shutdown 多次调用。
+**完成判定：** fake generator 可证明不存在 tool call、文件读取或递归 prepare。
 
-对应测试：
-- 混合 transport、多 server、一个关闭失败、重复关闭、无 secret 的状态和错误摘要。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_manager.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase4"
+**不得跨越的边界：** 不让摘要模型执行工具、读取 artifact 或使用主请求的工具许可。
 
-完成判定：
-- manager 本身完成且仍未接入 CLI。
+### T9：实现连续失败熔断与单次手动重试
 
-不得跨越的边界：
-- 不增加自动重连或 health checking。
+**前置条件：** T8 通过。
 
-## Phase 5：Adapter、Registry 与 Mode
+**允许修改/新增：**
 
-### T13：实现 MCPToolAdapter 与 ToolResult 映射
+- 新增 `newcode/context/manager.py`
+- 修改 `newcode/context/types.py`、`newcode/context/history.py`
+- 新增 `tests/test_context_manager.py`
 
-前置条件：
-- Phase 4 已通过。
+**实现动作：**
 
-修改/新增文件：
-- newcode/mcp/adapter.py
-- newcode/mcp/__init__.py
-- tests/test_mcp_adapter.py
+1. 连续 3 次摘要失败后打开熔断，自动请求不再尝试摘要。
+2. 每次自动或手动压缩调用最多发起一次摘要请求；失败不改变历史。
+3. `/compact` 的未来入口可显式请求一轮单次重试；成功关闭熔断并归零失败计数，失败维持打开。
 
-实现动作：
-- 实现现有 Tool Protocol 的 spec/run。
-- 将 descriptor 的 name、description、inputSchema 映射为 ToolSpec。
-- 将 manager call success/isError/异常映射为 JSON-safe ToolResult。
-- metadata 仅含安全 mcp_server、mcp_tool、transport identity。
+**对应测试：** 三次失败、自动禁用、成功重置、熔断后手动单次重试、异常/格式失败统一计数。
 
-对应测试：
-- schema、arguments、success、isError、exception、无 SDK 原始对象和无 secret。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_adapter.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase5"
+**完成判定：** 无自动重试循环，熔断与会话状态跨多次请求可观察。
 
-完成判定：
-- adapter 不导入 Provider、Permission 或 AgentLoop。
+**不得跨越的边界：** 不实现 CLI 命令，不调用真实 API 或工具。
 
-不得跨越的边界：
-- 不将 adapter 注册进 CLI 或 Provider。
+**Phase 验证：**
 
-### T14：扩展 ToolRegistry 分类和冲突防线
+```powershell
+.\.venv\Scripts\python.exe -m compileall newcode
+.\.venv\Scripts\python.exe -m pytest tests/test_context_history.py tests/test_context_summary.py tests/test_context_manager.py -q --basetemp "$env:TEMP\newcode-pytest-context-phase4"
+```
 
-前置条件：
-- T13 已完成。
+## Phase 5：AgentLoop 请求前接入
 
-修改/新增文件：
-- newcode/tools/registry.py
-- tests/test_tools_registry.py
-- tests/test_agent_scheduler.py
+### T10：接入请求前顺序与 usage 回写
 
-实现动作：
-- 在不改变六内置分类的前提下，为注册工具维护显式 read-only/side-effect 与 Do-visible 属性。
-- MCP adapter 固定为 side-effect、Do-visible。
-- 保留 register 的重复 ValueError 作为最后防线。
-- registry/manager 在注册前检测内置冲突、稳定名冲突和 digest collision。
+**前置条件：** Phase 4 通过。
 
-对应测试：
-- 内置 schema 与分类不变、MCP 非只读、冲突拒绝、scheduler 对 MCP 串行。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_tools_registry.py tests/test_agent_scheduler.py tests/test_mcp_adapter.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase5"
+**允许修改/新增：**
 
-完成判定：
-- MCP tool 可存在 registry，但尚不得通过 CLI 调用。
+- 修改 `newcode/agent/loop.py`
+- 仅必要时修改 `newcode/agent/collector.py`、`newcode/agent/events.py`
+- 修改 `newcode/context/manager.py`、`newcode/context/__init__.py`
+- 新增 `tests/test_agent_loop_context.py`
+- 修改 `tests/test_context_manager.py`、必要时 `tests/test_agent_loop.py`
 
-不得跨越的边界：
-- 不改变六个实际工具行为。
+**实现动作：**
 
-### T15：扩展 Do Mode schema 与 Plan Mode gate
+1. 每次 `stream_chat` 前固定执行“新增消息/工具结果 → 第一层 → 估算 → 至多一次第二层 → 构造主请求”。
+2. 将窄 SummaryGenerator 回调从 AgentLoop 注入 ContextManager；摘要调用零工具、不递归 prepare。
+3. 仅在主请求成功返回可信 prompt/input usage 后记录锚点。
+4. 让一个 ChatSession 跨多轮 AgentLoop 复用同一 ContextManager。
 
-前置条件：
-- T14 已完成。
+**对应测试：** 多轮/工具循环顺序、usage 回写、自动摘要最多一次、摘要零工具、主请求保留既有 tools、取消与 Provider error 回归。
 
-修改/新增文件：
-- newcode/agent/mode.py
-- newcode/agent/loop.py
-- tests/test_agent_modes.py
-- tests/test_agent_loop.py
+**完成判定：** 所有压缩均发生在主 Provider 请求前，Provider 无 Context Management 导入。
 
-实现动作：
-- 保持 Plan Mode 固定三个内置只读工具。
-- 使 Do Mode 通过 Registry 导出六内置加 Do-visible external tools，不继续以固定 DO_TOOL_NAMES 代表完整集合。
-- 保持模型伪造 Plan Mode MCP call 为 disallowed_tool，且不进入 permission/manager。
-- 保持 unknown_tool 的既有行为。
+**不得跨越的边界：** 不让 ContextManager 执行工具、权限确认、MCP；不改变 Plan/Do、Permission、ToolScheduler 或工具排序。
 
-对应测试：
-- Plan/Do schema、Plan MCP disallowed、Do MCP 可见、六工具回归。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_agent_modes.py tests/test_agent_loop.py tests/test_tools_registry.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase5"
+### T11：验证端到端工具流与边界不绕过
 
-完成判定：
-- Phase 5 只完成 schema/loop 可见性；不得让 CLI 暴露或执行 MCP 工具。
+**前置条件：** T10 通过。
 
-不得跨越的边界：
-- Phase 6 未完成前，禁止进行 CLI MCP 调用接入。
+**允许修改/新增：**
 
-## Phase 6：MCP Permission 扩展
+- 修改 `tests/test_agent_loop_context.py`
+- 必要时修改 `tests/test_agent_loop.py`、`tests/test_agent_loop_mcp.py`
 
-### T16：扩展 MCP identity normalizer 与 Permission 数据类型
+**实现动作：**
 
-前置条件：
-- Phase 5 已通过。
+1. 用 fake provider 和本地 fixture 验证大工具结果外置后，模型仅见预览/路径。
+2. 验证边界消息令模型经既有 read_file 链路重新读取，而非从摘要推断细节。
+3. 覆盖 Plan/Do、Permission、MCP 和 scheduler 的既有 gate 仍生效。
 
-修改/新增文件：
-- newcode/permissions/types.py
-- newcode/permissions/normalizer.py
-- tests/test_mcp_permissions.py
-- tests/test_permissions_types.py
+**对应测试：** 外置→重新读取→最终回答流；Plan Mode、permission deny、MCP deny、串行调度和六内置工具回归。
 
-实现动作：
-- 从 MCP adapter/ToolCall 获取 mcp_server、mcp_tool、mcp_transport、mcp_arguments。
-- 保持原始 args 与 normalized args 的现有语义。
-- 不把远端 arbitrary arguments 误当成本地 path sandbox 输入。
+**完成判定：** Context Management 未绕过任何现有执行链路。
 
-对应测试：
-- MCP normalized args、非 MCP 工具不变、无 secret 输出。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_permissions.py tests/test_permissions_types.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase6"
+**不得跨越的边界：** 不测试真实网络、生产 secret 或第三方 MCP server。
 
-完成判定：
-- 当前 hard denylist/workspace sandbox 的适用范围没有被虚假扩大。
+**Phase 验证：**
 
-不得跨越的边界：
-- 不修改 Provider 或 MCP transport。
+```powershell
+.\.venv\Scripts\python.exe -m compileall newcode
+.\.venv\Scripts\python.exe -m pytest tests/test_context_manager.py tests/test_agent_loop_context.py tests/test_agent_loop.py tests/test_agent_loop_mcp.py -q --basetemp "$env:TEMP\newcode-pytest-context-phase5"
+```
 
-### T17：扩展 YAML rule matcher 与 session allow
+## Phase 6：CLI `/compact` 与 artifact 生命周期
 
-前置条件：
-- T16 已完成。
+### T12：增加会话级 ContextManager 与 `/compact`
 
-修改/新增文件：
-- newcode/permissions/types.py
-- newcode/permissions/rules.py
-- newcode/permissions/session.py
-- tests/test_permissions_rules.py
-- tests/test_mcp_permissions.py
+**前置条件：** Phase 5 通过。
 
-实现动作：
-- PermissionMatch 增加 mcp_server/mcp_server_glob/mcp_tool/mcp_tool_glob。
-- YAML parser 只接受明确新字段。
-- matcher 支持 exact/glob MCP identity。
-- session confirmation 可创建精确 MCP server/tool allow rule。
+**允许修改/新增：**
 
-对应测试：
-- explicit allow/deny、glob、无效字段、session rule 精确匹配、原 command/path rules 回归。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_permissions_rules.py tests/test_mcp_permissions.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase6"
+- 修改 `newcode/cli.py`
+- 修改 `newcode/context/manager.py`
+- 新增 `tests/test_cli_context.py`
+- 必要时修改 `tests/test_cli_tool_flow.py`
 
-完成判定：
-- session allow 不会因 server/tool 名相似而误放行。
+**实现动作：**
 
-不得跨越的边界：
-- 不允许 rule 直接绕过 hard denylist、sandbox 或 Plan Mode。
+1. 由 `run_conversation` 为同一 ChatSession 创建、复用 ContextManager，并绑定 workspace/sensitive values。
+2. 增加 `/compact`：先运行第一层；只要存在可压缩历史，强制进行一次摘要。
+3. 61K 只作为安全状态和建议显示，绝不阻止已请求的手动强制压缩。
+4. 无历史、摘要失败和熔断状态仅输出脱敏摘要，不输出 prompt、artifact 内容、headers、env 或异常堆栈。
 
-### T18：增加 conservative MCP built-in policy 与 CLI confirmer 摘要
+**对应测试：** 强制优先级、61K 状态、无历史、成功、失败、熔断后手动重试、既有 `/plan`/`/do`/`/exit` 回归。
 
-前置条件：
-- T17 已完成。
+**完成判定：** CLI 只委托 ContextManager，不重复实现摘要/存储逻辑。
 
-修改/新增文件：
-- newcode/permissions/builtins.py
-- newcode/permissions/manager.py
-- newcode/permissions/confirmer.py
-- tests/test_permissions_manager.py
-- tests/test_mcp_permissions.py
-- tests/test_cli_permissions.py
+**不得跨越的边界：** 不改变 MCP lifecycle、Permission confirmer、Provider 配置或既有命令含义。
 
-实现动作：
-- 在 explicit rules 之后、permission mode 之前增加 external MCP built-in policy。
-- 所有未显式 allow/deny MCP tools 返回 high-risk require_confirmation。
-- strict/default/permissive/trusted 均不能自动 allow 未授权 MCP tool。
-- CLI confirmation 安全显示 MCP server/tool；不得显示 secret 或完整 arguments。
+### T13：在所有 CLI 退出路径清理 artifact
 
-对应测试：
-- 四种 mode 的 MCP 默认确认、explicit allow/deny 优先级、once/session/deny、CLI 摘要脱敏。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_mcp_permissions.py tests/test_permissions_manager.py tests/test_cli_permissions.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase6"
+**前置条件：** T12 通过。
 
-完成判定：
-- 只有 explicit allow 或确认可放行未知 MCP tool。
+**允许修改/新增：**
 
-不得跨越的边界：
-- 不削弱已有 hard denylist、workspace sandbox、sensitive file 或内置权限策略。
+- 修改 `newcode/cli.py`
+- 修改 `tests/test_cli_context.py`
 
-### T19：验证 AgentLoop 的 MCP permission 回灌
+**实现动作：**
 
-前置条件：
-- T18 已完成。
+1. 在当前 CLI 生命周期的 finally 中清理当前会话 artifact，保留既有 MCP shutdown 顺序与幂等性。
+2. 覆盖 EOF、`/exit`、KeyboardInterrupt、AgentLoop 异常和启动后异常。
+3. 清理失败仅报告安全诊断，不影响其他 cleanup，且绝不清理 sandbox 外文件。
 
-修改/新增文件：
-- newcode/agent/loop.py（仅必要的 adapter identity/权限接入调整）
-- tests/test_agent_loop_mcp.py
-- tests/test_agent_loop_permissions.py
+**对应测试：** 每个退出路径、清理失败隔离、当前 session 目录清理、其他 session/工作区文件保留、CLI 输出脱敏。
 
-实现动作：
-- 确保 MCP call 在 scheduler 前完成 PermissionManager.check。
-- deny 时产生 permission_denied ToolResult，按原始 index 写入 session 并回灌下一轮。
-- deny/disallowed 时不得调用 adapter/manager。
-- 允许后按既有 scheduler 规则串行执行。
+**完成判定：** 退出后不遗留当前会话 artifact，且现有 CLI 行为不变。
 
-对应测试：
-- deny、allow、session allow、Plan disallowed、tool result 回灌、顺序稳定。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_agent_loop_mcp.py tests/test_agent_loop_permissions.py tests/test_agent_loop.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase6"
+**不得跨越的边界：** 不安装 tmux，不使用真实生产 secret 或真实网络。
 
-完成判定：
-- Phase 6 完整后才允许开展 CLI MCP 调用接入。
+**Phase 验证：**
 
-不得跨越的边界：
-- 不把 permission/MCP 逻辑放入 Provider。
+```powershell
+.\.venv\Scripts\python.exe -m compileall newcode
+.\.venv\Scripts\python.exe -m pytest tests/test_cli_context.py tests/test_cli_tool_flow.py tests/test_cli_mcp.py -q --basetemp "$env:TEMP\newcode-pytest-context-phase6"
+```
 
-## Phase 7：CLI 生命周期与端到端接入
+## Phase 7：全量回归与人工验收
 
-### T20：实现 CLI MCP startup、discovery 与 registry 注册
+### T14：执行全量自动回归与边界审计
 
-前置条件：
-- Phase 6 已全部通过。
+**前置条件：** Phase 1–6 全部 targeted pytest 通过。
 
-修改/新增文件：
-- newcode/cli.py
-- tests/test_cli_mcp.py
+**允许修改/新增：**
 
-实现动作：
-- main 创建内置 registry、ToolContext、PermissionManager 后加载独立 MCP config。
-- 创建 manager，逐 server discovery，成功 adapter 注册。
-- 单 server failure 输出脱敏 warning，不阻止 CLI/内置工具/其他 server。
-- 保持 run_conversation 可依赖注入测试。
-
-对应测试：
-- 无 config、成功 discovery、单 server failure isolation、Do/Plan schema 行为。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_cli_mcp.py tests/test_cli_agent_loop.py tests/test_cli.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase7"
-
-完成判定：
-- CLI 仅在 Phase 6 后才暴露 MCP tool。
-- Provider 不修改。
-
-不得跨越的边界：
-- 不在 run_conversation 内直接实现 transport。
-
-### T21：实现 CLI finally shutdown 覆盖退出路径
-
-前置条件：
-- T20 已完成。
-
-修改/新增文件：
-- newcode/cli.py
-- tests/test_cli_mcp.py
-- tests/test_cli.py
-
-实现动作：
-- 将 startup 后 run_conversation 放入 try/finally。
-- 覆盖 EOF、/exit、KeyboardInterrupt、交互异常、启动后异常。
-- 每个路径调用幂等 MCPManager.shutdown。
-
-对应测试：
-- fake manager 验证每种退出路径 cleanup；一个 server cleanup failure 不阻断整体。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_cli_mcp.py tests/test_cli.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase7"
-
-完成判定：
-- CLI 是 MCP lifecycle 唯一 owner。
-
-不得跨越的边界：
-- 不改变 /plan、/do、/exit 的 session 污染语义。
-
-### T22：补充最小 Prompt 外部工具权限提醒
-
-前置条件：
-- T20 已完成。
-- 仅当现有 Prompt System 缺少稳定提醒时执行。
-
-修改/新增文件：
-- newcode/prompt/modules.py
-- 必要时 newcode/prompt/reminder.py
-- tests/test_prompt_builder.py
-- tests/test_prompt_reminder.py
-
-实现动作：
-- 仅增加“外部工具同样受权限检查”的稳定提示。
-- 不加入 server name、URL、headers、env、状态、远端错误或 secret。
-- 不改变 PromptBuilder/session 污染边界。
-
-对应测试：
-- stable prompt 提示存在；system-reminder/session 行为不变。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_prompt_builder.py tests/test_prompt_reminder.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase7"
-
-完成判定：
-- Prompt 只是行为提醒，安全判断仍完全由 Permission System 负责。
-
-不得跨越的边界：
-- 不把 MCP transport 或 server 配置塞进 Prompt System。
-
-### T23：完成 CLI MCP 端到端工具流回归
-
-前置条件：
-- T20-T22 已通过。
-
-修改/新增文件：
-- tests/test_cli_mcp.py
-- tests/test_cli_tool_flow.py
-- tests/test_cli_agent_loop.py
-- tests/test_cli_permissions.py
-
-实现动作：
-- 用 fake MCP manager/adapter 和 provider 验证 Do Mode MCP tool 执行、ToolResult 回灌和最终自然语言回答。
-- 验证 Plan Mode 请求 MCP tool 只产生 disallowed_tool，绝不触发确认或远端调用。
-- 验证拒绝、确认允许和 server failure 不影响正常 CLI 流程。
-- 验证 DSML 不泄露。
-
-对应测试：
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_cli_mcp.py tests/test_cli_agent_loop.py tests/test_cli_tool_flow.py tests/test_cli_permissions.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase7"
-
-完成判定：
-- CLI MCP 主链路完成，且六内置工具回归通过。
-
-不得跨越的边界：
-- 不实现 MCP resources/prompts/sampling 或自动 reconnect。
-
-## Phase 8：全量回归与人工验收
-
-### T24：执行模块边界与新增功能审计
-
-前置条件：
-- Phase 1-7 targeted tests 全部通过。
-
-修改/新增文件：
 - 原则上不修改生产文件。
-- 仅在测试揭示回归时作最小修改。
+- 仅允许修复失败直接证明的最小模块，并同步补最小回归测试。
 
-实现动作：
-- 检查 Provider 不导入 MCP/Permission/Prompt。
-- 检查 MCP 模块不导入 Provider，AgentLoop 不导入 SDK transport。
-- 检查无 legacy SSE、cache_control、automatic reconnect、resources/prompts/sampling/tasks/Apps。
-- 检查 Registry 仍只有六内置工具加已发现 MCP adapters，未新增内置工具。
+**实现动作：**
 
-对应测试：
-- 既有 Provider、Tool Registry、Prompt、Agent、Permission、CLI 测试。
-- compileall newcode
-- .\.venv\Scripts\python.exe -m pytest tests/test_provider_tool_calls.py tests/test_deepseek_provider.py tests/test_tools_registry.py -q --basetemp "$env:TEMP\newcode-pytest-mcp-phase8"
+1. 审计 Provider 不导入 Context Management，Context Management 不导入工具/MCP/权限执行层。
+2. 审计 artifact 仅在 sandbox 专用目录、摘要零工具且不递归、近期用户原文未改写。
+3. 运行全部自动回归与差异检查。
 
-完成判定：
-- 职责边界和 scope guardrails 无违反。
+**对应测试：** 全部 Chapter 8 测试及 Agent、CLI、Prompt、Permission、MCP、Provider 回归。
 
-不得跨越的边界：
-- 不为通过审计而重构无关模块。
+**完成判定：** 全量测试通过；任何 skipped 项都有可复现环境原因；无范围外能力。
 
-### T25：运行全量自动回归
+**不得跨越的边界：** 不以人工验收替代测试，不为通过测试重构无关模块。
 
-前置条件：
-- T24 已通过。
+### T15：执行受控人工验收
 
-修改/新增文件：
-- 原则上无。
-- 若失败，仅修复失败直接证明的最小回归模块及对应测试。
+**前置条件：** T14 通过。
 
-实现动作：
-- 执行全量 compileall。
-- 执行全量 pytest，使用系统临时目录的明确子目录。
-- 失败后先重跑相关 targeted tests，再重跑全量。
+**允许修改/新增：** 无；若发现问题，先新增最小自动化回归测试，再修复最小缺陷。
 
-对应测试：
-- .\.venv\Scripts\python.exe -m compileall newcode
-- .\.venv\Scripts\python.exe -m pytest -q --basetemp "$env:TEMP\newcode-pytest-mcp"
+**实现动作：**
 
-完成判定：
-- 全量 pytest 通过。
-- 不新增工具、不改变六内置基本行为、不把 Prompt/MCP/Permission 策略塞进 Provider。
+1. 使用 fake provider/local fixture 验收普通会话、超大工具结果、自动摘要、`/compact`、三次失败熔断、退出清理和敏感输出。
+2. 验证模型需要细节时通过既有读取工具访问 artifact，而非按摘要臆测。
+3. 记录未使用真实网络、生产 secret 或第三方 MCP server 的证据。
 
-不得跨越的边界：
-- 不因测试方便而放宽 MCP 默认确认、Plan Mode 或 secret 边界。
+**对应测试：** 人工本地 CLI 流与 T14 全量自动回归结果。
 
-### T26：执行真实 CLI 人工验收
+**完成判定：** 所有验收场景有可观察证据，当前会话 artifact 在退出后已清理。
 
-前置条件：
-- T25 已通过。
-- 已准备不含生产 secret 的本地 stdio fixture 和可控 HTTP fixture。
+**不得跨越的边界：** 不安装 tmux；若环境无 tmux，报告原因并以自动化 CLI fixture 验收为依据。
 
-修改/新增文件：
-- 无；除非人工验收发现可复现的最小 bug。
+**Phase 验证：**
 
-实现动作：
-- 验收无 MCP config 的普通聊天。
-- 验收有效 stdio server discovery。
-- 验收无效 server 不影响内置工具。
-- 验收 Do Mode 获准 MCP tool 调用和最终回答。
-- 验收 Plan Mode MCP call 被拒绝且不访问远端。
-- 验收 trusted mode 下未知 MCP tool 仍要求确认。
-- 验收 /exit 后 stdio/HTTP 资源释放。
+```powershell
+.\.venv\Scripts\python.exe -m compileall newcode
+.\.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-context-final"
+git diff --check
+```
 
-对应测试：
-- 人工 CLI 命令与受控 fixture。
-- 若发现问题，先补最小自动化回归测试，再修复。
+## 执行顺序
 
-完成判定：
-- Chapter 7 验收项全部具备自动或人工证据。
+```text
+Phase 1: T1 -> T2
+Phase 2: T3 -> T4
+Phase 3: T5 -> T6
+Phase 4: T7 -> T8 -> T9
+Phase 5: T10 -> T11
+Phase 6: T12 -> T13
+Phase 7: T14 -> T15
+```
 
-不得跨越的边界：
-- 不在人工验收中接入真实生产 secret、复杂 OAuth 或未在 spec 内的 MCP 能力。
+任一任务出现测试失败、需要未列出的生产文件、无法保持摘要零工具/不递归边界、artifact sandbox 无法证明或近期用户原文可能被改写时，立即停止并报告；不得跳过验证或带着失败继续。

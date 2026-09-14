@@ -18,6 +18,7 @@ from newcode.agent.events import (
 )
 from newcode.agent.mode import AgentMode, allowed_tool_names, is_tool_allowed
 from newcode.agent.scheduler import ToolExecutionRecord, ToolScheduler
+from newcode.context.manager import ContextManager
 from newcode.permissions.manager import PermissionManager
 from newcode.permissions.types import (
     PermissionDecision,
@@ -41,6 +42,7 @@ class AgentLoop:
         config: AgentLoopConfig | None = None,
         prompt_builder: PromptBuilder | None = None,
         permission_manager: PermissionManager | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self.provider = provider
         self.session = session
@@ -50,6 +52,7 @@ class AgentLoop:
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.scheduler = ToolScheduler(self.registry)
         self.permission_manager = permission_manager or PermissionManager()
+        self.context_manager = context_manager
 
     def run(
         self,
@@ -86,6 +89,8 @@ class AgentLoop:
 
             collector = StreamingTurnCollector()
             try:
+                if self.context_manager is not None:
+                    self.context_manager.prepare(self._generate_summary)
                 provider_events = self.provider.stream_chat(
                     self._provider_messages(mode, iteration),
                     tools=self.registry.to_openai_tools(allowed_tool_names(mode, self.registry)),
@@ -109,6 +114,9 @@ class AgentLoop:
                     iteration=iteration,
                 )
                 return
+
+            if self.context_manager is not None:
+                self.context_manager.record_usage(turn_result.usage)
 
             if not turn_result.tool_calls:
                 if turn_result.assistant_content.strip():
@@ -250,6 +258,17 @@ class AgentLoop:
             permission_mode=self.permission_manager.mode.value,
         )
         return self.prompt_builder.build_messages(self.session.messages, context)
+
+    def _generate_summary(self, prompt: str) -> str:
+        messages = [
+            ChatMessage(role="system", content="你是上下文摘要器。"),
+            ChatMessage(role="user", content=prompt),
+        ]
+        parts: list[str] = []
+        for event in self.provider.stream_chat(messages, tools=[], allow_tool_calls=False):
+            if hasattr(event, "text"):
+                parts.append(event.text)
+        return "".join(parts)
 
     def _make_unknown_tool_result(self, tool_call: ToolCall) -> ToolResult:
         return make_failure_result(

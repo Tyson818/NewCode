@@ -10,3 +10,4 @@ __pycache__/
 .env
 .pytest-basetemp-*/
 Newcode.lnk
+.newcode/context-artifacts/

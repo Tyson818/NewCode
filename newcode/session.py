@@ -28,6 +28,15 @@ class ChatMessage:
 @dataclass
 class ChatSession:
     messages: list[ChatMessage] = field(default_factory=list)
+    _context_version: int = field(default=0, init=False, repr=False)
+
+    @property
+    def context_version(self) -> int:
+        return self._context_version
+
+    def replace_messages(self, messages: list[ChatMessage]) -> None:
+        self.messages = list(messages)
+        self._context_version += 1
 
     def add_user_message(self, content: str) -> None:
         self._add_text_message("user", content)
