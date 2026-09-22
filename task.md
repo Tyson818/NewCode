@@ -1,63 +1,46 @@
-# Chapter 9：Project Instructions、Session Persistence 与 Automatic Memory 任务
+# Chapter 10：Command Registry & Dispatcher 原子任务
 
-## 文件清单
+## T1：命令模型与稳定错误
 
-预计新增：`newcode/instructions.py`、`newcode/persistence.py`、`newcode/memory/__init__.py`、`newcode/memory/types.py`、`newcode/memory/store.py`、`newcode/memory/service.py`，以及 `tests/test_instructions.py`、`tests/test_session_persistence.py`、`tests/test_memory_store.py`、`tests/test_memory_service.py`、`tests/test_prompt_memory.py`、`tests/test_agent_loop_memory.py`、`tests/test_cli_session.py`、`tests/test_cli_memory.py`。
+前置：无。允许：新增 `newcode/commands/__init__.py`、`types.py`、`tests/test_commands_registry.py`。动作：定义类别、元数据、可见性、解析/outcome 与安全码。测试：不可变定义、名称规范化、无敏感错误。完成：模型不依赖 CLI/Provider/工具。边界：不注册命令、不改 CLI。
 
-预计修改：`newcode/session.py`、`newcode/prompt/modules.py`、`newcode/prompt/builder.py`、`newcode/agent/loop.py`、`newcode/cli.py`，以及必要的既有对应测试。不得修改 Provider、MCP、Permission、ToolRegistry、ToolScheduler、依赖或现有 Context Management 的安全语义。
+## T2：静态注册中心
 
-## T1：路径与错误基础
+前置：T1。允许：`registry.py`、registry 测试。动作：静态注册、规范名/别名冲突启动失败、可见帮助、排序候选。测试：重复名、别名交叉冲突、casefold、隐藏过滤。完成：冲突零覆盖。边界：不得读取配置或运行时注册。
 
-前置：无。允许：`newcode/instructions.py`、`tests/test_instructions.py`。动作：定义受控 user/workspace 根、相对路径验证、符号链接/逃逸拒绝与安全错误码。测试：恶意绝对路径、`..`、link、编码/读取失败。完成：根外零读写且错误不泄露。边界：不加载 prompt、不写 session。
+## T3：解析器与补全
 
-## T2：三层指令和 include
+前置：T1–T2。允许：`dispatcher.py`、dispatcher 测试。动作：区分普通文本、slash、未知/错误参数，实现唯一补全/多候选菜单/隐藏排除。测试：大小写、空白、未知、无副作用、参数尾部。完成：未知 slash 不成为 AI 输入。边界：不得执行 handler、LLM、工具或文件。
 
-前置：T1。允许：`newcode/instructions.py`、`tests/test_instructions.py`。动作：加载 user/workspace/project，低至高合并，5 层 include、visited 防环、来源标记。测试：优先级、环、重复、超深、单层失败隔离。完成：结果稳定且无 session 变更。边界：不让指令授权工具。
+## T4：UI control interface
 
-## T3：会话 ID 与 JSONL 序列化
+前置：T1。允许：`ui.py`、UI 测试。动作：定义渲染无关协议、CLI adapter、fake UI。测试：info/error/help/menu/mode 调用。完成：handler 不直接依赖 print。边界：不引入 TUI/GUI 依赖。
 
-前置：T1。允许：`newcode/session.py`、`newcode/persistence.py`、`tests/test_session_persistence.py`、必要的 `tests/test_session.py`。动作：生成并校验 `YYYYMMDD-HHMMSS-[a-z0-9]{4}` ID，后缀使用安全随机源；同秒文件冲突仅重抽后缀、最多 16 次，排他创建且绝不覆盖已有会话。版本 header、脱敏 JSON-safe message/checkpoint。测试：格式、字符集、同秒不冲突、16 次耗尽安全失败与零覆盖、稳定 round-trip、敏感遮蔽、原子失败回退。完成：不会持久化 raw secret 或覆盖归档。边界：不接 CLI。
+## T5：纯本地内置命令
 
-## T4：恢复、截断与 30 天清理
+前置：T2–T4。允许：`builtins.py`、内置测试，必要时最小安全状态 accessor。动作：实现 help/compact/clear/session（及旧别名）/memory/permission/status。测试：成功、错误、脱敏、session/Context/Memory 隔离。完成：无主模型/工具/MCP 调用。边界：不改 Context/Memory 策略。
 
-前置：T3。允许：`newcode/persistence.py`、`newcode/session.py`、`tests/test_session_persistence.py`。动作：坏行跳过、有效记录恢复、未配对尾部截断、24 小时提醒信息、30 天限定清理。测试：损坏 JSONL、孤立 result、未完成 call、活动/根外/链接保留。完成：Provider 前消息合法。边界：不删除 sandbox 外或坏文件。
+## T6：模式与预设 AI 命令
 
-## T5：记忆类型、frontmatter 与 store
+前置：T5。允许：`builtins.py`、内置测试。动作：实现 plan/do state outcome 与无参数 review 固定 AI input outcome。测试：模式不改 Permission；review 非动态。完成：review 不直接调用 Provider。边界：不修改 PromptBuilder/Provider。
 
-前置：T1。允许：`newcode/memory/__init__.py`、`types.py`、`store.py`、`tests/test_memory_store.py`。动作：用户偏好、纠正反馈、项目知识、参考资料四类、user/project scope、frontmatter、索引和原子写。测试：workspace 指纹隔离、字段校验、敏感遮蔽、半成品失败，以及两个 scope 各自 200 行和 25 KB 的边界/超限拒绝。完成：两个限制均满足且不跨 scope。边界：不调用 LLM。
+## T7：CLI dispatcher 接入
 
-## T6：受限记忆选择与动态提示
+前置：T3–T6。允许：`newcode/cli.py`、`tests/test_cli_commands.py`、必要既有 CLI 测试。动作：exit 优先、分派 outcome、只有 ai_input 入 AgentLoop、迁移旧分支/别名。测试：命令循环、未知引导、普通文本、EOF、exit、checkpoint/finally。完成：既有注入仍可用。边界：不改 MCP/Provider/Permission 语义。
 
-前置：T5、T2。允许：`newcode/memory/store.py`、`newcode/prompt/modules.py`、`newcode/prompt/builder.py`、`tests/test_memory_store.py`、`tests/test_prompt_memory.py`。动作：8 条/6000 字符稳定选择，组合指令与记忆为动态 system message，并使 project、workspace、user 指令按高到低出现。测试：三层优先级/注入顺序、空/失败回退、不会写入 session。完成：来源与非授权提示可观察。边界：不改 reminder/Provider。
+## T8：安全 gate 回归
 
-## T7：记忆 LLM 结果与去重
+前置：T7。允许：回归测试；源码仅失败直接证明时最小修复。动作：证明 review 经 AgentLoop，Plan/Do、Permission、ToolScheduler、MCP、Context、Memory 未绕过。完成：fake provider/fixture 通过。边界：无命令级权限或网络。
 
-前置：T5。允许：`newcode/memory/service.py`、`store.py`、`tests/test_memory_service.py`。动作：构造零工具、零文件读取的受限去重请求，严格解析 create/update/merge/ignore。测试：重复合并、格式错、远端异常、敏感输入。完成：LLM 决策而非规则去重，失败零写入。边界：单次任务最多一次请求，不递归。
+## T9：全量验收
 
-## T8：异步服务与关闭
+前置：T1–T8。允许：仅失败直接证明的最小模块与回归测试。动作：compileall、全量 pytest、diff check、静态调用审计、受控 CLI 验收。完成：记录 skip 原因；不用网络、secret、第三方 MCP、tmux。边界：不进入 Chapter 11。
 
-前置：T7。允许：`newcode/memory/service.py`、`tests/test_memory_service.py`。动作：单 worker/有界队列、幂等 shutdown、有界等待与失败隔离。测试：提交不阻塞、队列满、安全取消/关闭、写入顺序。完成：无任务阻断主线程。边界：不引入网络或工具。
+每项完成后：
 
-## T9：AgentLoop 自然完成集成
+```powershell
+python -m compileall newcode
+python -m pytest <该项 tests> -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter10-tN"
+```
 
-前置：T6、T8。允许：`newcode/agent/loop.py`、必要时 `newcode/agent/events.py`、`tests/test_agent_loop_memory.py`、必要时 `tests/test_agent_loop.py`。动作：请求前读动态背景；仅 `AgentFinalAnswer` 后提交快照。测试：final 一次、provider error/cancel/permission deny/max iteration 零提交、工具顺序不变。完成：主回复无等待。边界：不绕过 Plan/Do、Permission、MCP、Scheduler。
-
-## T10：CLI session 生命周期
-
-前置：T4、T9。允许：`newcode/cli.py`、`persistence.py`、`tests/test_cli_session.py`。动作：`/sessions` 仅展示当前 workspace 可恢复会话的 ID、标题/安全摘要、最后更新时间、消息数；`/resume <session-id>` 恢复指定会话，配合 checkpoint、24h 提醒、30d 清理。测试：无归档行为保持、恢复、坏文件、无效/过期/跨 workspace/不可恢复 ID 的脱敏提示。完成：CLI 输出与列表均脱敏、无跨 workspace 信息泄露。边界：不改配置/Provider。
-
-## T11：CLI memory/cleanup 编排
-
-前置：T8、T10。允许：`newcode/cli.py`、`tests/test_cli_memory.py`、必要时 `tests/test_cli_context.py`。动作：finally 依序安全归档、memory shutdown、context cleanup，互不阻断。测试：EOF、`/exit`、KeyboardInterrupt、loop 异常、启动后异常、MCP cleanup 回归。完成：每条路径可观察。边界：不清除其他 session/workspace。
-
-## T12：Chapter 9 targeted 回归
-
-前置：T1–T11。允许：仅失败证明所需最小模块与测试。动作：运行所有 Chapter 9 测试及 Prompt/Session/AgentLoop/CLI/Context 回归。测试：`python -m compileall newcode`；`python -m pytest tests/test_instructions.py tests/test_session_persistence.py tests/test_memory_store.py tests/test_memory_service.py tests/test_prompt_memory.py tests/test_agent_loop_memory.py tests/test_cli_session.py tests/test_cli_memory.py tests/test_context_*.py -q --basetemp "$env:TEMP\newcode-pytest-chapter9-targeted"`。完成：全绿。边界：不以范围外重构解决。
-
-## T13：全量验收
-
-前置：T12。允许：同 T12。动作：静态依赖审计、fake CLI 人工验收。测试：`python -m compileall newcode`；`python -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter9-final"`；`git diff --check`。完成：记录 skip 原因、无真实网络/secret。边界：不安装 tmux；无法交互时以自动化 fixture 证据替代。
-
-## 执行顺序
-
-`T1 → T2 → T3 → T4`；`T1 → T5 → T6`；`T5 → T7 → T8`；`T6 + T8 → T9 → T10 → T11 → T12 → T13`。
+失败、冲突不安全、绕过 gate 或需要范围外设计时，立即停止并报告。

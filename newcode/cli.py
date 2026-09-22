@@ -17,6 +17,10 @@ from newcode.agent import (
     StopReason,
 )
 from newcode.agent.mode import AgentMode
+from newcode.commands.builtins import CommandRuntime, create_builtin_registry
+from newcode.commands.dispatcher import CommandDispatcher
+from newcode.commands.types import CommandOutcomeKind, CommandParseKind
+from newcode.commands.ui import CLIUIControl
 from newcode.context.manager import ContextManager
 from newcode.config import ConfigError, load_config, resolve_api_key
 from newcode.mcp.adapter import MCPToolAdapter
@@ -59,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     mcp_runtime = None
     mcp_manager = None
     memory_service = None
+    mcp_status_summary = "MCP 状态未提供。"
     try:
         config = load_config(Path(args.config))
         api_key = resolve_api_key(config.api_key_env)
@@ -76,7 +81,8 @@ def main(argv: list[str] | None = None) -> int:
         mcp_manager = MCPManager(mcp_config.servers.values(), runtime=mcp_runtime)
         for name, error in mcp_config.errors.items():
             print(f"MCP server unavailable ({name}): {error.code}", file=sys.stderr)
-        for name, descriptors in mcp_manager.discover_all().items():
+        discovered_servers = mcp_manager.discover_all()
+        for name, descriptors in discovered_servers.items():
             config_entry = mcp_config.servers[name]
             for descriptor in descriptors:
                 try:
@@ -85,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
                     registry.register(adapter, read_only=False, do_visible=True)
                 except (MCPToolSchemaError, ValueError):
                     print(f"MCP tool unavailable ({name}): mcp_tool_schema_invalid", file=sys.stderr)
+        discovered_tools = sum(len(descriptors) for descriptors in discovered_servers.values())
+        mcp_status_summary = f"MCP 已配置 {len(mcp_config.servers)} 个服务，已发现 {discovered_tools} 个工具。"
     except ConfigError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 1
@@ -114,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             permission_rules=permission_rules,
             session_archive=session_archive,
             memory_service=memory_service,
+            mcp_status_summary=mcp_status_summary,
         )
     finally:
         if memory_service is not None:
@@ -140,6 +149,7 @@ def run_conversation(
     context_manager: ContextManager | None = None,
     session_archive: SessionArchive | None = None,
     memory_service: MemoryService | None = None,
+    mcp_status_summary: str = "MCP 状态未提供。",
 ) -> int:
     registry = registry or create_default_registry()
     tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
@@ -159,6 +169,9 @@ def run_conversation(
         tool_context.sensitive_values,
     )
     mode = AgentMode.DO
+    command_registry = create_builtin_registry()
+    command_dispatcher = CommandDispatcher(command_registry)
+    command_ui = CLIUIControl(output=output, error_output=error_output)
 
     print("NewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
     try:
@@ -178,45 +191,65 @@ def run_conversation(
         if text in EXIT_COMMANDS:
             print("已结束对话。", file=output)
             return 0
-        if text == SESSIONS_COMMAND:
-            _print_sessions(session_archive, output)
+        parsed = command_dispatcher.dispatch_input(user_input, command_ui)
+        if parsed.kind is CommandParseKind.EMPTY:
             continue
-        if text.startswith(RESUME_COMMAND):
-            restored = _resume_session(session_archive, text)
-            if restored is None:
-                print("会话不可恢复。", file=output)
+        if parsed.kind is CommandParseKind.UNKNOWN:
+            continue
+        if parsed.kind is CommandParseKind.COMMAND:
+            if parsed.command is None:
                 continue
-            _safe_checkpoint(session_archive, session)
-            _safe_context_cleanup(context_manager)
-            session = restored.session
-            context_manager = ContextManager(
-                session,
-                tool_context.workspace_root,
-                tool_context.sensitive_values,
+            outcome = command_dispatcher.execute(
+                parsed.command,
+                _command_runtime(
+                    command_registry,
+                    context_manager,
+                    session,
+                    mode,
+                    session_archive,
+                    memory_service,
+                    permission_manager,
+                    mcp_status_summary,
+                    provider,
+                ),
+                command_ui,
             )
-            print(f"已恢复会话：{session.session_id}", file=output)
-            if restored.needs_time_span_reminder:
-                print("该会话距离上次更新已超过 24 小时，请先确认当前状态。", file=output)
-            continue
-        if text == PLAN_COMMAND:
-            mode = AgentMode.PLAN
-            print("已切换到 Plan Mode。", file=output)
-            continue
-        if text == DO_COMMAND:
-            mode = AgentMode.DO
-            print("已切换到 Do Mode。", file=output)
-            continue
-        if text == COMPACT_COMMAND:
-            status = context_manager.manual_compact(
-                lambda prompt: _generate_summary(provider, prompt)
-            )
-            messages = {
-                "compacted": "上下文已压缩。",
-                "no_history": "没有可压缩的历史。",
-                "failed": "上下文压缩未完成。",
-            }
-            print(messages[status], file=output)
-            continue
+            if outcome.kind is CommandOutcomeKind.HANDLED:
+                continue
+            if outcome.kind is CommandOutcomeKind.MODE_CHANGE:
+                mode = AgentMode(outcome.mode or AgentMode.DO.value)
+                command_ui.set_mode(mode.value)
+                continue
+            if outcome.kind is CommandOutcomeKind.CLEAR_SESSION:
+                session, context_manager = _clear_session(
+                    session,
+                    context_manager,
+                    session_archive,
+                    tool_context,
+                )
+                command_ui.info("已开始新会话。")
+                continue
+            if outcome.kind is CommandOutcomeKind.RESUME_SESSION:
+                restored = _resume_session(session_archive, f"/resume {outcome.session_id or ''}")
+                if restored is None:
+                    command_ui.error("session_restore_failed", "会话不可恢复。")
+                    continue
+                _safe_checkpoint(session_archive, session)
+                _safe_context_cleanup(context_manager)
+                session = restored.session
+                context_manager = ContextManager(
+                    session,
+                    tool_context.workspace_root,
+                    tool_context.sensitive_values,
+                )
+                command_ui.info(f"已恢复会话：{session.session_id}")
+                if restored.needs_time_span_reminder:
+                    command_ui.info("该会话距离上次更新已超过 24 小时，请先确认当前状态。")
+                continue
+            if outcome.kind is CommandOutcomeKind.AI_INPUT:
+                text = outcome.ai_input or ""
+            else:
+                continue
 
         print("NewCode> ", end="", file=output, flush=True)
         loop = AgentLoop(
@@ -245,6 +278,98 @@ def run_conversation(
         _safe_cleanup_stale(session_archive, session.session_id)
         _safe_memory_shutdown(memory_service)
         _safe_context_cleanup(context_manager)
+
+
+def _command_runtime(
+    registry,
+    context_manager: ContextManager,
+    session: ChatSession,
+    mode: AgentMode,
+    archive: SessionArchive | None,
+    memory_service: MemoryService | None,
+    permission_manager: PermissionManager,
+    mcp_status_summary: str,
+    provider: ChatProvider,
+) -> CommandRuntime:
+    """仅把既有的受控本地查询与生命周期能力交给内置命令。"""
+
+    def compact() -> str:
+        return context_manager.manual_compact(lambda prompt: _generate_summary(provider, prompt))
+
+    def list_sessions() -> tuple[object, ...]:
+        if archive is None:
+            return ()
+        try:
+            return archive.list_recoverable()
+        except Exception:
+            return ()
+
+    def list_memory(scope: str) -> tuple[object, ...]:
+        store = getattr(memory_service, "store", None)
+        if store is None:
+            return ()
+        try:
+            notes = store.select_for_prompt()
+        except Exception:
+            return ()
+        return tuple(note for note in notes if scope == "all" or note.scope.value == scope)
+
+    def permission_summary() -> str:
+        try:
+            session_rule_count = len(permission_manager.session_rules.rules)
+            diagnostics = len(permission_manager.rule_load_errors)
+        except Exception:
+            return "权限状态暂不可用。"
+        return (
+            f"权限模式：{permission_manager.mode.value}；"
+            f"会话规则：{session_rule_count} 条；安全诊断：{diagnostics} 项。"
+        )
+
+    def status_summary() -> str:
+        try:
+            estimated = context_manager.estimator.estimate(session.messages, session.context_version)
+            circuit = "已熔断" if context_manager.circuit_open else "正常"
+        except Exception:
+            estimated = 0
+            circuit = "不可用"
+        memory = "已启用" if memory_service is not None else "未启用"
+        return (
+            f"模式：{mode.value}；会话：{session.session_id or '未归档'}；"
+            f"上下文近似：{estimated} tokens；压缩熔断：{circuit}；"
+            f"自动记忆：{memory}；{mcp_status_summary}"
+        )
+
+    return CommandRuntime(
+        registry=registry,
+        manual_compact=compact,
+        list_sessions=list_sessions,
+        list_memory=list_memory,
+        permission_summary=permission_summary,
+        status_summary=status_summary,
+    )
+
+
+def _clear_session(
+    session: ChatSession,
+    context_manager: ContextManager,
+    archive: SessionArchive | None,
+    tool_context: ToolContext,
+) -> tuple[ChatSession, ContextManager]:
+    """保存旧会话并清理其 artifact 后创建独立的新受控会话。"""
+
+    _safe_checkpoint(archive, session)
+    _safe_context_cleanup(context_manager)
+    replacement = ChatSession()
+    if archive is not None:
+        _safe_create_session(archive, replacement)
+    return (
+        replacement,
+        ContextManager(
+            replacement,
+            tool_context.workspace_root,
+            tool_context.sensitive_values,
+        ),
+    )
 
 
 def _generate_summary(provider: ChatProvider, prompt: str) -> str:

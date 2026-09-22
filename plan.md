@@ -1,77 +1,104 @@
-# Chapter 9：Project Instructions、Session Persistence 与 Automatic Memory 实施计划
+# Chapter 10：Command Registry & Dispatcher 计划
 
-## 架构与调用顺序
+## 架构总览
+
+输入路径为：`CLI input -> exit 优先判断 -> CommandParser -> CommandRegistry/Dispatcher -> CommandOutcome -> UIControl 或既有 AgentLoop`。非 `/` 文本不经过命令注册中心，仍保持原 AgentLoop 路径；未知 `/` 文本停在分派器，绝不送模型。
 
 ```text
-CLI startup
-  -> 安全解析 workspace / user roots
-  -> InstructionLoader + SessionArchive.restore
-  -> ChatSession + ContextManager(session_id)
-每次 AgentLoop 主请求前
-  -> ContextManager.prepare -> PromptContextLoader(指令 + 记忆) -> PromptBuilder
-自然 AgentFinalAnswer 后
-  -> MemoryService.submit(snapshot) [后台，不等待]
-CLI finally
-  -> archive checkpoint -> memory shutdown(有界) -> context cleanup -> 原有 MCP shutdown
+CommandDefinition -> CommandRegistry -> CommandDispatcher
+                                      |       |       |
+                                   local    UI      fixed AI input
+                                      |       |       |
+                                  UIControl UIControl existing AgentLoop
 ```
 
-各持久化组件只拥有自己的受控根；所有路径经 `resolve()`、根包含性、文件类型和符号链接检查。动态提示只构造 Provider 消息，绝不写回 `ChatSession`。Provider 继续只接收消息、tools 与 `allow_tool_calls`，不导入本章模块。
+## 核心接口
 
-## 模块设计
+### CommandDefinition 与结果
 
-| 模块 | 责任 | 关键接口 |
-|---|---|---|
-| `newcode/instructions.py` | 三层加载、include 展开、来源/错误 | `load_project_instructions(workspace, user_root)` |
-| `newcode/persistence.py` | ID、JSONL checkpoint/restore、30 天清理 | `SessionArchive.create/append/restore/cleanup` |
-| `newcode/memory/types.py` | note/frontmatter/index/候选和结果领域类型 | 不依赖 Provider 或工具 |
-| `newcode/memory/store.py` | user/project 根、frontmatter、索引、原子读写/清理 | `MemoryStore.load_context/apply` |
-| `newcode/memory/service.py` | 有界异步队列、自然完成快照、LLM 去重、shutdown | `submit_after_natural_completion` |
-| `newcode/prompt/builder.py` / `modules.py` | 将动态背景插入 stable prompt 与 reminder 间 | 不改变 session |
-| `newcode/session.py` | 安全消息序列化/反序列化与 session ID | 保持当前 tool pairing 语义 |
-| `newcode/agent/loop.py` | 主请求前获取动态 prompt；自然 final 后通知 service | 不等待 memory |
-| `newcode/cli.py` | `/sessions`、`/resume <session-id>`、恢复提醒、checkpoint/finally 编排 | 保持现有命令和 MCP 生命周期 |
+`CommandDefinition` 为不可变静态元数据：`name`、`aliases`、`visibility`、`category`、`summary`、`usage`、`argument_spec`、`handler`。名称经去 `/` 与 `casefold()` 规范化。
 
-## 数据与格式
+`ParsedCommand` 保存原始输入、规范命令、参数 token 与参数尾部。`CommandOutcome` 只能表达 `handled`、`ai_input`、`mode_change`、`session_replaced`、`error`，不携带工具调用、Provider 或文件句柄。
 
-`SessionArchive` 使用 `YYYYMMDD-HHMMSS-[a-z0-9]{4}` ID；后缀来自安全随机源。同秒名称冲突时只重抽后缀，最多 16 次，以排他创建确保绝不覆盖已有归档；失败只返回安全错误。header 记录格式版本、session ID、workspace 指纹、创建/更新时间；message 记录使用 role/content/tool_calls/tool_call_id 的 JSON-safe 形式，敏感内容先遮蔽。恢复器按顺序保留可验证记录，使用未完成 assistant call 集合识别尾部截断。查询器按 workspace 指纹只返回可恢复的 ID、标题/安全摘要、最后更新时间和消息数。
+### UIControl
 
-`MemoryNote` 的类别固定为用户偏好、纠正反馈、项目知识、参考资料，使用受限 YAML frontmatter 和 Markdown 正文。文件名由受控 ID 生成；索引不存正文，只存安全 metadata，且 user/project 两个 scope 各自同时受最多 200 行及最大 25 KB 限制。记忆 LLM 输入是脱敏候选与最多 200 条 metadata，输出只能是 `ignore`、`create`、`update`、`merge` 的 JSON 包络；解析失败不落盘。
+`UIControl` 协议定义 `info(text)`、`error(code, text)`、`help(entries)`、`completion_menu(entries)`、`set_mode(mode)`。CLI adapter 映射到既有 `output/error_output`；fake UI 收集调用。handler 不直接 `print`。
 
-动态提示固定为：stable modules → `项目指令与记忆（动态背景）` → system reminder → session messages。该动态背景内的指令严格按 project → workspace → user 排列，随后才是经过 scope 筛选的记忆；它标识层级/来源/范围和“不是授权、必须核验工具事实”。
+### CommandRuntime
+
+分派器取得窄 `CommandRuntime`：当前 mode/session、ContextManager、SessionArchive、MemoryStore/MemoryService、PermissionManager、MCP 安全摘要、workspace。它只暴露已存在的安全查询及受控生命周期动作；不暴露 Provider、ToolRegistry、ToolScheduler 或 MCP client。`/review` 只返回固定 AI 输入，CLI 后续照常创建 AgentLoop。
+
+## 模块与文件
+
+| 文件 | 责任 |
+|---|---|
+| `newcode/commands/__init__.py` | 导出公共模型与默认注册表。 |
+| `newcode/commands/types.py` | 元数据、类别、解析、outcome、安全错误码。 |
+| `newcode/commands/registry.py` | 静态注册、规范化、冲突、帮助、补全候选。 |
+| `newcode/commands/dispatcher.py` | 输入解析、参数校验、handler 调用、未知引导。 |
+| `newcode/commands/builtins.py` | 十个内置命令和兼容别名。 |
+| `newcode/commands/ui.py` | UIControl 协议与 CLI adapter。 |
+| `newcode/cli.py` | 用 dispatcher 替换命令分支；保留输入循环、AgentLoop、finally。 |
+| `tests/test_commands_*.py` | 注册、解析、补全、UI、内置命令单测。 |
+| `tests/test_cli_commands.py` | CLI 命令及既有 gate 集成回归。 |
+
+原则上不修改 Provider、PromptBuilder、PermissionManager、ToolRegistry、ToolScheduler、MCP runtime/manager/adapter、Context 或 Memory 核心算法。测试直接证明缺少安全读取 accessor 时，才最小扩展。
+
+## 内置命令实现策略
+
+- `/help` 读取 registry 可见元数据，支持规范名或别名。
+- `/compact` 调用现有 `ContextManager.manual_compact`，复用已有零工具摘要 generator。
+- `/clear` 先 checkpoint、再 Context cleanup、再建新 `ChatSession`/archive/ContextManager；任何失败保留旧归档。
+- `/plan`、`/do` 只返回 mode outcome，CLI 更新 mode，不触及 Permission mode。
+- `/session` 调用 `SessionArchive.list_recoverable/restore`；兼容旧别名映射同一 handler。
+- `/memory` 使用 MemoryStore 的受控读取/选择接口，仅输出脱敏 metadata。
+- `/permission` 汇总 PermissionManager 的 mode、会话规则数和规则加载错误计数。
+- `/status` 汇总 CLI 已知状态、Context usage/熔断、MemoryService 状态和 MCP 已知 discovery 摘要；绝不主动探测。
+- `/review` 无参数时产生固定请求，后续走正常 AgentLoop；Plan/Do、Permission、ToolScheduler、MCP 仍在原位置生效。
 
 ## Phase
 
-### Phase 1：基础类型、路径安全与三层指令
+### Phase 1：注册、解析与 UI 边界
 
-目标：创建安全根/错误模型与指令加载器。文件：`newcode/instructions.py`、必要的 `newcode/session.py`、`tests/test_instructions.py`、`tests/test_session.py`。依赖：既有 sensitive/sandbox 原则。完成标准：三层优先级、include 5 层、cycle/visited/逃逸/符号链接、脱敏错误通过；不接入 Prompt/CLI。
+目标：命令模型、静态注册、冲突失败、大小写解析、帮助、补全、fake UI。文件：`newcode/commands/*`、`tests/test_commands_registry.py`、`tests/test_commands_dispatcher.py`、`tests/test_commands_ui.py`。完成：普通文本/未知 slash/参数错误稳定区分，隐藏命令不泄露。
 
-### Phase 2：JSONL 会话归档与恢复
+### Phase 2：内置命令与 CLI 迁移
 
-目标：实现 `[a-z0-9]{4}` 安全随机后缀的 session ID、16 次冲突重试、版本化 JSONL、坏行跳过、尾部工具配对截断、提醒与清理。文件：`newcode/persistence.py`、`newcode/session.py`、`tests/test_session_persistence.py`、必要的 `tests/test_session.py`。依赖：Phase 1 安全路径。完成标准：安全 checkpoint/restore/30 天清理、冲突零覆盖通过；不接入 CLI/AgentLoop。
+目标：十个处理器、兼容别名、CLI 接入。文件：`newcode/commands/builtins.py`、`newcode/cli.py`、`tests/test_commands_builtins.py`、`tests/test_cli_commands.py`及必要最小状态 accessor。完成：旧命令、退出、checkpoint、cleanup 顺序不变。
 
-### Phase 3：记忆存储与安全注入上下文
+### Phase 3：安全 gate、补全与端到端
 
-目标：实现用户偏好、纠正反馈、项目知识、参考资料四类 note、frontmatter、scope/index caps、动态 prompt 数据读取。文件：`newcode/memory/__init__.py`、`types.py`、`store.py`、`newcode/prompt/modules.py`、`builder.py`、`tests/test_memory_store.py`、`tests/test_prompt_memory.py`。依赖：Phase 1。完成标准：隔离、原子写、每个 scope 200 行和 25 KB 双重上限、8/6000 注入上限及指令高优先级在前的顺序通过；不调用 LLM、CLI 或 loop。
+目标：验证 `/review`、Plan/Do、Permission、MCP、Context、Memory、session 及补全无副作用。文件：Phase 2 测试与必要最小回归。完成：fake provider/local fixture 证据完整。
 
-### Phase 4：异步记忆服务与自然结束 hook
+### Phase 4：全量验收
 
-目标：有界后台任务、严格 LLM 结果解析/去重、自然 final 唯一触发、安全关闭。文件：`newcode/memory/service.py`、`newcode/agent/loop.py`、`tests/test_memory_service.py`、`tests/test_agent_loop_memory.py`。依赖：Phase 2–3。完成标准：主回复不等待、非自然结束零任务、失败零写入、关闭隔离通过；不改 Provider/MCP/Permission。
+目标：静态边界审计、全量测试、受控 CLI 人工验收。文件：仅失败直接证明的最小模块与测试。完成：无 tmux、网络、secret、第三方 MCP。
 
-### Phase 5：CLI 生命周期、恢复和 session 命令
-
-目标：启动恢复/新建、`/sessions`（仅当前 workspace 的 ID、标题/安全摘要、最后更新时间、消息数）、`/resume <session-id>`、checkpoint、时间提醒、清理和 finally 编排。文件：`newcode/cli.py`、必要时 `newcode/persistence.py`、`tests/test_cli_session.py`、`tests/test_cli_memory.py`。依赖：Phase 2、4。完成标准：无效、过期、跨 workspace、不可恢复 ID 安全失败；EOF、`/exit`、中断、loop 异常、启动后异常均安全；保持 `/plan`、`/do`、`/compact`、MCP 行为。
-
-### Phase 6：回归、审计与受控验收
-
-目标：全量验证与最小修复。允许文件仅为直接失败所需最小模块/测试。完成标准：全量 pytest、compileall、diff check、静态依赖审计、fake CLI 流通过；无真实网络/secret/tmux 安装。
-
-## 关键决定
+## 技术决定
 
 | 决定 | 选择 | 原因 |
 |---|---|---|
-| 指令优先级 | 加载为 user < workspace < project `AGENTS.md`；注入为 project → workspace → user | 兼容当前项目治理文件，且模型先见高优先级内容 |
-| include 限制 | 5 层、同层 root、canonical visited | 防环与路径逃逸 |
-| session 位置 | `~/.newcode/sessions` | 与工作区 runtime artifact 分离，避免提交 |
-| 记忆位置 | user root + workspace `.newcode/memory/project` | 明确跨项目边界 |
-| 异步机制 | 单 worker、有界队列、关闭有界等待 | 不阻塞回复且避免并发写冲突 |
-| 注入顺序 | stable 后、reminder 前 | 指令可见，仍由当前运行态提醒收束 |
+| 名称 | 去 `/` 后 `casefold()` | 一致的大小写无关查找及冲突检测。 |
+| 参数 | 非 shell 空白 token，不求值 | 十项命令无需路径表达式，安全且跨平台。 |
+| 未知 slash | 本地 `/help` 引导 | 避免控制输入进入模型。 |
+| 兼容 | `/sessions`、`/resume` 作为别名 | 保持 Chapter 9 可观察行为。 |
+| UI | 窄协议 + CLI adapter | 单测不绑定终端框架。 |
+| review | 固定字符串经 AgentLoop | 无动态 prompt，保留所有 gate。 |
+| 状态 | 仅已有状态快照 | 避免新网络生命周期。 |
+
+## 验证约定
+
+每 Phase 先：
+
+```powershell
+python -m compileall newcode
+python -m pytest <targeted tests> -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter10-phaseN"
+```
+
+最终：
+
+```powershell
+python -m compileall newcode
+python -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter10-final"
+git diff --check
+```

@@ -1,75 +1,81 @@
-# Chapter 9：Project Instructions、Session Persistence 与 Automatic Memory
+# Chapter 10：Command Registry & Dispatcher —— 统一 NewCode 的交互命令
 
 ## 背景与目标
 
-NewCode 当前只有进程内 `ChatSession`，退出后历史丢失；PromptBuilder 虽预留自定义指令和长期记忆模块，但没有受控来源；Context Management 只管理当前会话的大小。本章增加可审计的项目指令、可恢复的本地会话与保守的自动记忆，使长期工作连续而不越过既有权限、sandbox、Plan/Do 和工具调度边界。
-
-目标是：加载三层指令并确定优先级；以安全 JSONL 存档和恢复会话；在自然完成后异步生成有限、可去重的四类记忆，并在下一次主模型请求前注入相关范围。用户原文在活动会话与 Chapter 8 的近期保留区规则不变。
+NewCode 当前在 CLI 输入循环中以分支直接处理 `/plan`、`/do`、`/compact`、`/sessions` 和 `/resume`。本章建立固定、可测试的命令注册中心与分派器，统一命令发现、帮助、补全、状态输出和 AI 预设请求，同时保持已有会话、Context Management、Memory、MCP 与 Permission 的边界。命令不是工具，不是可扩展脚本系统，也不会绕过 AgentLoop。
 
 ## 功能需求
 
-### F1：三层项目指令
+### F1：命令注册、元数据与启动校验
 
-按低到高加载用户级 `~/.newcode/INSTRUCTIONS.md`、工作区级 `<workspace>/.newcode/INSTRUCTIONS.md`、项目级 `<workspace>/AGENTS.md`。高层与低层冲突时高层优先；注入动态 system message 时必须按高到低排列项目级、工作区级、用户级内容，并保留来源标签和此优先级说明。指令不能作为用户消息写入 `ChatSession`。
+注册中心只包含程序内定义的内置命令。每项元数据至少包含规范名、别名、可见性、简短帮助、使用格式、命令类别、参数约束及模式/会话影响说明；名称均以 `/` 开头。
 
-指令中的独立一行 `@include relative/path.md` 允许展开。包含路径相对当前指令文件；不得为绝对路径、不得含 `..`，解析后仍必须位于该层允许根（用户层为 `~/.newcode`，工作区/项目层为 workspace）内。最大嵌套深度为 **5**；以规范化解析路径维护 visited 集，重复或环引用只安全跳过一次。文件不存在、不可读、编码错误、越界、环或超深只产生脱敏错误码，不阻断其余层加载或正常对话。
+注册时以去除前导 `/` 后的 Unicode `casefold()` 形式比较规范名及别名。任意规范名或别名冲突时，启动以安全错误 `command_alias_conflict` 失败，绝不静默覆盖或按顺序择一。命令表不得由配置、会话、Prompt、MCP 或模型输出动态修改。
 
-### F2：JSONL 会话归档、恢复与清理
+### F2：解析与未命中
 
-每个 CLI 会话使用固定格式 `YYYYMMDD-HHMMSS-xxxx` 的稳定 session ID：前段为本地创建时间，`xxxx` 必须由安全随机源从 `[a-z0-9]{4}` 生成，用于防止同秒冲突。存档只可位于用户专用根 `~/.newcode/sessions/` 的 `<session-id>.jsonl`；禁止把用户提供的 ID 直接拼为路径，禁止符号链接/绝对路径/`..` 逃逸。若同一秒的候选文件名已存在，只重新生成后缀并最多尝试 16 次；全部冲突或创建失败时返回脱敏安全错误，绝不覆盖、截断或替换已有会话。首行是版本化元数据，后续每行是可 JSON 转发的消息或安全事件。每次自然完成的 turn 与关闭前均写入完整、已脱敏 checkpoint；写入须原子化或保证读者只接受完整记录。
+首个非空字符为 `/` 时，按 Unicode 空白拆分命令名与参数；命令名大小写不敏感，参数原样保留在参数尾部。本章命令不支持 shell 展开、变量替换、管道、引号求值或文件读取。参数数量或格式不符时仅显示安全用法，不发起模型、工具、MCP 或文件操作。
 
-恢复时验证 ID、版本、workspace 绑定和每条记录。坏 JSON、未知 record、字段类型错误或无法反序列化的行安全跳过并统计；不得因单坏行中止可用历史。恢复后的尾部若存在未配对的 assistant tool call、孤立 tool result 或不完整交换，则从第一个不完整交换开始截断；不得把半对交换发送给 Provider。恢复后继续复用 Context Management，且在下一次主模型请求前按既有规则执行预防性外置/必要压缩。
+未知 `/` 命令不送入 AI，输出安全“未知命令”提示及 `/help` 引导；普通非命令文本继续进入既有 AgentLoop，空白输入继续忽略。
 
-`/sessions` 只列出当前 workspace 可恢复会话的 session ID、标题或安全摘要、最后更新时间和消息数；列表不得包含其他 workspace 的会话内容或标识。`/resume <session-id>` 恢复指定会话。无效、过期、跨 workspace 或不可恢复 ID 只返回脱敏安全提示。恢复若距最后有效更新时间达到 **24 小时**，CLI 显示不含内容的时间跨度提醒。启动和关闭可清理最后有效更新时间超过 **30 天**的 session 文件；只能删除 session 根内已验证的普通归档文件，跳过活动会话、符号链接、坏文件和根外路径，清理失败互相隔离。
+### F3：命令类别与 UI control interface
 
-### F3：自动记忆
+命令只能属于：
 
-自动记忆仅保存长期有用且可操作的四类笔记：
+- **纯本地**：读取受控本地状态或执行既有本地生命周期动作；不启动主模型回合、Agent 工具或 MCP。
+- **界面状态**：只更新交互状态，例如 Plan/Do；不修改 Permission、Provider、会话历史或执行工具。
+- **预设提示词送入 AI**：只产生固定、程序定义的用户请求，随后仍经既有 AgentLoop 主路径。
 
-1. 用户偏好；
-2. 纠正反馈；
-3. 项目知识；
-4. 参考资料。
+处理器只依赖独立 UI control interface，而不是 `print` 或具体终端框架。该接口呈现安全信息、错误、帮助、补全菜单和模式状态；CLI 是适配器。处理器返回声明式结果，分派器决定是否进入正常 AI 回合。
 
-用户级笔记只位于 `~/.newcode/memory/user/`，可跨工作区使用；项目级笔记只位于 `<workspace>/.newcode/memory/project/`，必须含 workspace 指纹，绝不注入其他项目。每个笔记使用 YAML frontmatter（格式版本、ID、类别、scope、workspace 指纹、创建/更新时间、标签、来源 session 的安全标识）与 Markdown 正文。用户级与项目级索引均最多 **200 行**且最大 **25 KB**；新增、更新、合并与重建索引时必须同时验证两项限制，不能以任一项替代另一项。请求前最多注入 **8** 条且总正文不超过 **6,000** 字符，超限时按更新时间和相关标签稳定选择；该注入限制不得替代索引上限。笔记和索引中的敏感值必须遮蔽。决策和工作流经验只能作为项目知识或参考资料笔记的正文内容，不构成额外类别。
+### F4：十个内置命令
 
-LLM 负责在给定候选笔记与新候选时判定重复、合并、替换或忽略；它不拥有文件、工具、网络或权限能力。模型产出必须是严格可解析的受限结果，格式错误或异常时不写入记忆。自动记忆不得把短期工具输出、完整对话、secret、headers、环境变量、URL credential、完整堆栈或远端错误复制为笔记。
+| 命令 | 类别 | 参数与用途 | 输出与影响 |
+|---|---|---|---|
+| `/help` | 纯本地 | 可选命令名；显示可见命令或用法 | 不含隐藏命令、密钥、路径凭据或内部异常；不改状态。 |
+| `/compact` | 纯本地控制 | 无参数；迁移现有手动 Context 压缩 | 保持既有压缩/无历史/失败、artifact sandbox、零工具摘要与熔断。 |
+| `/clear` | 纯本地控制 | 无参数；checkpoint 当前会话后开始新受控 ChatSession | 清理旧 Context artifact；保留 Plan/Do、MemoryService、PermissionManager 与 MCP 生命周期。 |
+| `/plan` | 界面状态 | 无参数；切为 Plan Mode | 保持 Plan Mode 工具可见性与零 MCP 调用边界。 |
+| `/do` | 界面状态 | 无参数；切为 Do Mode | 保持既有 Permission、ToolScheduler 与 MCP adapter gate。 |
+| `/session` | 纯本地 | `list`（默认）或 `resume <session-id>` | 迁移 `/sessions`、`/resume <id>`；仅当前 workspace 安全摘要，拒绝无效/过期/跨 workspace/不可恢复 ID。 |
+| `/memory` | 纯本地 | 可选 `user`、`project`、`all`（默认） | 只显示受控、脱敏的记忆元数据/安全摘要；不调用 LLM、不写笔记。 |
+| `/permission` | 纯本地 | 无参数 | 显示当前 mode、会话规则计数和安全诊断摘要；不显示规则原文或敏感参数，不改变授权。 |
+| `/status` | 纯本地 | 无参数 | 显示 Plan/Do、session ID、上下文近似 usage/熔断安全状态、MemoryService 状态与 MCP 已知摘要；无网络 health check。 |
+| `/review` | 预设提示词送入 AI | 无参数 | 固定请求：“审查当前工作区未提交变更，说明风险、证据和建议，不擅自修改。”；完整通过 AgentLoop 与既有 gate。 |
 
-### F4：自然结束后的异步执行
+`/sessions` 是 `/session list` 的兼容别名，`/resume <id>` 是 `/session resume <id>` 的兼容别名；`/exit`、`/quit`、`exit` 保持 CLI 优先退出路径，不计入十个注册命令。
 
-只有 AgentLoop 产生正常最终回答（不是 Provider 错误、取消、权限拒绝、Plan Mode 禁止、最大轮数停止或异常）后，才可提交一次自动记忆任务。任务接收已脱敏、受大小限制的历史快照，异步、串行地运行，绝不阻塞已经交给 CLI 的主回复，也不改变 AgentLoop 的事件顺序。
+### F5：Tab 补全
 
-关闭时停止接收新任务；对正在运行的任务执行有界等待后取消/放弃，绝不为等待记忆阻断 CLI、Context artifact 清理或 MCP shutdown。写笔记必须通过临时同目录文件加原子替换，失败不得留下半成品。重复关闭安全，单项关闭失败不得阻断其余清理。
+补全只针对以 `/` 开头、尚未提交的命令名，使用与解析相同的大小写无关前缀匹配。隐藏命令永不参与候选、帮助或菜单。唯一匹配替换为规范名并保留参数；多个匹配不改输入，只经 UI control interface 显示按规范名排序的安全菜单；无匹配不显示候选。补全不运行命令、不请求 AI、不读写会话或文件。
 
-### F5：请求前 Prompt 注入
+### F6：兼容、安全与关闭
 
-每次主模型请求前，PromptBuilder 在稳定系统提示之后、现有 system reminder 之前，注入一条含项目指令与已筛选记忆的动态 system message。注入内容标明“背景信息而非用户输入”，来源、scope、可能过期性及不得绕过权限/工具结果验证；不写入 ChatSession，不参与 JSONL 原文记录，也不改变 Context Management 对近期用户消息的原文保护。
+`/compact`、`/plan`、`/do`、`/sessions`、`/resume`、`/exit` 的可观察语义必须保持。命令层不得改变 Provider 配置、PromptBuilder 稳定模块、Permission 决策、ToolRegistry、ToolScheduler、MCP discovery/runtime/adapter、Context 压缩策略、Memory 自动写入策略或既有关闭顺序。
 
-加载失败、没有指令、没有记忆、索引上限或记忆任务失败时，主请求仍正常进行。Provider 不导入或理解 Instruction、SessionArchive 或 Memory；这些功能不能绕过 AgentLoop、Plan/Do gate、PermissionManager、ToolScheduler、ToolRegistry、MCP 或 workspace sandbox。
+错误只使用稳定安全码或用户安全摘要；不得泄露 env、headers、secret、URL credential、完整异常、未脱敏会话内容、记忆正文或绝对路径。不得引入网络、真实第三方 MCP、生产 secret、tmux、RAG、向量数据库、自定义命令或动态生成的提示词。
 
-### F6：安全、错误与隐私
+## 非功能要求
 
-所有持久化、提示注入、CLI 状态和错误均使用既有敏感值遮蔽规则，并额外遮蔽常见敏感字段。稳定、安全的错误码包括 `instruction_load_failed`、`instruction_include_cycle`、`instruction_include_depth`、`instruction_path_outside_workspace`、`session_archive_failed`、`session_restore_failed`、`session_record_invalid`、`session_tool_pair_truncated`、`memory_index_failed`、`memory_note_invalid`、`memory_generation_failed`。不得显示 secret、原始路径凭据、完整堆栈、完整远端响应或原始会话内容。
+- 注册、解析、补全和 handler 可用 fake UI、fake provider、临时 workspace/home 及既有依赖注入独立测试。
+- 解析、注册和补全确定性；冲突、无效参数和 handler 失败不能破坏 CLI 循环。
+- 不新增依赖；每 Phase 先 `python -m compileall newcode`，再跑 targeted pytest；最终跑全量 pytest 与 `git diff --check`。
 
-## 非目标
+## 不做的事项
 
-- 向量数据库、embedding、RAG、语义搜索或机器学习式召回。
-- 团队同步、云同步、跨设备共享、远端备份或账户体系。
-- 复杂加密密钥管理、复杂 OAuth、真实第三方网络服务。
-- 修改 Provider 协议、MCP transport、Permission 规则语义、ToolScheduler 或六个内置工具。
-- 自动执行来自指令、会话或记忆的操作，或让记忆模型调用工具。
+- 自定义、插件化、配置驱动或运行时注册命令；
+- 动态生成 `/review` 等命令提示词；
+- 命令级 Permission、命令自身直接执行工具或绕过 AgentLoop；
+- GUI/TUI 重构、网络 health check、MCP 协议扩展；
+- 改变六个内置工具、Provider、MCP、Permission、Context 或 Memory 的安全模型。
 
 ## 验收标准
 
-- AC1：三层指令的加载顺序为 user < workspace < project，动态注入顺序为 project → workspace → user；5 层 include、visited 防环及 sandbox 防逃逸可由本地 fixture 观察，任一文件失败不阻断其他层。
-- AC2：`YYYYMMDD-HHMMSS-[a-z0-9]{4}` session ID 由安全随机源生成；同秒冲突只重试安全后缀、达到 16 次后安全失败且绝不覆盖已有归档。JSONL 写入/恢复、坏行跳过、尾部工具交换截断、24 小时提醒与 30 天受限清理可重复验证。
-- AC3：`/sessions` 仅显示当前 workspace 可恢复会话的 ID、标题/安全摘要、最后更新时间和消息数；`/resume <session-id>` 的无效、过期、跨 workspace 或不可恢复输入均不泄露信息。
-- AC4：活动会话仍遵守 Chapter 8 的外置与摘要；恢复不会发送不配对工具消息，近期用户原文不被持久化流程改写。
-- AC5：用户偏好、纠正反馈、项目知识、参考资料四类记忆，scope 隔离、frontmatter、每个 scope 的 200 行和 25 KB 双重索引上限、8 条/6,000 字符注入上限、LLM 去重和原子写入均可验证。
-- AC6：只在自然最终回答后异步排队；主回复、工具顺序和既有 gate 不被阻塞或改变；关闭安全且隔离失败。
-- AC7：敏感值、headers、环境变量、URL credential、完整堆栈及远端敏感内容不会进入归档、笔记、索引、prompt、CLI 或错误。
-- AC8：全量回归与 fake provider/local fixture CLI 验收通过；不使用真实网络、生产 secret 或第三方 MCP。
-
-## 测试范围
-
-新增指令、会话归档、记忆、Prompt/AgentLoop/CLI 集成测试，全部使用临时 home/workspace、fake clock、fake provider 与本地文件。覆盖恶意 include/ID/符号链接、坏 JSONL、多工作区隔离、崩溃/关闭路径、去重格式失败、动态 prompt 顺序、自然完成与非自然结束、Context Management 和既有 Permission/MCP/Plan-Do 回归。每个 Phase 运行 `python -m compileall newcode` 及其 targeted pytest；最终运行 `pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter9-final"` 与 `git diff --check`。
+- AC1：十个内置命令及兼容别名可发现；重复规范名/别名启动安全失败。
+- AC2：大小写不敏感解析、参数拒绝、未知 slash 的 `/help` 引导及普通文本进入 AgentLoop 有测试。
+- AC3：三类命令只执行其允许动作，UI control interface 可用 fake 实现验证。
+- AC4：既有 compact、Plan/Do、会话恢复、Context、Memory、MCP、Permission 和退出清理回归通过。
+- AC5：补全排除隐藏命令；唯一替换、多匹配菜单、无匹配无副作用。
+- AC6：`/clear`、`/session`、`/memory`、`/permission`、`/status`、`/review` 的成功、错误和脱敏覆盖通过。
+- AC7：`/review` 走 AgentLoop，Plan/Do、Permission、ToolScheduler 与 MCP gate 未绕过。
+- AC8：全量 `pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter10-final"`、compileall、diff check 与 fake CLI 验收通过。
