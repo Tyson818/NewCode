@@ -11,3 +11,4 @@ __pycache__/
 .pytest-basetemp-*/
 Newcode.lnk
 .newcode/context-artifacts/
+.newcode/memory/

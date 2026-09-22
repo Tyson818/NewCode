@@ -19,6 +19,7 @@ from newcode.agent.events import (
 from newcode.agent.mode import AgentMode, allowed_tool_names, is_tool_allowed
 from newcode.agent.scheduler import ToolExecutionRecord, ToolScheduler
 from newcode.context.manager import ContextManager
+from newcode.memory.service import MemoryService
 from newcode.permissions.manager import PermissionManager
 from newcode.permissions.types import (
     PermissionDecision,
@@ -43,6 +44,7 @@ class AgentLoop:
         prompt_builder: PromptBuilder | None = None,
         permission_manager: PermissionManager | None = None,
         context_manager: ContextManager | None = None,
+        memory_service: MemoryService | None = None,
     ) -> None:
         self.provider = provider
         self.session = session
@@ -53,6 +55,7 @@ class AgentLoop:
         self.scheduler = ToolScheduler(self.registry)
         self.permission_manager = permission_manager or PermissionManager()
         self.context_manager = context_manager
+        self.memory_service = memory_service
 
     def run(
         self,
@@ -122,6 +125,11 @@ class AgentLoop:
                 if turn_result.assistant_content.strip():
                     self.session.add_assistant_message(turn_result.assistant_content)
                 yield AgentFinalAnswer(turn_result.assistant_content)
+                if self.memory_service is not None:
+                    try:
+                        self.memory_service.submit(self.session.messages)
+                    except Exception:
+                        pass
                 return
 
             self.session.add_assistant_tool_calls(turn_result.tool_calls)

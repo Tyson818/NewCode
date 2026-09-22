@@ -30,7 +30,10 @@ from newcode.permissions.manager import PermissionManager
 from newcode.permissions.types import PermissionMode
 from newcode.providers.base import ChatProvider
 from newcode.providers.deepseek import DeepSeekProvider
-from newcode.session import ChatSession
+from newcode.memory.service import MemoryGenerationRequest, MemoryService
+from newcode.memory.store import MemoryStore
+from newcode.persistence import SessionArchive, SessionArchiveError
+from newcode.session import ChatMessage, ChatSession
 from newcode.tools.registry import ToolRegistry, create_default_registry
 from newcode.tools.types import ToolContext
 
@@ -40,6 +43,8 @@ EXIT_COMMANDS = {"/exit", "/quit", "exit"}
 PLAN_COMMAND = "/plan"
 DO_COMMAND = "/do"
 COMPACT_COMMAND = "/compact"
+SESSIONS_COMMAND = "/sessions"
+RESUME_COMMAND = "/resume"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
 
     mcp_runtime = None
     mcp_manager = None
+    memory_service = None
     try:
         config = load_config(Path(args.config))
         api_key = resolve_api_key(config.api_key_env)
@@ -87,6 +93,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        session_archive = SessionArchive(
+            tool_context.workspace_root,
+            sensitive_values=tool_context.sensitive_values,
+        )
+        memory_service = MemoryService(
+            MemoryStore(
+                tool_context.workspace_root,
+                sensitive_values=tool_context.sensitive_values,
+            ),
+            lambda request: _generate_memory(provider, request),
+            sensitive_values=tool_context.sensitive_values,
+        )
         return run_conversation(
             provider=provider,
             session=ChatSession(),
@@ -94,8 +112,12 @@ def main(argv: list[str] | None = None) -> int:
             tool_context=tool_context,
             permission_mode=config.permission_mode,
             permission_rules=permission_rules,
+            session_archive=session_archive,
+            memory_service=memory_service,
         )
     finally:
+        if memory_service is not None:
+            _safe_memory_shutdown(memory_service)
         if mcp_manager is not None:
             mcp_manager.shutdown()
         if mcp_runtime is not None:
@@ -116,6 +138,8 @@ def run_conversation(
     permission_mode: PermissionMode = PermissionMode.DEFAULT,
     permission_rules: PermissionRulesLoadResult | None = None,
     context_manager: ContextManager | None = None,
+    session_archive: SessionArchive | None = None,
+    memory_service: MemoryService | None = None,
 ) -> int:
     registry = registry or create_default_registry()
     tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
@@ -125,6 +149,10 @@ def run_conversation(
         confirmer=permission_confirmer
         or CliPermissionConfirmer(input_func=input_func, output=output),
     )
+    if session_archive is not None:
+        _safe_cleanup_stale(session_archive, session.session_id)
+        if session.session_id is None:
+            _safe_create_session(session_archive, session)
     context_manager = context_manager or ContextManager(
         session,
         tool_context.workspace_root,
@@ -150,6 +178,26 @@ def run_conversation(
         if text in EXIT_COMMANDS:
             print("已结束对话。", file=output)
             return 0
+        if text == SESSIONS_COMMAND:
+            _print_sessions(session_archive, output)
+            continue
+        if text.startswith(RESUME_COMMAND):
+            restored = _resume_session(session_archive, text)
+            if restored is None:
+                print("会话不可恢复。", file=output)
+                continue
+            _safe_checkpoint(session_archive, session)
+            _safe_context_cleanup(context_manager)
+            session = restored.session
+            context_manager = ContextManager(
+                session,
+                tool_context.workspace_root,
+                tool_context.sensitive_values,
+            )
+            print(f"已恢复会话：{session.session_id}", file=output)
+            if restored.needs_time_span_reminder:
+                print("该会话距离上次更新已超过 24 小时，请先确认当前状态。", file=output)
+            continue
         if text == PLAN_COMMAND:
             mode = AgentMode.PLAN
             print("已切换到 Plan Mode。", file=output)
@@ -178,19 +226,25 @@ def run_conversation(
             tool_context=tool_context,
             permission_manager=permission_manager,
             context_manager=context_manager,
+            memory_service=memory_service,
         )
 
         try:
-            _consume_agent_events(
+            natural = _consume_agent_events(
                 loop.run(text, mode=mode),
                 output=output,
                 error_output=error_output,
             )
+            if natural:
+                _safe_checkpoint(session_archive, session)
         except KeyboardInterrupt:
             print("\n已中断当前任务。", file=output)
         print("", file=output)
     finally:
-        context_manager.cleanup()
+        _safe_checkpoint(session_archive, session)
+        _safe_cleanup_stale(session_archive, session.session_id)
+        _safe_memory_shutdown(memory_service)
+        _safe_context_cleanup(context_manager)
 
 
 def _generate_summary(provider: ChatProvider, prompt: str) -> str:
@@ -210,13 +264,31 @@ def _generate_summary(provider: ChatProvider, prompt: str) -> str:
     return "".join(parts)
 
 
+def _generate_memory(provider: ChatProvider, request: MemoryGenerationRequest) -> str:
+    """MemoryService 的唯一生成桥接：不注册工具，也不读取文件。"""
+
+    parts: list[str] = []
+    for event in provider.stream_chat(
+        [
+            ChatMessage(role="system", content="你是受控的本地记忆去重器。"),
+            ChatMessage(role="user", content=request.prompt),
+        ],
+        tools=list(request.tools),
+        allow_tool_calls=request.allow_tool_calls,
+    ):
+        if hasattr(event, "text"):
+            parts.append(event.text)
+    return "".join(parts)
+
+
 def _consume_agent_events(
     events,
     *,
     output: TextIO,
     error_output: TextIO,
-) -> None:
+) -> bool:
     printed_text = False
+    natural = False
     for event in events:
         if isinstance(event, AgentTextDelta):
             printed_text = True
@@ -247,12 +319,86 @@ def _consume_agent_events(
             continue
 
         if isinstance(event, AgentFinalAnswer):
+            natural = True
             if event.content and not printed_text:
                 print(event.content, end="", file=output, flush=True)
             continue
 
         if isinstance(event, AgentUsage):
             continue
+    return natural
+
+
+def _safe_create_session(archive: SessionArchive, session: ChatSession) -> None:
+    try:
+        archive.create(session)
+    except Exception:
+        return
+
+
+def _safe_checkpoint(archive: SessionArchive | None, session: ChatSession) -> None:
+    if archive is None or session.session_id is None:
+        return
+    try:
+        archive.checkpoint(session)
+    except Exception:
+        return
+
+
+def _safe_cleanup_stale(archive: SessionArchive | None, active_session_id: str | None) -> None:
+    if archive is None:
+        return
+    try:
+        archive.cleanup_stale(active_session_id=active_session_id)
+    except Exception:
+        return
+
+
+def _safe_memory_shutdown(memory_service: MemoryService | None) -> None:
+    if memory_service is None:
+        return
+    try:
+        memory_service.shutdown()
+    except Exception:
+        return
+
+
+def _safe_context_cleanup(context_manager: ContextManager) -> None:
+    try:
+        context_manager.cleanup()
+    except Exception:
+        return
+
+
+def _print_sessions(archive: SessionArchive | None, output: TextIO) -> None:
+    if archive is None:
+        print("没有可恢复的会话。", file=output)
+        return
+    try:
+        summaries = archive.list_recoverable()
+    except Exception:
+        summaries = ()
+    if not summaries:
+        print("没有可恢复的会话。", file=output)
+        return
+    for summary in summaries:
+        print(
+            f"{summary.session_id} | {summary.title} | {summary.updated_at.isoformat()} | {summary.message_count} 条消息",
+            file=output,
+        )
+
+
+def _resume_session(archive: SessionArchive | None, text: str):
+    if archive is None:
+        return None
+    parts = text.split()
+    if len(parts) != 2 or parts[0] != RESUME_COMMAND:
+        return None
+    try:
+        restored = archive.restore(parts[1])
+    except Exception:
+        return None
+    return restored if restored.session is not None else None
 
 
 def _build_permission_manager(

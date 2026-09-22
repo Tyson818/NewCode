@@ -28,6 +28,7 @@ class ChatMessage:
 @dataclass
 class ChatSession:
     messages: list[ChatMessage] = field(default_factory=list)
+    session_id: str | None = None
     _context_version: int = field(default=0, init=False, repr=False)
 
     @property

@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from newcode.prompt.modules import (
+    DynamicPromptBackground,
     PromptModule,
     StablePrompt,
     default_optional_modules,
     default_stable_modules,
+    dynamic_background_messages,
 )
 from newcode.prompt.reminder import PromptBuildContext, build_system_reminder
 from newcode.session import ChatMessage
@@ -38,6 +40,8 @@ class PromptBuilder:
         self,
         session_messages: Sequence[ChatMessage],
         context: PromptBuildContext,
+        *,
+        dynamic_background: DynamicPromptBackground | None = None,
     ) -> list[ChatMessage]:
         messages = [
             ChatMessage(
@@ -45,6 +49,11 @@ class PromptBuilder:
                 content=self.build_stable_prompt().content,
             )
         ]
+        if dynamic_background is not None:
+            messages.extend(
+                ChatMessage(role="system", content=content)
+                for content in dynamic_background_messages(dynamic_background)
+            )
         reminder = build_system_reminder(context)
         if reminder:
             messages.append(ChatMessage(role="system", content=reminder))
