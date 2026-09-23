@@ -132,6 +132,7 @@ def test_cli_plan_and_do_switch_modes_without_session_messages(tmp_path):
         "read_file",
         "find_files",
         "search_code",
+        "load_skill",
     }
     assert tool_schema_names(provider.calls[1]["tools"]) == {
         "read_file",
@@ -140,6 +141,7 @@ def test_cli_plan_and_do_switch_modes_without_session_messages(tmp_path):
         "run_command",
         "find_files",
         "search_code",
+        "load_skill",
     }
     assert [message.content for message in session.messages if message.role == "user"] == [
         "先计划",

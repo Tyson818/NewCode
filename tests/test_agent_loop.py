@@ -425,6 +425,7 @@ def test_agent_loop_default_mode_exposes_all_tools(tmp_path):
         "run_command",
         "find_files",
         "search_code",
+        "load_skill",
     }
 
 
@@ -436,4 +437,5 @@ def test_agent_loop_explicit_do_mode_exposes_all_tools(tmp_path):
 
     assert {tool["function"]["name"] for tool in provider.calls[0]["tools"]} == {
         "read_file",
+        "load_skill",
     }

@@ -21,6 +21,9 @@ test = [
 [project.scripts]
 newcode = "newcode.cli:main"
 
+[tool.setuptools.package-data]
+newcode = ["resources/skills/*/SKILL.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

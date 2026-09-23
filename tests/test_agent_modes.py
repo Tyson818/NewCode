@@ -126,6 +126,7 @@ def test_agent_loop_passes_plan_mode_tools_to_provider(tmp_path):
         "read_file",
         "find_files",
         "search_code",
+        "load_skill",
     }
 
 
@@ -147,6 +148,7 @@ def test_agent_loop_passes_do_mode_tools_to_provider(tmp_path):
         "run_command",
         "find_files",
         "search_code",
+        "load_skill",
     }
 
 

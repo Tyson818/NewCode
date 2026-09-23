@@ -23,6 +23,7 @@ class StablePrompt:
 class DynamicPromptBackground:
     """不写入会话的请求级背景；字段顺序即注入优先级。"""
 
+    active_skills: str = ""
     project_instructions: str = ""
     workspace_instructions: str = ""
     user_instructions: str = ""
@@ -32,6 +33,7 @@ class DynamicPromptBackground:
 def dynamic_background_messages(background: DynamicPromptBackground) -> list[str]:
     messages: list[str] = []
     for source, content in (
+        ("已激活 Skill｜来源：受控会话状态", background.active_skills),
         ("项目指令｜来源：<workspace>/AGENTS.md", background.project_instructions),
         ("工作区指令｜来源：<workspace>/.newcode/INSTRUCTIONS.md", background.workspace_instructions),
         ("用户指令｜来源：~/.newcode/INSTRUCTIONS.md", background.user_instructions),

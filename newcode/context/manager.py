@@ -13,10 +13,10 @@ from .prevention import externalize_tool_results
 
 
 class ContextManager:
-    def __init__(self, session: ChatSession, workspace_root: Path, sensitive_values: tuple[str, ...] = ()) -> None:
+    def __init__(self, session: ChatSession, workspace_root: Path, sensitive_values: tuple[str, ...] = (), *, artifact_session_id: str = "context-session") -> None:
         self.session = session
         self.estimator = TokenEstimator()
-        self.artifacts = ArtifactStore(workspace_root, "context-session", sensitive_values)
+        self.artifacts = ArtifactStore(workspace_root, artifact_session_id, sensitive_values)
         self.consecutive_failures = 0
         self.circuit_open = False
 

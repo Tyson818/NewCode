@@ -26,11 +26,17 @@ from newcode.permissions.types import (
     PermissionDecisionValue,
 )
 from newcode.prompt import PromptBuildContext, PromptBuilder, PromptEnvironment
+from newcode.prompt.modules import DynamicPromptBackground
 from newcode.providers.base import ChatProvider, ProviderError
 from newcode.session import ChatMessage, ChatSession
 from newcode.tools.executor import execute_tool_call, make_failure_result
 from newcode.tools.registry import ToolRegistry, create_default_registry
 from newcode.tools.types import ToolCall, ToolContext, ToolResult
+from newcode.skills.discovery import SkillDiscovery
+from newcode.skills.policy import visible_tool_names
+from newcode.skills.state import ActiveSkillState
+from newcode.skills.tool import LoadSkillTool
+from newcode.skills.types import SkillCatalog
 
 class AgentLoop:
     def __init__(
@@ -45,6 +51,9 @@ class AgentLoop:
         permission_manager: PermissionManager | None = None,
         context_manager: ContextManager | None = None,
         memory_service: MemoryService | None = None,
+        skill_state: ActiveSkillState | None = None,
+        skill_catalog: SkillCatalog | None = None,
+        skill_discovery: SkillDiscovery | None = None,
     ) -> None:
         self.provider = provider
         self.session = session
@@ -56,6 +65,20 @@ class AgentLoop:
         self.permission_manager = permission_manager or PermissionManager()
         self.context_manager = context_manager
         self.memory_service = memory_service
+        self.skill_state = skill_state or ActiveSkillState()
+        self._skill_discovery = skill_discovery or SkillDiscovery()
+        self._fixed_skill_catalog = skill_catalog is not None
+        self._skill_catalog = skill_catalog or self._skill_discovery.discover(self.tool_context.workspace_root)
+        if self.registry.get("load_skill") is None:
+            self.registry.register(
+                LoadSkillTool(
+                    catalog=lambda: self._skill_catalog,
+                    state=self.skill_state,
+                    registry=self.registry,
+                ),
+                read_only=False,
+                do_visible=True,
+            )
 
     def run(
         self,
@@ -89,6 +112,7 @@ class AgentLoop:
                 iteration=iteration,
                 max_iterations=self.config.max_iterations,
             )
+            self._refresh_skills()
 
             collector = StreamingTurnCollector()
             try:
@@ -96,7 +120,7 @@ class AgentLoop:
                     self.context_manager.prepare(self._generate_summary)
                 provider_events = self.provider.stream_chat(
                     self._provider_messages(mode, iteration),
-                    tools=self.registry.to_openai_tools(allowed_tool_names(mode, self.registry)),
+                    tools=self.registry.to_openai_tools(self._visible_tool_names(mode)),
                     allow_tool_calls=True,
                 )
             except ProviderError as exc:
@@ -250,6 +274,14 @@ class AgentLoop:
     def _execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         return execute_tool_call(tool_call, self.registry, self.tool_context)
 
+    def _refresh_skills(self) -> None:
+        if not self._fixed_skill_catalog:
+            self._skill_catalog = self._skill_discovery.discover(self.tool_context.workspace_root)
+        self.skill_state.refresh(self._skill_catalog)
+
+    def _visible_tool_names(self, mode: AgentMode) -> frozenset[str]:
+        return visible_tool_names(mode, self.registry, self.skill_state)
+
     def _provider_messages(
         self,
         mode: AgentMode,
@@ -265,7 +297,14 @@ class AgentLoop:
             ),
             permission_mode=self.permission_manager.mode.value,
         )
-        return self.prompt_builder.build_messages(self.session.messages, context)
+        active_skills = self.skill_state.prompt_background()
+        if not active_skills:
+            return self.prompt_builder.build_messages(self.session.messages, context)
+        return self.prompt_builder.build_messages(
+            self.session.messages,
+            context,
+            dynamic_background=DynamicPromptBackground(active_skills=active_skills),
+        )
 
     def _generate_summary(self, prompt: str) -> str:
         messages = [
@@ -295,7 +334,7 @@ class AgentLoop:
         for tool_call in tool_calls:
             if self.registry.get(tool_call.name) is None:
                 continue
-            if not is_tool_allowed(tool_call.name, mode, self.registry):
+            if tool_call.name not in self._visible_tool_names(mode):
                 return tool_call
         return None
 

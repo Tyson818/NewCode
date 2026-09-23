@@ -32,6 +32,7 @@ class CommandOutcomeKind(str, Enum):
     MODE_CHANGE = "mode_change"
     CLEAR_SESSION = "clear_session"
     RESUME_SESSION = "resume_session"
+    SKILL_REQUEST = "skill_request"
 
 
 @dataclass(frozen=True)
@@ -84,3 +85,5 @@ class CommandOutcome:
     ai_input: str | None = None
     mode: str | None = None
     session_id: str | None = None
+    skill_name: str | None = None
+    skill_parameters: tuple[tuple[str, str], ...] = ()

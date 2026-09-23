@@ -1,104 +1,126 @@
-# Chapter 10：Command Registry & Dispatcher 计划
+# Chapter 11：Skill System 计划
 
-## 架构总览
-
-输入路径为：`CLI input -> exit 优先判断 -> CommandParser -> CommandRegistry/Dispatcher -> CommandOutcome -> UIControl 或既有 AgentLoop`。非 `/` 文本不经过命令注册中心，仍保持原 AgentLoop 路径；未知 `/` 文本停在分派器，绝不送模型。
+## 架构与数据流
 
 ```text
-CommandDefinition -> CommandRegistry -> CommandDispatcher
-                                      |       |       |
-                                   local    UI      fixed AI input
-                                      |       |       |
-                                  UIControl UIControl existing AgentLoop
+SkillDiscovery (project > user > builtin) -> immutable internal SkillCatalog metadata
+                                           -> StartupSkillDirectory(name + description only)
+                                           -> activated SkillCommandOverlay/help/completion
+AgentLoop system tool load_skill -> serial ToolScheduler/Permission/executor -> SkillLoader -> validated SkillActivation
+                                               -> ActiveSkillState
+ActiveSkillState -> PromptBuilder dynamic background + SkillToolPolicy
+short command -> shared AgentLoop 或 IsolatedSkillRunner -> safe summary only
 ```
 
-## 核心接口
+发现只产出 `SkillMetadata`；加载才读取 SOP 和资源索引；激活才产生 `SkillActivation`。`ActiveSkillState` 是 CLI 会话内对象，不序列化到 `ChatSession`、JSONL、Memory 或 artifact。
 
-### CommandDefinition 与结果
+## 核心模型与接口
 
-`CommandDefinition` 为不可变静态元数据：`name`、`aliases`、`visibility`、`category`、`summary`、`usage`、`argument_spec`、`handler`。名称经去 `/` 与 `casefold()` 规范化。
+| 模型 | 关键字段与约束 |
+|---|---|
+| `SkillMetadata` | 内部本地模型：name、description、source、root、entry、mode、tools、history_messages、model、parameters、digest；不含 SOP。 |
+| `StartupSkillDirectoryEntry` | 仅供模型发现注入：name 与一句 description；不含 tools、mode、model、parameters、路径、digest 或 SOP。 |
+| `LoadedSkill` | metadata、参数替换后 SOP、安全相对资源索引；只在 load/activation 中持有。 |
+| `SkillActivation` | loaded snapshot、activation sequence、stale/invalid 状态；多个按 sequence 排序。 |
+| `SkillCatalog` | 不可变 discovery snapshot、诊断、短命令 overlay；refresh 原子替换。 |
+| `SkillToolPolicy` | 普通工具为 Plan/Do 可见工具与激活白名单交集；`load_skill` 是 Plan/Do 都可见、串行的系统例外。 |
+| `SkillExecutionResult` | shared/isolated 成功或安全错误、仅可回流的安全摘要。 |
 
-`ParsedCommand` 保存原始输入、规范命令、参数 token 与参数尾部。`CommandOutcome` 只能表达 `handled`、`ai_input`、`mode_change`、`session_replaced`、`error`，不携带工具调用、Provider 或文件句柄。
+`SkillDiscovery.discover(workspace, user_root, builtin_root, registry)` 返回 catalog；`SkillLoader.load(name, parameters, catalog, registry, provider_capabilities)` 返回 LoadedSkill 或安全错误；`ActiveSkillState.activate/clear/refresh` 管理 snapshot；`IsolatedSkillRunner.run(...)` 只返回安全摘要。
 
-### UIControl
-
-`UIControl` 协议定义 `info(text)`、`error(code, text)`、`help(entries)`、`completion_menu(entries)`、`set_mode(mode)`。CLI adapter 映射到既有 `output/error_output`；fake UI 收集调用。handler 不直接 `print`。
-
-### CommandRuntime
-
-分派器取得窄 `CommandRuntime`：当前 mode/session、ContextManager、SessionArchive、MemoryStore/MemoryService、PermissionManager、MCP 安全摘要、workspace。它只暴露已存在的安全查询及受控生命周期动作；不暴露 Provider、ToolRegistry、ToolScheduler 或 MCP client。`/review` 只返回固定 AI 输入，CLI 后续照常创建 AgentLoop。
-
-## 模块与文件
+## 模块边界与文件
 
 | 文件 | 责任 |
 |---|---|
-| `newcode/commands/__init__.py` | 导出公共模型与默认注册表。 |
-| `newcode/commands/types.py` | 元数据、类别、解析、outcome、安全错误码。 |
-| `newcode/commands/registry.py` | 静态注册、规范化、冲突、帮助、补全候选。 |
-| `newcode/commands/dispatcher.py` | 输入解析、参数校验、handler 调用、未知引导。 |
-| `newcode/commands/builtins.py` | 十个内置命令和兼容别名。 |
-| `newcode/commands/ui.py` | UIControl 协议与 CLI adapter。 |
-| `newcode/cli.py` | 用 dispatcher 替换命令分支；保留输入循环、AgentLoop、finally。 |
-| `tests/test_commands_*.py` | 注册、解析、补全、UI、内置命令单测。 |
-| `tests/test_cli_commands.py` | CLI 命令及既有 gate 集成回归。 |
+| `newcode/skills/types.py` | frontmatter/schema、metadata、activation、稳定错误与结果。 |
+| `newcode/skills/discovery.py` | 三根扫描、优先级、路径安全、轻量解析、diagnostic、catalog。 |
+| `newcode/skills/loader.py` | 按需 SOP/资源加载、参数替换、模型/工具白名单验证。 |
+| `newcode/skills/state.py` | 会话级激活、热更新 stale/invalid、动态背景渲染、白名单交集。 |
+| `newcode/skills/tool.py` | 系统 `load_skill` Tool adapter；在 Plan/Do 均可见，经正常 ToolRegistry/AgentLoop/Permission/串行 Scheduler/executor。 |
+| `newcode/skills/runner.py` | shared/isolated 子对话、有限历史、摘要回流、隔离 cleanup。 |
+| `newcode/skills/commands.py` | catalog snapshot 的受控短命令 overlay；不修改静态 registry。 |
+| `newcode/resources/skills/{commit,review,test}/SKILL.md` | 三个内置模板及仅需的安全参考资源。 |
+| `newcode/prompt/modules.py`、`builder.py` | active skills 在动态背景首位注入。 |
+| `newcode/agent/loop.py` | 请求前刷新、`load_skill` 可见性、SkillToolPolicy 工具过滤及 isolated factory 注入点。 |
+| `newcode/cli.py`、`newcode/commands/*` | catalog/activation 生命周期、复合命令视图、clear/resume、CLI cleanup。 |
+| `tests/test_skills_*.py`、相关 CLI/Agent/Prompt 回归 | 单元、隔离、gate、热更新、端到端覆盖。 |
 
-原则上不修改 Provider、PromptBuilder、PermissionManager、ToolRegistry、ToolScheduler、MCP runtime/manager/adapter、Context 或 Memory 核心算法。测试直接证明缺少安全读取 accessor 时，才最小扩展。
+Provider 不导入 Skill；Skill 不直接导入 MCP manager/client、工具 executor、PermissionManager 或 ToolScheduler。AgentLoop 仍是唯一可发起 Provider/tool 回合的组件。
 
-## 内置命令实现策略
+## 关键流程
 
-- `/help` 读取 registry 可见元数据，支持规范名或别名。
-- `/compact` 调用现有 `ContextManager.manual_compact`，复用已有零工具摘要 generator。
-- `/clear` 先 checkpoint、再 Context cleanup、再建新 `ChatSession`/archive/ContextManager；任何失败保留旧归档。
-- `/plan`、`/do` 只返回 mode outcome，CLI 更新 mode，不触及 Permission mode。
-- `/session` 调用 `SessionArchive.list_recoverable/restore`；兼容旧别名映射同一 handler。
-- `/memory` 使用 MemoryStore 的受控读取/选择接口，仅输出脱敏 metadata。
-- `/permission` 汇总 PermissionManager 的 mode、会话规则数和规则加载错误计数。
-- `/status` 汇总 CLI 已知状态、Context usage/熔断、MemoryService 状态和 MCP 已知 discovery 摘要；绝不主动探测。
-- `/review` 无参数时产生固定请求，后续走正常 AgentLoop；Plan/Do、Permission、ToolScheduler、MCP 仍在原位置生效。
+### 发现与刷新
+
+1. 建立三根安全路径，不存在即为空；拒绝 root/entry/resource symlink 和逃逸。
+2. 每项轻量读取 frontmatter，校验 schema、名称、白名单工具存在性及 mode；计算 digest。
+3. 按 project > user > builtin 决定同名赢家，形成不可变内部 catalog；坏项仅诊断；另从赢家投影出仅 name/description 的模型启动目录。
+4. 主回合前 refresh；新增只进入可发现 catalog，内容变更标 stale，删除/无效立即 invalid 并从激活/overlay 移除。
+
+### 加载与 prompt
+
+1. `load_skill` 在 Plan/Do 均经 registry、AgentLoop、Permission、串行 Scheduler 与 executor 执行，调用 loader；它不是只读并发工具。成功激活后才创建对应会话级短命令，短命令也只形成受控 load/execution request。
+2. loader 读取赢家 entry、替换声明参数、构造资源索引、检查模型能力，成功则 activation snapshot 替换同名旧 activation。
+3. state 将所有有效 activation 以固定标签放在 DynamicPromptBackground 的首项；PromptBuilder 每轮重新构造，session 不变。
+4. tool policy 将 active whitelist 交集应用到 AgentLoop provider schemas 和执行前可见性：普通工具为 Plan/Do 集合与所有 whitelist 的交集；保留 Plan/Do 均可见、串行的 system `load_skill`。
+
+### isolated
+
+1. `history_messages` 仅允许 0–20：0 不携带主历史；大于 0 时，从主 session 最近端选择最多 N 条已脱敏 user/assistant 非工具消息，工具调用及工具结果一律排除。
+2. 创建 transient child session/context/activation；不共享主 session、memory、artifact 或 active skills，子 activation 仅保留本次 isolated Skill snapshot，使用相同安全基础设施与可用 provider model。
+3. 运行后把 child 的最终文本经敏感值遮蔽、长度限制和来源标签生成摘要，作为主 session 安全回流；finally 清理 child artifact。
+4. 子会话失败只回流安全码/摘要，绝不携带原始子历史或资源正文。
 
 ## Phase
 
-### Phase 1：注册、解析与 UI 边界
+### Phase 1：模型、发现与资源 sandbox
 
-目标：命令模型、静态注册、冲突失败、大小写解析、帮助、补全、fake UI。文件：`newcode/commands/*`、`tests/test_commands_registry.py`、`tests/test_commands_dispatcher.py`、`tests/test_commands_ui.py`。完成：普通文本/未知 slash/参数错误稳定区分，隐藏命令不泄露。
+创建 types/discovery，完成单文件/目录包、schema、三级覆盖、坏项隔离、digest、路径和资源索引安全，以及只含 name/description 的启动目录投影。测试：`test_skills_discovery.py`、`test_skills_paths.py`。不接 Prompt/Agent/CLI。
 
-### Phase 2：内置命令与 CLI 迁移
+### Phase 2：按需加载、激活与 Prompt 注入
 
-目标：十个处理器、兼容别名、CLI 接入。文件：`newcode/commands/builtins.py`、`newcode/cli.py`、`tests/test_commands_builtins.py`、`tests/test_cli_commands.py`及必要最小状态 accessor。完成：旧命令、退出、checkpoint、cleanup 顺序不变。
+实现 loader/state、参数替换、模型/工具校验、热更新/invalid、动态背景最前注入。测试：`test_skills_loader.py`、`test_skills_state.py`、`test_prompt_skills.py`。不执行工具或 isolated。
 
-### Phase 3：安全 gate、补全与端到端
+### Phase 3：系统 load_skill、白名单与 AgentLoop
 
-目标：验证 `/review`、Plan/Do、Permission、MCP、Context、Memory、session 及补全无副作用。文件：Phase 2 测试与必要最小回归。完成：fake provider/local fixture 证据完整。
+实现系统 Tool、SkillToolPolicy、Plan/Do 双模式可见性、串行 Scheduler/Permission/executor/MCP gate，保持 Provider 独立。测试：`test_skills_tool.py`、`test_agent_loop_skills.py`及 MCP/Permission 回归。无 CLI 短命令。
 
-### Phase 4：全量验收
+### Phase 4：短命令、shared/isolated 与 CLI 生命周期
 
-目标：静态边界审计、全量测试、受控 CLI 人工验收。文件：仅失败直接证明的最小模块与测试。完成：无 tmux、网络、secret、第三方 MCP。
+实现 immutable overlay、短命令冲突/补全、clear/new/resume 激活清空、isolated runner、安全摘要与 cleanup。静态 `/review` 固定行为优先；同名 review Skill 可加载但无 overlay。测试：`test_skills_commands.py`、`test_skills_runner.py`、`test_cli_skills.py`。不改变 Chapter 10 静态命令。
+
+### Phase 5：边界审计与全量验收
+
+只在失败直接证明时最小修复；全量 pytest、compileall、diff check、fake CLI 验收与 skip 原因记录。无 tmux、网络或生产 secret。
 
 ## 技术决定
 
 | 决定 | 选择 | 原因 |
 |---|---|---|
-| 名称 | 去 `/` 后 `casefold()` | 一致的大小写无关查找及冲突检测。 |
-| 参数 | 非 shell 空白 token，不求值 | 十项命令无需路径表达式，安全且跨平台。 |
-| 未知 slash | 本地 `/help` 引导 | 避免控制输入进入模型。 |
-| 兼容 | `/sessions`、`/resume` 作为别名 | 保持 Chapter 9 可观察行为。 |
-| UI | 窄协议 + CLI adapter | 单测不绑定终端框架。 |
-| review | 固定字符串经 AgentLoop | 无动态 prompt，保留所有 gate。 |
-| 状态 | 仅已有状态快照 | 避免新网络生命周期。 |
+| 发现 | 内部 metadata 本地保留；模型启动目录仅 name/description，按需全文 | 防止 metadata/SOP 泄露并避免上下文膨胀。 |
+| 覆盖 | project > user > builtin | 项目可定制且稳定。 |
+| 多 Skill 工具 | 白名单交集 + `load_skill` 例外 | 最小权限、顺序无关。 |
+| 热更新 | valid 变更 stale，显式 reload；删除/无效立即失效 | 不静默改变已激活 SOP。 |
+| 动态注入 | active skill 最先出现且不写 session | 指令显著且不污染存档。 |
+| 模型失败 | 显式指定不可用即失败，无回退 | 防止隐式能力/成本变化。 |
+| 短命令 | 成功 activation 的 immutable overlay，不改 sealed registry | 保留 Chapter 10 防线且不把发现变成任意命令。 |
+| `/review` 冲突 | 静态 `/review` 优先；review Skill 可加载但不注册 overlay | 维持 Chapter 10 固定行为。 |
+| isolated 历史 | 0–20 条最近脱敏 user/assistant 非工具消息 | 明确零历史与工具信息隔离。 |
+| 内置模板 | commit/test 可用 `run_command`；review 只读 | 功能不伪装为只读，仍受原有全部 gate。 |
+| isolated 回流 | 脱敏、最多 4,000 字符、无第二次 LLM | 子对话隔离且保留可用结果。 |
 
 ## 验证约定
 
-每 Phase 先：
+每 Phase：
 
 ```powershell
-python -m compileall newcode
-python -m pytest <targeted tests> -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter10-phaseN"
+.venv\Scripts\python.exe -m compileall newcode
+.venv\Scripts\python.exe -m pytest <targeted tests> -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter11-phaseN"
 ```
 
 最终：
 
 ```powershell
-python -m compileall newcode
-python -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter10-final"
+.venv\Scripts\python.exe -m compileall newcode
+.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter11-final"
 git diff --check
 ```

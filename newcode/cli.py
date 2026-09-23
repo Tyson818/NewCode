@@ -40,6 +40,10 @@ from newcode.persistence import SessionArchive, SessionArchiveError
 from newcode.session import ChatMessage, ChatSession
 from newcode.tools.registry import ToolRegistry, create_default_registry
 from newcode.tools.types import ToolContext
+from newcode.skills.commands import SkillCommandDispatcher, SkillCommandOverlay
+from newcode.skills.discovery import SkillDiscovery
+from newcode.skills.runner import SkillRunner
+from newcode.skills.state import ActiveSkillState
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -170,7 +174,13 @@ def run_conversation(
     )
     mode = AgentMode.DO
     command_registry = create_builtin_registry()
-    command_dispatcher = CommandDispatcher(command_registry)
+    skill_state = ActiveSkillState()
+    skill_discovery = SkillDiscovery()
+    skill_catalog = skill_discovery.discover(tool_context.workspace_root)
+    command_dispatcher = SkillCommandDispatcher(
+        CommandDispatcher(command_registry),
+        SkillCommandOverlay(command_registry, skill_state),
+    )
     command_ui = CLIUIControl(output=output, error_output=error_output)
 
     print("NewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
@@ -227,6 +237,8 @@ def run_conversation(
                     session_archive,
                     tool_context,
                 )
+                skill_state.reset_for_new_session()
+                skill_catalog = skill_discovery.discover(tool_context.workspace_root)
                 command_ui.info("已开始新会话。")
                 continue
             if outcome.kind is CommandOutcomeKind.RESUME_SESSION:
@@ -242,12 +254,40 @@ def run_conversation(
                     tool_context.workspace_root,
                     tool_context.sensitive_values,
                 )
+                skill_state.reset_for_resume()
+                skill_catalog = skill_discovery.discover(tool_context.workspace_root)
                 command_ui.info(f"已恢复会话：{session.session_id}")
                 if restored.needs_time_span_reminder:
                     command_ui.info("该会话距离上次更新已超过 24 小时，请先确认当前状态。")
                 continue
             if outcome.kind is CommandOutcomeKind.AI_INPUT:
                 text = outcome.ai_input or ""
+            elif outcome.kind is CommandOutcomeKind.SKILL_REQUEST:
+                activation = next(
+                    (item for item in skill_state.activations if item.loaded.metadata.frontmatter.name == outcome.skill_name),
+                    None,
+                )
+                if activation is None:
+                    command_ui.error("skill_not_found", "Skill 当前不可用。")
+                    continue
+                runner = SkillRunner(
+                    provider=provider,
+                    registry=registry,
+                    tool_context=tool_context,
+                    permission_manager=permission_manager,
+                    parent_session=session,
+                    parent_context=context_manager,
+                    skill_catalog=skill_catalog,
+                )
+                if activation.loaded.metadata.frontmatter.mode.value == "isolated":
+                    result = runner.run_isolated(activation, outcome.skill_parameters, mode=mode)
+                    if result.ok:
+                        command_ui.info(result.summary)
+                        _safe_checkpoint(session_archive, session)
+                    else:
+                        command_ui.error(result.code or "skill_isolated_failed", "Skill 未完成。")
+                    continue
+                text = runner.shared_input(activation, outcome.skill_parameters)
             else:
                 continue
 
@@ -260,6 +300,8 @@ def run_conversation(
             permission_manager=permission_manager,
             context_manager=context_manager,
             memory_service=memory_service,
+            skill_state=skill_state,
+            skill_discovery=skill_discovery,
         )
 
         try:
@@ -274,6 +316,7 @@ def run_conversation(
             print("\n已中断当前任务。", file=output)
         print("", file=output)
     finally:
+        skill_state.clear()
         _safe_checkpoint(session_archive, session)
         _safe_cleanup_stale(session_archive, session.session_id)
         _safe_memory_shutdown(memory_service)
