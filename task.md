@@ -1,283 +1,292 @@
-# Chapter 13：SubAgent 原子任务
-
-## 通用执行规则
-
-- 先完成前置任务；每个 Phase 通过 `.venv\Scripts\python.exe -m compileall newcode` 与本 Phase targeted pytest 后才进入下一 Phase。
-- 测试仅使用 fake Provider/ProviderFactory、fake clock/thread coordination、临时 home/workspace 和本地 fixture；不访问真实网络、不读取生产 secret、不连接第三方 MCP。
-- 如 `.venv` 不存在，可使用当前 Python，但须记录。禁止跨 Phase 文件、Provider orchestration、Permission 语义或历史章节范围扩展。
-- 每项完成时记录测试输出、稳定错误码、状态/安全边界证据；测试失败立即停止，不带失败进入下一 Phase。
-
-## 文件规划
-
-| 操作 | 文件 | 职责 |
-|---|---|---|
-| 新增 | `newcode/subagents/__init__.py` | 导出稳定窄接口 |
-| 新增 | `newcode/subagents/types.py` | 定义、Task、状态、预算、错误和诊断模型 |
-| 新增 | `newcode/subagents/discovery.py` | YAML/Markdown 定义发现、优先级、路径验证 |
-| 新增 | `newcode/subagents/policy.py` | 父/角色/mode/background 工具集合交集 |
-| 新增 | `newcode/subagents/budget.py` | token 近似统计、round/deadline budget |
-| 新增 | `newcode/subagents/manager.py` | 有界 worker、task 状态、通知、wait/cancel/close |
-| 新增 | `newcode/subagents/runner.py` | 隔离 child AgentLoop、Definition/Fork 快照与 cleanup |
-| 新增 | `newcode/subagents/tool.py` | 唯一固定 `agent` Tool schema 与操作分派 |
-| 修改 | `newcode/agent/loop.py` | 主请求安全点投递后台完成消息及 AgentTool 接缝 |
-| 修改 | `newcode/prompt/modules.py` | 仅 Agent name/description 动态目录 |
-| 修改 | `newcode/cli.py` | ProviderFactory、Manager/Tool 注册与生命周期 |
-| 必要时修改 | `newcode/skills/policy.py` | 提供只读的父 Skill 有效工具集合 |
-| 新增测试 | `tests/test_subagents_types.py`, `test_subagents_discovery.py`, `test_subagents_budget.py`, `test_subagents_manager.py`, `test_subagents_policy.py`, `test_subagents_runner.py`, `test_subagents_tool.py`, `test_prompt_subagents.py`, `test_agent_loop_subagents.py`, `test_cli_subagents.py` | 覆盖各层 |
-| 必要时修改测试 | 现有 `tests/test_hooks_actions.py`、AgentLoop/CLI 回归 | 证明 Hook 占位语义和旧行为不变 |
-
-禁止新增依赖、修改 `newcode/providers/`、`newcode/permissions/`、`newcode/mcp/`、`newcode/persistence.py`、session archive 格式、配置文件或 Chapter 10 命令注册表。若确需上述范围，停止并报告最小阻塞点。
-
-## Phase 1：定义模型与发现（T1–T4）
-
-### T1 — AgentDefinition 与诊断类型
-
-**前置条件：** Chapter 13 spec 已批准。
-**允许文件：** `newcode/subagents/__init__.py`、`newcode/subagents/types.py`、`tests/test_subagents_types.py`。
-**实现动作：** 定义 source、frontmatter、catalog、diagnostic、模型/权限模式与稳定名称格式 `[a-z][a-z0-9-]{0,63}`；限制字段类型、重复项、描述长度、正文大小和 `max_iterations=1..8`；定义稳定错误码。
-**对应测试：** 字段缺失/未知/类型错误、名称边界、duplicate tool、iteration 边界、错误码稳定；确保 repr/diagnostic 不含正文。
-**完成判定：** 纯类型可独立导入，非法输入只产生稳定 validation code。
-**禁止边界：** 不扫描文件、不构造 Tool、不启动 Provider/worker。
-
-### T2 — 安全目录扫描
-
-**前置条件：** T1。
-**允许文件：** `newcode/subagents/discovery.py`、`tests/test_subagents_discovery.py`。
-**实现动作：** 扫描 project `.newcode/agents/`、user `~/.newcode/agents/`、package `newcode/resources/agents/` 与显式注入的 plugin roots；只读普通 `.md` 文件，不导入/执行插件代码。
-**对应测试：** 临时根读取、缺根、绝对路径/`..`、符号链接、目录逃逸、非普通文件与权限/OSError。
-**完成判定：** 所有 entry 在各自来源根内；无效文件有脱敏诊断且不阻断其他文件。
-**禁止边界：** 不扫描任意系统目录，不修改 workspace，不下载插件。
-
-### T3 — YAML frontmatter 与正文校验
-
-**前置条件：** T1–T2。
-**允许文件：** `newcode/subagents/discovery.py`、`types.py`、`tests/test_subagents_types.py`、`tests/test_subagents_discovery.py`。
-**实现动作：** 严格解析 `name/description/tools.allow/tools.deny/model/max_iterations/permission_mode`；`tools.allow` 必须是字符串列表，空列表明确表示不允许普通工具；`tools.deny` 可选且缺省为空，deny 优先；未知字段拒绝；检查 Markdown 分隔符、正文 ≤64 KiB、工具名唯一与格式；同来源同名冲突隔离。
-**对应测试：** 有效/无效 frontmatter、allow 缺失/空列表/错误类型、deny 缺省/显式覆盖与 deny 优先、超限正文、重复名、插件路径注入、未知字段；重复名不由扫描顺序随机选中。
-**完成判定：** 每条定义独立解析；缺少 allow 与显式空 allow 有不同且固定语义；bad definition 不影响 sibling。
-**禁止边界：** 不执行 Markdown/资源中的 script，不对 Agent 正文做模板求值。
-
-### T4 — 来源覆盖与启动可用性
-
-**前置条件：** T1–T3；测试可注入最终 ToolRegistry 名称。
-**允许文件：** `newcode/subagents/discovery.py`、`tests/test_subagents_discovery.py`。
-**实现动作：** 实现 project > user > builtin > explicit plugin precedence；跨来源以高优先级有效定义覆盖，单文件非法不屏蔽低层有效项；同源 duplicate 全部冲突项跳过；校验 allow/deny 引用当前 Registry。
-**对应测试：** 每层同名覆盖、稳定排序、非法高层回退、未知工具拒绝、plugin 默认空且仅显式注入可见。
-**完成判定：** 多次发现输出一致，目录向模型只投影 name/description。
-**禁止边界：** 不注入正文、工具 schema、路径、digest 或 secret 到启动 prompt。
-
-**Phase 1 退出门：** `.venv\Scripts\python.exe -m compileall newcode` 与 `pytest tests/test_subagents_types.py tests/test_subagents_discovery.py -q -rs --basetemp "$env:TEMP\newcode-pytest-ch13-p1"` 全通过；路径/来源安全测试有证据。
-
-## Phase 2：预算、任务 manager 与状态机（T5–T8）
-
-### T5 — 状态、scope、预算纯模型
-
-**前置条件：** Phase 1 通过。
-**允许文件：** `types.py`、`budget.py`、`tests/test_subagents_budget.py`、`tests/test_subagents_types.py`。
-**实现动作：** 定义 queued/running/background/completed/failed/cancelled/timed_out 状态、合法转换、不可复用 task ID 与 session-generation binding；实现 max 8 rounds、300s、16K 近似 token 预算和输入/输出统计；明确 128 条记录上限与 `subagent_task_store_full`。
-**对应测试：** 状态图允许/禁止转换、token 估算、边界、usage 不可用、deadline/cancel 预算。
-**完成判定：** 超限永不继续下一轮/下一工具；美元成本字段不伪造。
-**禁止边界：** 不请求 Provider、不写 archive、不改变 session。
-
-### T6 — 有界 worker 与队列
-
-**前置条件：** T5。
-**允许文件：** `manager.py`、`types.py`、`tests/test_subagents_manager.py`。
-**实现动作：** 固定 2 daemon workers、最多 4 queued、每 session ≤6 active/uncollected tasks、manager 最多 128 条记录；start 快速入队并返回 task ID；满载立即安全拒绝；只淘汰最旧已领取终态记录，捕获 worker exception。
-**对应测试：** 并发上限、队列满、session/record limit、无可淘汰记录时 `subagent_task_store_full`、已领取终态淘汰、未领取结果保留、task id 唯一性、异常隔离、稳定创建/完成序号。
-**完成判定：** 不会无界创建线程、任务或诊断，未领取结果绝不被淘汰。
-**禁止边界：** 不接 AgentLoop/CLI，不让 worker 写 parent ChatSession。
-
-### T7 — wait/background/cancel/collect 生命周期
-
-**前置条件：** T5–T6。
-**允许文件：** `manager.py`、`types.py`、`tests/test_subagents_manager.py`。
-**实现动作：** `wait` ≤30s、wait timeout 自动转 background；支持显式后台 start 和 parent Agent `background` 手动转换；终结态 cancel 幂等；completed result 只能领取一次。
-**对应测试：** 明确状态转换、假时钟 timeout、三种 background 进入方式、cancel 与 completion race、重复 collect。
-**完成判定：** 锁保护状态与结果原子性，不存在终结后被 worker 覆盖。
-**禁止边界：** 不实现用户 slash command，不向 session 写消息。
-
-### T8 — session scope、通知与 shutdown
-
-**前置条件：** T6–T7。
-**允许文件：** `manager.py`、`types.py`、`tests/test_subagents_manager.py`。
-**实现动作：** 完成结果按序写进 manager 有界记录/通知队列；scope mismatch 丢弃；通知/collect 互斥；session close 撤销 token、清空 pending；shutdown 合计 deadline ≤1 秒。
-**对应测试：** session ID+generation 不串线、completion 顺序、不丢/不重、关闭超时、close/new scope/reset、不持久化重启。
-**完成判定：** manager 独自持有 task state；旧 scope 无可领取结果。
-**禁止边界：** 不触碰父 ChatSession/SessionArchive/MCP/Hook cleanup。
-
-**Phase 2 退出门：** compileall 通过；`pytest tests/test_subagents_budget.py tests/test_subagents_manager.py -q -rs --basetemp "$env:TEMP\newcode-pytest-ch13-p2"` 全通过；队列/关闭时间有实际断言。
-
-## Phase 3：策略与 child runner（T9–T13）
+# Chapter 14：Git Worktree —— 原子任务
+
+## 任务约定
+
+- 只在 Chapter 14 获批后实施；每个 Phase 内按编号顺序执行，Phase compileall、targeted pytest、`git diff --check` 全过才进入下一 Phase。
+- Git 测试仅用临时本地 repositories/fake executable；不 remote、不 push、不改全局 Git 配置。
+- 当前 Git/ToolContext/Permission/CLI 的实际限制以 `spec.md` 为准：特别是 `run_command` 没有 OS sandbox 时必须 fail closed。
+- 下表是最大文件范围；某任务没有授权的模块不得顺便修改。新增最小测试 fixture 只能放在对应测试文件。
 
-### T9 — 多层工具策略交集
+## 文件清单
 
-**前置条件：** Phase 2 通过；发现 catalog 已完成。
-**允许文件：** `policy.py`、必要时 `skills/policy.py`、`tests/test_subagents_policy.py`。
-**实现动作：** Definition 使用必填 `tools.allow`（空列表为空普通工具集）；Fork 请求未提供 allowlist 时继承启动时父级有效可见工具不可变快照，提供时仅进一步收窄。计算 Registry ∩ child 启动父级可见/Permission 上限 ∩ 最新 Manager 父策略快照 ∩ Definition/Fork allow − 所有 deny ∩ child mode ∩ background read-only；`agent/load_skill` 不进入 child。父主线程负责发布不可变快照，worker 只能从 Manager 读取；每轮模型请求前和每次工具调用前复核，更新不得扩权；session scope 关闭撤销快照并取消 child。权限模式取更保守者。
-**对应测试：** Definition allow 缺失拒绝、空 allow、Fork allow 缺省继承与显式收窄/空集；Plan/Do、allow/deny、deny 优先、空交集、父扩权不扩 child、运行中父 Do→Plan 收窄、运行中 Skill whitelist 收窄、MCP 与 background 过滤；父对象变更不被 worker 直接读取。
-**完成判定：** 新工具默认不可用；父级收窄后运行 child 的下一轮模型工具集合及下一次工具调用不再包含被移除工具；parent 后续变宽不能扩大 spawn ceiling；session 关闭撤销策略并取消 child。
-**禁止边界：** 不改 Permission 规则语义，不以 whitelist 代替 Permission。
+| 用途 | 允许新增/修改文件 |
+|---|---|
+| Worktree 核心 | `newcode/worktrees/__init__.py`、`types.py`、`paths.py`、`git.py`、`manager.py`、`setup.py`、`command_sandbox.py` |
+| Definition / child | `newcode/subagents/types.py`、`discovery.py`、`runner.py`、必要时 `manager.py`、`policy.py`、`tool.py` |
+| cwd/工具安全 | `newcode/tools/types.py`、`workspace.py`、`file_tools.py`、`search_tools.py`、`command_tool.py`、`newcode/permissions/normalizer.py`、`sandbox.py` |
+| 根身份派生状态 | 必要时 `newcode/context/artifacts.py`、`newcode/memory/store.py` |
+| CLI lifecycle | `newcode/cli.py` |
+| 忽略规则 | `.gitignore`（仅追加 `.newcode/worktrees/`） |
+| 单元测试 | `tests/test_worktrees_paths.py`、`test_worktrees_git.py`、`test_worktrees_config.py`、`test_worktrees_manager.py`、`test_worktrees_setup.py`、`test_worktrees_command_sandbox.py` |
+| 集成测试 | `tests/test_subagents_worktrees.py`、`tests/test_cli_worktrees.py`、必要时 `tests/test_agent_loop_subagents.py`、`test_tools_workspace.py`、`test_permissions_sandbox.py`、`test_context_artifacts.py`、`test_memory_store.py`、`test_mcp_manager.py` |
+
+`pyproject.toml` 仅当测试直接证明新增 production module 无法打包时允许最小改动；本章默认不新增依赖。
+
+## Phase 1：模型、路径、Git runner 与配置校验（T1–T4）
+
+### T1：Definition isolation schema
 
-### T10 — 子 Agent 独立 Permission 与 ToolRegistry view
+- **前置条件：** Chapter 13 AgentDefinition/discovery 测试通过；已读定义 frontmatter 当前校验。
+- **允许文件：** `newcode/subagents/types.py`、`newcode/subagents/discovery.py`、`tests/test_subagents_discovery.py`。
+- **实现动作：** 增加 `shared|worktree` 字段；缺省 shared；非法值使单 Definition 隔离失败且不阻断 catalog 其它项；Fork 不读取 isolation。
+- **测试：** 缺省/两合法值/非法值/无效高优先级隔离；已有 Definition/Fork 兼容。
+- **完成判定：** 目录 projection 不暴露额外敏感字段，旧 Agent 行为保持不变。
+- **禁止边界：** 不创建 Worktree，不改主 AgentLoop/CLI/Provider/Permission。
+
+### T2：Worktree 名称与路径校验
 
-**前置条件：** T9。
-**允许文件：** `runner.py`、`policy.py`、`tests/test_subagents_runner.py`、`tests/test_subagents_policy.py`。
-**实现动作：** 为 child 构造过滤 registry view 与独立 PermissionManager；复制项目/用户规则与不可变父 Permission 上限，不复制 parent session allow；每轮和每次工具调用读取 Manager 当前策略快照；使用 deny-by-default 非交互 confirmer；不把 AgentTool/递归能力加入 child。
-**对应测试：** explicit deny/allow、confirmation 零执行、hard deny/sandbox、无父 session allow 继承、非交互运行；运行中的 child 在父 Do→Plan、Skill allowlist 收窄后下一轮不再看到/调用被移除工具。
-**完成判定：** child 每次工具仍由 AgentLoop → Permission → ToolScheduler → executor 判断。
-**禁止边界：** 不绕过或改写 PermissionManager，不自动批准 confirmation。
-
-### T11 — Definition runner 与 Context 生命周期
+- **前置条件：** T1 完成；锁定 spec 的 root 和命名规则。
+- **允许文件：** `newcode/worktrees/__init__.py`、`types.py`、`paths.py`、`tests/test_worktrees_paths.py`。
+- **实现动作：** 校验安全 slug、task ID、slash 段、长度；生成 `<repo>/.newcode/worktrees/<agent-slug>/<task-id>` 与受控 branch；拒绝绝对路径、盘符、UNC、反斜杠、空段、dot 段、链接/junction、非普通文件/目录和 canonical escape。
+- **测试：** 分段、最大长度、slash 深度、Windows drive/UNC、POSIX absolute、junction/symlink（环境不支持则只 skip 创建）、root containment 与 branch unsafe 输入。
+- **完成判定：** 任意非法输入稳定为 `worktree_path_invalid` 或专用冲突码，无文件副作用。
+- **禁止边界：** 不允许模型直接给 filesystem path 或 Git ref；不执行 Git。
+
+### T3：固定 argv Git adapter
+
+- **前置条件：** T2 完成。
+- **允许文件：** `newcode/worktrees/git.py`、`types.py`、`tests/test_worktrees_git.py`。
+- **实现动作：** 注入可执行文件/fake runner；固定 argv、cwd、受控 env、shell=False、timeout、最大输出；每条 manager 命令强制 `-c core.hooksPath=<manager-owned-empty-dir>`、禁用 system/global config、prompt 和 fsmonitor；包装 repo root/common-dir/head/ref/list/status/ignored/upstream/check-ref-format 只读调用。
+- **测试：** fake runner 断言 argv 分项、shell=False、empty hooks override 在所有子命令存在、system/global config 被禁用、无模型参数注入；timeout、异常、非零 exit、畸形/超长输出脱敏。
+- **完成判定：** 不调用网络/Git 任意命令，错误只产生稳定安全码。
+- **禁止边界：** 本任务无 `worktree add/remove` mutation；不暴露 subprocess stderr。
+
+### T4：用户/项目 Worktree 初始化配置
+
+- **前置条件：** T2–T3 完成。
+- **允许文件：** `newcode/worktrees/setup.py`、`types.py`、`tests/test_worktrees_config.py`、`.gitignore`。
+- **实现动作：** strict YAML user trust ceiling 和 project subset；未知字段/坏条目隔离；硬拒绝 secrets/runtime state；只向 `.gitignore` 追加 `.newcode/worktrees/`。
+- **测试：** 两层顺序、project 不扩大 user allowlist、单项坏配置隔离、敏感名即使显式 allow 也拒绝、`git check-ignore` 临时 repo 验证准确忽略 Worktree root 而不忽略 `.newcode/INSTRUCTIONS.md` 等。
+- **完成判定：** config 坏值不会阻断 shared CLI；ignore scope 精确。
+- **禁止边界：** 不复制文件、不调用 `git add`、不覆盖已有 `.gitignore` 规则。
+
+**Phase 1 gate：** `compileall newcode`；`test_subagents_discovery.py test_worktrees_paths.py test_worktrees_git.py test_worktrees_config.py` targeted；`git diff --check`。全通过才进入 T5。
+
+## Phase 2：Manager 创建、注册验证与状态（T5–T8）
+
+### T5：Lease、owner marker、锁和生命周期模型
 
-**前置条件：** T9–T10。
-**允许文件：** `runner.py`、必要时 `types.py`、`tests/test_subagents_runner.py`。
-**实现动作：** 用 definition 正文作为角色 system SOP，为每 task 构造独立 session/loop/context/skills state/usage/cancel state；无 Memory/Hook/session archive；finally 清理 child Context artifact。
-**对应测试：** 独立 messages/state、正文每轮存在、Context 独立压缩/失败、cleanup 在成功/异常/cancel 路径运行。
-**完成判定：** worker 只向 Manager 返回结果，不接触 parent Session。
-**禁止边界：** 不共享 active Skills、HookEngine 或 MemoryService。
-
-### T12 — Fork 快照、模型选择与 cache capability
+- **前置条件：** Phase 1 全通过。
+- **允许文件：** `newcode/worktrees/types.py`、`manager.py`、`tests/test_worktrees_manager.py`。
+- **实现动作：** 定义 Worktree lease/status/error/lock interface；ownership marker 存于 canonical common Git dir 的专用 NewCode metadata 子目录，不在 child checkout；marker 含版本、owner token、repo identity、branch/path/task ID；跨进程锁与进程内占用表。
+- **测试：** 状态转换合法/非法、marker schema、task lock 双占、锁释放与 owner mismatch。
+- **完成判定：** marker 不包含 secret，状态不写入 Chapter13 SessionArchive。
+- **禁止边界：** 不扫描/删除任意 Worktree，不在 worker 修改父状态。
+
+### T6：Worktree add 创建路径
 
-**前置条件：** T11；ProviderFactory 接口定义。
-**允许文件：** `runner.py`、`types.py`、`tests/test_subagents_runner.py`。
-**实现动作：** 复制最近 ≤20 条脱敏纯 user/assistant 文本、总长 ≤12,000 字符；冻结父启动 Permission 与有效可见工具上限；禁止 tool/system/dynamic/Hook/Memory 内容；Fork 未给 allowlist 时继承该启动工具快照，显式 allowlist 仅收窄；default inherit model，Fork 可选 model override；model 必须 Factory 声明并显式建 client；无 fallback；cache 能力缺省 false。
-**对应测试：** 0/20 条边界、敏感值、无 tool/system/SOP 复制、父 session 修改不影响 child、unsupported `haiku/sonnet/opus` 无 fallback、cache unsupported 普通运行。
-**完成判定：** fork snapshot immutable，当前 DeepSeek 仅当前 config model 可用。
-**禁止边界：** 不修改 Provider contract/实现，不宣称 token/cost savings。
+- **前置条件：** T5 完成。
+- **允许文件：** `newcode/worktrees/git.py`、`manager.py`、`tests/test_worktrees_manager.py`、`tests/test_worktrees_git.py`。
+- **实现动作：** 锁定 repo/task；验证 non-bare、canonical root/common dir/base HEAD、目标与 ref 未占用；先登记可回滚 owner lease，再经 T3 hook-safe wrapper 固定 argv 执行 `worktree add -b`；成功后查询并校验注册信息才返回 ready lease。
+- **测试：** 临时本地 git init repo 创建成功，两个 worktree branch/path 唯一；repo/bare/invalid HEAD、branch/path collision、git error/timeout fail closed；为 repo `.git/hooks/post-checkout`、user/global hooksPath fixture 放置 sentinel，worktree add checkout 全过程 sentinel 不得创建；不依赖 network。
+- **完成判定：** create 成功唯一返回已验证 lease；拒绝不启动 child。
+- **禁止边界：** 不用 `--force`、shell 字符串、push/fetch、现存分支覆盖。
+
+### T7：注册校验与已有目录拒绝/受控恢复
+
+- **前置条件：** T6 完成。
+- **允许文件：** `newcode/worktrees/git.py`、`manager.py`、`tests/test_worktrees_manager.py`。
+- **实现动作：** 比较 porcelain list、show-toplevel、common-dir、symbolic branch、HEAD、owner marker、Manager lease；仅当前 manager 已登记且未占用的同 task 可复验；其他已存在目标统一拒绝。只读查询也经 T3 hooks/config 隔离 wrapper。
+- **测试：** 删除登记、伪造 marker、别的 common dir、branch/path/head 改变、重复 registration、detached HEAD、已占用、单凭目录存在恢复等拒绝；list/rev-parse 查询不触发 fixture hooks。
+- **完成判定：** 每项拒绝无删除、无启动、无复用副作用。
+- **禁止边界：** 不做跨进程 resume，不调用 prune。
+
+### T8：安全回滚和失败隔离
+
+- **前置条件：** T6–T7 完成。
+- **允许文件：** `newcode/worktrees/manager.py`、`git.py`、`tests/test_worktrees_manager.py`。
+- **实现动作：** create 半途失败时，只对本 manager-created、marker+registry 双重证明、无用户变更且未占用资源做 remove；其它情况 preserve+diagnostic。
+- **测试：** add 前后每阶段注入故障、并发 race、registration 失败、cleanup 命令失败；相邻任务仍可创建/运行。
+- **完成判定：** rollback 永不删除先存目录、分支或他人 worktree。
+- **禁止边界：** 禁止递归删除公共 Worktree root、force remove、自动 branch -D。
+
+**Phase 2 gate：** `compileall newcode`；`test_worktrees_git.py test_worktrees_manager.py` targeted；`git diff --check`。通过后进入 T9。
 
-### T13 — 文件读 cache、MCP/Skill 限定与预算执行
-
-**前置条件：** T9–T12。
-**允许文件：** `runner.py`、`budget.py`、必要时 `policy.py`、`tests/test_subagents_runner.py`、`tests/test_subagents_policy.py`。
-**实现动作：** 建 child-local read_file cache（128 entry/2 MiB，stat 签名，写/replace/command/MCP 后清空）；每次命中仍先过 Permission/sandbox；检查每次主请求和每个工具前 budget/cancel；MCP 仍走现 manager；Skill state child-local且不继承。
-**对应测试：** cache hit/miss/invalidation/symlink/scope isolation，permission denial 不读缓存，MCP confirmation fail-closed，background 仅只读。
-**完成判定：** token/round/time超限稳定终止，工具历史完整、安全排序；child memory/service 无共享。
-**禁止边界：** 不增大权限、不改 MCP/Context/Memory core、不做 Worktree。
+## Phase 3：cwd、sandbox、内置工具与缓存（T9–T14）
 
-**Phase 3 退出门：** compileall 通过；`pytest tests/test_subagents_policy.py tests/test_subagents_runner.py -q -rs --basetemp "$env:TEMP\newcode-pytest-ch13-p3"` 全通过；fork 隐私、Permission、cache、安全 cleanup 有明确断言。
-
-## Phase 4：统一 Tool 与 AgentLoop/Prompt 接入（T14–T18）
+### T9：不可变 child execution context
 
-### T14 — 固定 `agent` Tool schema
+- **前置条件：** Phase 2 通过。
+- **允许文件：** `newcode/tools/types.py`、`newcode/subagents/types.py`、`newcode/worktrees/types.py`、相应类型测试。
+- **实现动作：** ToolContext 增加 canonical `cwd`、workspace identity；旧构造保持 cwd 默认为 workspace root；Worktree root 与 cwd 一致但语义独立。
+- **测试：** 默认兼容、相对/非 canonical cwd 拒绝或归一、安全 root identity 不可变。
+- **完成判定：** 不调用/修改 process cwd；旧 caller 可继续构造 ToolContext。
+- **禁止边界：** 不全局 `chdir`，不在 ToolContext 放入可变父 session。
 
-**前置条件：** Phase 2–3 通过。
-**允许文件：** `tool.py`、`types.py`、`tests/test_subagents_tool.py`。
-**实现动作：** 实现单一 `agent` Tool 和固定字段 schema。所有请求必填 operation；start 必填 kind、非空 task_prompt、execution；Definition 必填 agent_name 且禁止 model_override/allowlist，Fork 禁止 agent_name、允许可选 model_override/allowlist；start 仅接受这些 operation 专属字段。其他操作必填 task_id：status 只读；wait 可选 1–30 整数 wait_seconds（缺省 30）；background、cancel、collect 不接受其他字段。未知/缺失/不兼容字段统一 `subagent_invalid_request`。定义各操作合法状态、等待/后台转换、取消幂等、结果单次领取及稳定 not-found/not-ready/already-collected/model-unavailable 错误码。
-**对应测试：** 固定 schema snapshot；六种 operation 的必填/可选字段、Definition/Fork 差异、每个非法组合与未知字段、wait 边界、状态与领取语义、错误码稳定、无动态注册。
-**完成判定：** 任意角色/任务仅有同一 `agent` 名和 schema；所有字段组合确定、可解析并安全失败，不存在动态 schema。
-**禁止边界：** Tool 不直接调用 Provider/CLI/UI，不自行绕过 Permission。
-
-### T15 — 主 AgentLoop 注册、Plan/Do 与 Permission gate
+### T10：workspace resolver 与文件/搜索工具
 
-**前置条件：** T14。
-**允许文件：** `agent/loop.py`、`tool.py`、必要时 `skills/policy.py`、`tests/test_subagents_tool.py`、`tests/test_agent_loop_subagents.py`。
-**实现动作：** CLI 构造好的 AgentTool 注册一次并在 Plan/Do 可见；标记非只读使 Scheduler 串行；mode/Skill visibility 复核后才由 PermissionManager/executor 调用。
-**对应测试：** tool 固定、计划/执行模式、permission deny/confirmation、ToolScheduler serial、未知/隐藏调用无 worker。
-**完成判定：** 任一拒绝先于 task creation，父 AgentLoop 不崩溃。
-**禁止边界：** 不修改 Provider、ToolScheduler 与 Permission 语义；child registry 排除 agent。
+- **前置条件：** T9 完成。
+- **允许文件：** `newcode/tools/workspace.py`、`file_tools.py`、`search_tools.py`、对应既有测试及 `tests/test_subagents_worktrees.py`。
+- **实现动作：** 统一使用 `workspace_root` 解析文件参数；固定 child root containment，扫描时拒绝/跳过逃逸 symlink/junction；find/search 返回 child-relative path。
+- **测试：** read/write/replace/find/search 五工具在不同 temp worktree 执行、绝对/`..`/链接 escape 拒绝、主目录同名文件保持不变。
+- **完成判定：** 六内置工具中的五个文件类工具的所有读写均限 child root。
+- **禁止边界：** 不改变 shared tool schema/语义，不读 common `.git` 元数据。
 
-### T16 — 主请求安全点结果投递
+### T11：Permission 与 sandbox root
 
-**前置条件：** T8、T15。
-**允许文件：** `agent/loop.py`、`manager.py`、`tests/test_agent_loop_subagents.py`。
-**实现动作：** 每个主请求最终 messages 构造前按 session scope drain 完成 notice，原子 claim 后以 assistant 背景摘要添加到主 session。
-**对应测试：** worker 不持有 session、safe-point-only mutation、顺序、不丢失/不重复、foreground collect 不重复、旧 session 不串线。
-**完成判定：** 通知只进入正确 parent ChatSession，单条 ≤4,000 字符且已脱敏。
-**禁止边界：** 不在后台线程/ToolScheduler worker 写主历史，不回灌完整 child messages。
+- **前置条件：** T9–T10 完成。
+- **允许文件：** `newcode/permissions/normalizer.py`、`sandbox.py`、相关 sandbox/permission tests。
+- **实现动作：** permission request、normalized absolute path 与 sandbox root 一致使用 child workspace root；保持 hard deny、显式 deny、Plan/Do 优先级。
+- **测试：** main path 从 worktree child deny；child path allow/确认照既有策略；symlink root escape deny；MCP/non-file policy unchanged。
+- **完成判定：** common Git dir/main workspace 不会进入 sandbox allowed root。
+- **禁止边界：** 不改变 Permission rules、MCP 或 Plan/Do semantics。
 
-### T17 — 动态 Agent catalog
+### T12：根身份化 child read cache
 
-**前置条件：** T4、T15。
-**允许文件：** `prompt/modules.py`、`agent/loop.py`、`tests/test_prompt_subagents.py`。
-**实现动作：** 动态背景只包含 catalog 的 name+description 和固定提示；不同 Agent body、路径、digest/model/完整 metadata 不注入。
-**对应测试：** 排序、覆盖后目录稳定、无定义/无效定义、敏感或路径字段不泄露。
-**完成判定：** Parent 能选 definition，system prompt 不暴露正文。
-**禁止边界：** 不把 prompt/catalog 写入 ChatSession/JSONL/Memory/artifact。
+- **前置条件：** T9–T11 完成。
+- **允许文件：** `newcode/subagents/runner.py`、`types.py`、`tests/test_subagents_worktrees.py`、`tests/test_subagents_runner.py`。
+- **实现动作：** 缓存 key 加 canonical workspace root、workspace identity、canonical file path、stat signature；每个 Worktree/task 独立 cache。
+- **测试：** 两个 root 相同相对路径不同内容、一个 root 文件变化、cache eviction/invalidation、shared path 不读 Worktree cache。
+- **完成判定：** 目录不同绝不 cache hit；existing permission check 仍先于 cache hit。
+- **禁止边界：** 不跨 child/task 共享缓存。
+
+### T13：run_command sandbox capability
 
-### T18 — Hook 占位决策和递归防线
+- **前置条件：** T9 完成；先验证目标平台技术能力，不以 cwd 假称隔离。
+- **允许文件：** `newcode/worktrees/command_sandbox.py`、`newcode/tools/command_tool.py`、`types.py`、`tests/test_worktrees_command_sandbox.py`。
+- **实现动作：** command tool 从 ToolContext 获取固定 cwd；Worktree child 只可经结构化解析器和 capability 执行受限只读 Git allowlist：`status --no-optional-locks`、`diff --no-ext-diff --no-textconv`、`log`、`show`、`cat-file`、`ls-files`、受限 `rev-parse`。拒绝 `git add`、`git commit`、`git update-ref`、branch/ref 写入、checkout/switch、reset、clean、fetch、push、config、worktree add/remove/prune 和未列命令。当前 Worktree admin dir（含 index/HEAD/config/logs）及 common metadata 对 child 一律只读；不支持 child commit（没有 task 独占 objects/refs）。不把原始 shell 字符串交给 shell；拒绝 operator、pager、external diff/textconv、helper 和 config override。不能证明解析、ACL、参数及 hooks 隔离时，命令执行前 fail closed；shared 保持既有行为。
+- **测试：** fake backend 记录 cwd=root；验证只读 allowlist 命令可用；逐项尝试 add/commit/update-ref/ref/config/worktree 写命令与未列命令，断言拒绝且 subprocess 零调用或零副作用；确认 common objects/refs、当前 index/HEAD、main 与其他 Worktree admin metadata 均未改变。覆盖 shell operator/命令拼接不能绕过策略。真实隔离 backend（若实现）以临时本地 repo 验证；不能证明 ACL/解析时断言 Git/`run_command` subprocess 零调用。
+- **完成判定：** 只有只读命令矩阵、共享与 task admin metadata 写保护、hooks 隔离全部通过才显示/执行受限 Git 查询；`git add`、`git commit`、`git update-ref` 永远拒绝，不能仅依赖 cwd 或静态文本扫描，也不能 silent fallback。
+- **禁止边界：** 不把静态 shell 文本扫描单独视作完整隔离，不运行真实危险命令。
 
-**前置条件：** T14–T17。
-**允许文件：** `tests/test_subagents_tool.py`、必要时 `tests/test_hooks_actions.py`。
-**实现动作：** 验证 Hook `subagent` action 继续返回 `hook_subagent_not_available`，不调用 manager、不排队；AgentTool child 不包含 AgentTool/HookEngine。
-**对应测试：** placeholder 零创建、child 无 Hook 回调、agent 嵌套请求拒绝。
-**完成判定：** Chapter12 Hook 行为兼容且不递归。
-**禁止边界：** 不激活 Hook SubAgent action，不改 Hook 规则/action 实现。
+### T14：派生缓存/Context artifact 根隔离
 
-**Phase 4 退出门：** compileall 通过；`pytest tests/test_subagents_tool.py tests/test_agent_loop_subagents.py tests/test_prompt_subagents.py -q -rs --basetemp "$env:TEMP\newcode-pytest-ch13-p4"` 全通过；AgentTool/通知/gates 有证据。
+- **前置条件：** T9–T12 完成。
+- **允许文件：** 必要时 `newcode/context/artifacts.py`、`newcode/memory/store.py`、`newcode/instructions.py`、`newcode/skills/discovery.py`、SubAgent 相关 tests。
+- **实现动作：** 所有已有缓存 key 包含来源 canonical root/workspace fingerprint；project memory fingerprint 使用 worktree root；context artifact 写入/cleanup 锁定当前 child root。没有现存 cache 的模块不新增 cache。
+- **测试：** artifact 仅写 child root 并 cleanup；memory project scope 区分同 repo 的不同 worktree；instructions/project discovery 正确 root；无越界清理。
+- **完成判定：** root 变化时不复用 derived content；user scope仍按当前规则。
+- **禁止边界：** child 不启用 Memory/Archive/Hook/父 Skills，除 Definition SOP 的既有语义。
 
-## Phase 5：CLI 与 session lifecycle（T19–T21）
+**Phase 3 gate：** `compileall newcode`；`test_worktrees_command_sandbox.py test_subagents_worktrees.py test_tools_workspace.py test_permissions_sandbox.py test_context_artifacts.py test_memory_store.py` targeted；`git diff --check`。若特定既有测试文件名/结构不同，先定位同等现存测试，不创建重复测试集。
+
+## Phase 4：初始化、安全 Runner 与结果（T15–T18）
 
-### T19 — CLI 注入 ProviderFactory 与单 Manager
+### T15：精确配置文件 allowlist 复制
 
-**前置条件：** Phase 4 通过。
-**允许文件：** `newcode/cli.py`、`tests/test_cli_subagents.py`。
-**实现动作：** MCP discovery 后构造 Agent catalog、ProviderFactory 和每进程单 SubAgentManager；Factory 仅声明 `config.model`、为 child 建独立 client 且有限请求 timeout；创建并注册单个 agent Tool。
-**对应测试：** 当前模型继承、可用性集合、独立 fake client、无额外工具、startup fail isolation。
-**完成判定：** CLI 注入完全来自现有 config/Registry，不修改 config/Provider 文件。
-**禁止边界：** 不读取 API key 到 Agent prompt/diagnostics，不对模型名静默 fallback。
+- **前置条件：** Phase 1–3 全通过。
+- **允许文件：** `newcode/worktrees/setup.py`、`tests/test_worktrees_setup.py`。
+- **实现动作：** user exact allowlist ∩ project request ∩ hard-safe names；copy files / ignored files 仅逐个普通文件复制，不递归；临时文件+原子 rename，reject links。
+- **测试：** allow/deny precedence、`.env`/token/session/memory/artifact/MCP config拒绝、路径穿越拒绝、copy failure无半成品、目录不递归。
+- **完成判定：** 默认复制 0 项，秘密永不进入 child。
+- **禁止边界：** 不复制全部 ignored/untracked、环境变量、父 session。
 
-### T20 — 新旧 session scope 切换和最终清理
+### T16：dependency link 信任检查
 
-**前置条件：** T19。
-**允许文件：** `newcode/cli.py`、`tests/test_cli_subagents.py`，必要时既有 `tests/test_cli_session.py`。
-**实现动作：** `/clear`、`/resume` 在 session 切换前取消旧 tasks、清通知并 bounded wait；EOF、exit、KeyboardInterrupt、异常和正常退出统一 close；SubAgent cleanup 在既有 Hook/Memory/Context/MCP cleanup 前完成且总等待 ≤1 秒。
-**对应测试：** 各退出事件顺序、服务 cleanup 失败隔离、scope generation 更新、archive/resume 不恢复 task。
-**完成判定：** 旧任务不能通知新 session，SubAgent shutdown 不阻塞后续 cleanup。
-**禁止边界：** 不新增 slash command，不改原 `/clear`、`/resume`、Hook/Memory/Context/MCP 语义。
-
-### T21 — CLI 受控端到端
-
-**前置条件：** T14–T20。
-**允许文件：** `tests/test_cli_subagents.py`、必要时最小 `cli.py` 修正。
-**实现动作：** 用 FakeProvider、临时 workspace/home、fake clock/provider factory 驱动 Definition/Fork、background 完成通知和退出清理。
-**对应测试：** 配置发现→普通 AgentTool→child fake 工具→safe result→后台通知→clear/resume/exit；不产生真实 API 调用。
-**完成判定：** 主/子历史隔离、task 非持久化、结果一次交付、旧 CLI 命令回归。
-**禁止边界：** 不用真实 Provider、网络、secret、第三方 MCP、tmux。
-
-**Phase 5 退出门：** compileall 通过；`pytest tests/test_cli_subagents.py tests/test_cli_session.py tests/test_cli_hooks.py tests/test_cli_context.py tests/test_cli_memory.py tests/test_cli_mcp.py tests/test_cli_commands.py -q -rs --basetemp "$env:TEMP\newcode-pytest-ch13-p5"` 全通过。
-
-## Phase 6：最终回归与验收（T22–T24）
-
-### T22 — Chapter 4–12 与静态边界回归
-
-**前置条件：** Phase 1–5 全通过。
-**允许文件：** 默认只读；若直接证明回归，最小相关模块和对应测试。
-**实现动作：** 执行 Provider/AgentLoop/Tools/Permission/Plan-Do/Context/Memory/MCP/Skill/Hook/Commands/CLI targeted tests；静态检查 Provider 无 SubAgent import、child 无嵌套/Hook、Tool gate 与 session isolation。
-**对应测试：** 项目中 Chapter 4–12 全部相关测试及新的 SubAgent tests。
-**完成判定：** 原有工具六件套、MCP、权限、上下文和命令语义无回归。
-**禁止边界：** 不做与失败无直接因果的重构。
-
-### T23 — 全量验证与 skip 审核
-
-**前置条件：** T22。
-**允许文件：** 默认只读；最小 regression fix + 测试例外同 T22。
-**实现动作：** 全量 compileall、pytest `-rs` 与 `git diff --check`；记录每个 skip 的平台/环境原因。
-**对应测试：** 全部 pytest。
-**完成判定：** 无失败；所有 skip 有说明；diff check clean。
-**禁止边界：** 不隐藏 skip、不使用外网、不安装 tmux。
-
-### T24 — Fake CLI 验收与边界报告
-
-**前置条件：** T23 全通过。
-**允许文件：** 默认只读。
-**实现动作：** fake provider/fixture 验收 definition/fork、permission deny、Plan/Do、foreground/background 三路径、通知领取、timeout/cancel、会话切换和 cleanup。
-**对应测试：** 自动化 E2E 加静态审计清单。
-**完成判定：** 提供每项日志/断言证据、skip 原因、未完成项及本章边界结论。
-**禁止边界：** 不运行真实 API/MCP/Hook HTTP，不提交或暂存。
-
-**Phase 6 退出门：** `.venv\Scripts\python.exe -m compileall newcode`、`.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter13-final"`、`git -c safe.directory=F:/agent/Newcode diff --check` 均通过；受控 CLI fixture 完成。
-
-## 顺序
+- **前置条件：** T15 完成。
+- **允许文件：** `newcode/worktrees/setup.py`、路径工具、`tests/test_worktrees_setup.py`。
+- **实现动作：** 只解析用户指定的可信只读 dependency roots；project 只能引用登记 ID；target path canonical、可读、不可写且不能被 child 修改，平台不支持 read-only link 则跳过。
+- **测试：** unknown/outside/writable/link-chain/reparse target拒绝；合法 fake trusted root；子 Agent 不能写目标的验证。
+- **完成判定：** 默认无 link，失败继续但依赖不可用并记录 safe code。
+- **禁止边界：** 不 link `.venv` 或任意 workspace/用户目录，不信任 project 提供的绝对路径。
+
+### T17：Git hooks 显式禁用
+
+- **前置条件：** T15–T16 完成。
+- **允许文件：** `newcode/worktrees/setup.py`、`git.py`、`manager.py`、`tests/test_worktrees_setup.py`。
+- **实现动作：** Chapter 14 hook execution allowlist 固定为空；Git adapter 对每条 SubAgentManager 命令固定注入 manager-owned empty hooks dir，并禁用 system/global config；忽略 repo/user/global 设置的 hooksPath。checkout、add、list、status、remove 及失败清理统一走该 wrapper。
+- **测试：** 为 repo `.git/hooks`、user hooksPath 和 global hooksPath 配置写入 fixture sentinel；逐种 Manager Git 命令均验证 sentinel 零执行，重点覆盖 `worktree add` 的 checkout hook；配置覆盖缺失时断言 Git 命令零启动。
+- **完成判定：** 所有 manager Git 入口都可证明 hook 绝不执行；不支持的环境 fail closed。
+- **禁止边界：** 不复制/执行任何 hook，不改仓库/用户/全局 Git 配置，不运行生产 hooks。
+
+### T18：Runner 创建/完成集成与安全结果
+
+- **前置条件：** T5–T17 完成。
+- **允许文件：** `newcode/subagents/runner.py`、必要时 `manager.py`/`types.py`、`tests/test_subagents_worktrees.py`。
+- **实现动作：** Worktree Definition start 前创建并 verify lease，初始化后再建 child ToolContext/AgentLoop；finally 取消/有限等待、finish；结果带脱敏状态/branch/path，保留 Chapter13 budgets/Permission/policy/notifications。
+- **测试：** create failure 不启动 Provider；Definition shared旧路径无变；worktree child cwd/root；final/exception/cancel/timeout分别清理或保留；结果不包含 Git output/secrets。
+- **完成判定：** 主 ChatSession 不被 worker 修改，Manager安全队列负责结果。
+- **禁止边界：** Fork 不创建 Worktree；不合并、不提交、不 push、不变更 Provider。
+
+**Phase 4 gate：** `compileall newcode`；`test_worktrees_setup.py test_subagents_worktrees.py` targeted；`git diff --check`。
+
+## Phase 5：完成保护、过期清理与 CLI 生命周期（T19–T22）
+
+### T19：dirty/upstream outcome
+
+- **前置条件：** Phase 4 通过。
+- **允许文件：** `newcode/worktrees/git.py`、`manager.py`、`types.py`、`tests/test_worktrees_manager.py`。
+- **实现动作：** `status --porcelain=v1 -z --untracked-files=all` 检查 tracked/staged/untracked；另执行 `status --ignored=matching`、`ls-files --others --ignored --exclude-standard -z` 与 no-follow root walk 检查 ignored 文件和目录；只清理 owner manifest 中逐项验证的本 task temp 再重查。validated upstream rev-list 判断 ahead；无 upstream/离线/timeout/异常/输出截断/扫描错误均 unknown preserve。
+- **测试：** clean/no changes, staged/unstaged/untracked/ignored file/ignored directory, ahead commit, no upstream, status/traversal incomplete, network not attempted；child 创建 ignored file 后不得自动删除，tree 必须 preserve。
+- **完成判定：** 任一非空/unknown/扫描不完整均不能 remove；Worktree `.git` pointer 仅在与精确 task admin registration 匹配时视为结构性 metadata。
+- **禁止边界：** 不自动 commit/reset/clean/stash/fetch/push。
+
+### T20：三层过期清理
+
+- **前置条件：** T19 完成。
+- **允许文件：** `newcode/worktrees/manager.py`、`git.py`、`paths.py`、`tests/test_worktrees_manager.py`。
+- **实现动作：** 30 天候选 + path gate + Git/owner gate + activity/cleanliness gate；重检后逐项验证 tracked/staged/untracked/ignored 文件/目录及完整 root walk 为空才 remove，记录安全失败继续其余候选。
+- **测试：** 恰好/超过 30 天；main/user/root/outside/link/unknown owner拒绝；active lock skip；dirty/ahead/no upstream/ignored file or dir/scan error保留；一个 cleanup失败不阻断其它资源。
+- **完成判定：** 清理不遍历/删除公共 root 或 Git metadata；每个删除对象均有完整审计条件。
+- **禁止边界：** 不以 mtime 单独授权，不 `rmtree`，不 prune。
+
+### T21：CLI SubAgent/Worktree lifecycle
+
+- **前置条件：** T18–T20 完成。
+- **允许文件：** `newcode/cli.py`、`tests/test_cli_worktrees.py`、必要时 `tests/test_cli_subagents.py`。
+- **实现动作：** CLI 创建/注入每进程 WorktreeManager；clear/resume 先关闭旧 scope 和 child worktree，再开新 generation；EOF/exit/KeyboardInterrupt/异常统一有限等待，cleanup fail 不阻断 Hook→Memory→Context→MCP。
+- **测试：** 所有退出入口、初始化中异常、clear/resume、多个 task隔离、shutdown顺序及异常注入。
+- **完成判定：** Manager 每 task资源最多 finish 一次；已有 SubAgent/Hook/Memory/Context/MCP语义不变。
+- **禁止边界：** 不新增 slash command、跨会话恢复、MCP cwd更改。
+
+### T22：AgentLoop通知与结果格式回归
+
+- **前置条件：** T18–T21 完成。
+- **允许文件：** `newcode/agent/loop.py` 仅测试明确证明需适配时；`tests/test_subagents_worktrees.py`、`tests/test_agent_loop_subagents.py`。
+- **实现动作：** Worktree outcome 随 task summary安全传递；通知仍只在主 AgentLoop安全点按序一次性写入正确 session/generation。
+- **测试：** completion/collect race、clear后旧通知丢弃、路径/branch脱敏与长度、Context estimate含 notification、Archive不记录task state。
+- **完成判定：** 不改变已有 AgentLoop事件/tool-call次序与 gate。
+- **禁止边界：** 不允许 worker写 parent ChatSession，不绕过 ToolScheduler/Permission。
+
+**Phase 5 gate：** `compileall newcode`；`test_worktrees_manager.py test_subagents_worktrees.py test_cli_worktrees.py test_agent_loop_subagents.py test_cli_subagents.py` targeted；`git diff --check`。
+
+## Phase 6：全回归与验收（T23–T26）
+
+### T23：Chapter 14 targeted regression
+
+- **前置条件：** Phase 1–5 全通过。
+- **允许文件：** 默认无；只允许直接失败证明的 Worktree 生产模块及对应最小回归测试。
+- **实现动作：** 运行 Worktree、SubAgent、Tool、Permission、Context、Memory、MCP、CLI targeted suite。
+- **测试：** 使用 fake provider、local repo 和 local fixtures，覆盖共享 Git metadata 只读 object/禁止共享 refs 等写入、Manager commands 禁 hooks、ignored 内容保留；记录每个 skip 原因。
+- **完成判定：** 所有 targeted 通过；无范围外修复。
+- **禁止边界：** 不真实网络/secret/MCP/hooks/tmux。
+
+### T24：全 Chapter 4–14 和全量 pytest
+
+- **前置条件：** T23 通过。
+- **允许文件：** 默认无；只修直接回归。
+- **实现动作：** compileall、Chapter4–14 regression 与 full pytest，basetemp 使用系统 TEMP。
+- **测试：** `.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-final"`。
+- **完成判定：** 全量通过并解释所有 skip。
+- **禁止边界：** 不忽略/隐藏失败，不扩大测试范围外功能。
+
+### T25：静态安全边界审计与 diff
+
+- **前置条件：** T24 通过。
+- **允许文件：** 默认无；审计证明缺陷才最小修复。
+- **实现动作：** 审计 Provider无 Worktree 感知、Git argv 与 empty hooks override、安全目录、cwd/sandbox根、只读 Git 命令 allowlist/写命令 denylist、process sandbox 对 common objects/refs 与当前/其他 Worktree admin metadata 的只读边界及 fail-closed、Permission/Plan/ToolScheduler链、无主 session写入、cache root隔离、tracked/staged/untracked/ignored 全状态清理门、MCP语义不变、shared行为兼容。
+- **测试：** 临时本地 repo 验证只读 Git allowlist；对 `git add/commit/update-ref`、ref/config/worktree 写入及未列命令断言拒绝且无文件/object/ref/index/HEAD 副作用；`git diff --check`；rg/源码审计记录具体证据。
+- **完成判定：** 每项边界均有实现位置与测试佐证；未知标记未完成而非通过。
+- **禁止边界：** 不暂存/提交/全局配置。
+
+### T26：本地 Git + fake CLI acceptance
+
+- **前置条件：** T23–T25 通过。
+- **允许文件：** 默认无；如流程缺陷仅加最小 acceptance regression test 与直接修复。
+- **实现动作：** 临时 home/workspace/local Git repo/fake Provider/command sandbox跑 shared与worktree Definition；工具读写隔离；完成保护、保留信息、cancel/timeout、clear/resume、EOF/exit/error cleanup；确认无网络命令。
+- **测试：** 本地 acceptance fixture 和最终 `git status --short`（只读）。
+- **完成判定：** main repo文件不被 Worktree child写入；Worktree cleanup/preserve结果与 Git 实际状态一致；无真实 tmux时说明环境原因。
+- **禁止边界：** 不修改全局 Git config、不 remote/push、不运行生产 hooks、不给 run_command 未验证 sandbox 权限。
+
+## 执行顺序
 
 ```text
-T1 → T2 → T3 → T4
-                 ↓
-T5 → T6 → T7 → T8
-                 ↓
-T9 → T10 → T11 → T12 → T13
-                           ↓
-T14 → T15 → T16 → T17 → T18
-                           ↓
-T19 → T20 → T21 → T22 → T23 → T24
+T1 -> T2 -> T3 -> T4
+                 -> T5 -> T6 -> T7 -> T8
+                                  -> T9 -> T10 -> T11 -> T12 -> T13 -> T14
+                                                                   -> T15 -> T16 -> T17 -> T18
+                                                                                         -> T19 -> T20 -> T21 -> T22
+                                                                                                              -> T23 -> T24 -> T25 -> T26
 ```
+
+每 Phase 的最后一项必须先完成 targeted pytest、`python -m compileall newcode`、`git diff --check`。任何 sandbox confinement、Git ownership、删除保护或权限链无法证明时停止并报告，不允许跳过退出门。

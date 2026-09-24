@@ -1,153 +1,182 @@
-# Chapter 13：SubAgent 实施计划
+# Chapter 14：Git Worktree —— 实施计划
 
-## 架构概要
+## 架构概览
 
-主 Agent 继续由现有 AgentLoop 驱动；新增 `newcode/subagents/` 负责 definition discovery、窄权限策略、进程内任务状态、有界 worker、ProviderFactory 与统一 `agent` Tool。`agent` Tool 由主 CLI 在 MCP discovery 后注册一次，并作为非只读工具通过 AgentLoop → mode/visibility → PermissionManager → ToolScheduler → executor。子 Agent 使用独立 AgentLoop/ChatSession/Context/权限会话状态，但其有效工具集合只是父级能力的子集。
+本计划基于当前 NewCode：`SubAgentRunner` 为每个 child 建立独立 AgentLoop/ChatSession/Context/Permission，`ToolContext.workspace_root` 是当前文件工具与 Permission sandbox 根；`run_command` 当前 shell 执行且以 workspace root 为 cwd；CLI 在 SubAgent shutdown 后继续 Hook、Memory、Context、MCP cleanup。当前无 worktree/cwd/清理支持。
 
-任务 worker 只写 SubAgentManager 的锁保护记录和有界通知队列。父 ChatSession 只由主 AgentLoop 在请求前安全点更新。CLI 负责创建/切换 session scope 与取消/关闭 manager；不新建 slash command，不让 Provider、MCP、Permission 或 ToolScheduler 理解 SubAgent。
-
-## 核心数据与接口
-
-- `AgentDefinition`：已校验名称、说明、source、正文、allow/deny、model、max_iterations、permission_mode、摘要/digest。
-- `SubAgentTask`：task ID、父 session scope、definition/fork 类型、状态、执行方式、不可变输入快照、budget/stat、终态码、安全摘要、创建/完成序号、结果领取状态、取消 token。Manager 最多保留 128 条；仅淘汰最旧的已领取终态记录，未领取结果永不淘汰。
-- `ParentPolicySnapshot`：不可变地记录启动时父 Permission policy 与有效可见工具上限；主线程在父策略收窄时发布新快照，Manager 按 session scope 保存最新版本，worker 只能读取 Manager 快照，不能访问父 AgentLoop/ChatSession。
-- `SubAgentManager`：`start`、`status`、`wait`、`background`、`cancel`、`collect`、`drain_notifications(scope)`、`close_session(scope)`、`shutdown(deadline)`。所有状态跃迁、领取和通知标记串行化。
-- `ProviderFactory`：报告当前可用 model，并按 model/请求 timeout 创建新的 ChatProvider；CLI 只声明配置 model 可用。child 不共享主 Provider client。
-- `AgentTool`：固定 `agent` schema，将参数校验后委派 Manager；不创建动态 Tool。
-- `SubAgentRunner`：创建 child scope、session、ContextManager、PermissionManager、ToolRegistry view、Skill state、budget/cancel state；只返回安全结果。
-
-## 文件与职责
+新增 Worktree 层仅服务 Definition 的 `isolation=worktree`；shared Definition 和 Fork 保持原样。组件及单向依赖：
 
 ```text
-newcode/subagents/
-  __init__.py       公共窄接口
-  types.py          definition、task、状态、预算和诊断纯类型
-  discovery.py      定义文件扫描、优先级、YAML/frontmatter 与路径安全
-  policy.py         父/角色/mode/background 工具集合的交集
-  budget.py         单任务 token 近似计数、轮次与时限
-  manager.py        有界队列、worker、状态机、通知/领取/取消/关闭
-  runner.py         Definition/Fork child AgentLoop 构造与安全收尾
-  tool.py           唯一固定 agent Tool 与稳定 schema
-newcode/agent/loop.py           主请求安全点取通知、注册/执行控制 Tool 的接缝
-newcode/prompt/modules.py       仅 name/description 的定义目录动态背景
-newcode/cli.py                  ProviderFactory、Manager/Tool 注册、session 与退出清理
-newcode/skills/policy.py        若需，在现有纯策略层暴露父 Skill 有效工具快照
-tests/test_subagents_*.py       types/discovery/policy/manager/runner/tool 单元测试
-tests/test_agent_loop_subagents.py
-tests/test_prompt_subagents.py
-tests/test_cli_subagents.py
+worktrees.types/path_safety/config -> worktrees.git/worktrees.manager
+                                      -> worktrees.setup
+SubAgentRunner -> WorktreeManager -> child ToolContext(workspace_root, cwd, identity)
+ToolContext -> Workspace/files/search/Permission/command sandbox
+CLI -> WorktreeManager cleanup -> Hook -> Memory -> Context -> MCP (existing order preserved)
 ```
 
-不修改 Provider 接口或实现；CLI 的 ProviderFactory 在当前 config model 上创建独立 DeepSeekProvider/OpenAI client，并为 child client 设有限请求 timeout。现有配置文件、依赖、Permission 规则语义与 MCP runtime 不改。插件发现只接受可信调用方显式传入的资源目录，不导入插件代码；当前 CLI 的插件根集合为空。
+Provider 不感知 Worktree。Manager 通过统一 Git adapter 以固定 argv 调用本地 Git；adapter 对每条命令强制 `core.hooksPath` 指向 Manager-owned empty dir，并禁用 system/global config 与交互行为，确保包括 `worktree add` 在内的命令不触发 checkout hooks。Git 输出只用于验证和安全状态判定。Agent worker 只持有不可变 Worktree lease/context，不读取父 AgentLoop 或 ChatSession。
 
-## 数据流
+## 核心模型与接口
 
-1. CLI 加载配置与 MCP tools，构造 Registry；发现并校验 Agent 定义，校验其工具引用 against 最终 Registry。
-2. CLI 创建 session scope、SubAgentManager 与 AgentTool，并将 AgentTool 固定注册为串行工具；PromptBuilder 只注入 agent name/description 目录。
-3. 主 Agent 请求固定 `agent` schema 的某一 operation；`start` 的 Definition/Fork 字段组合由同一 schema 的严格校验器判定。主 AgentLoop 先按当前 mode/Skill/tool visibility 检查，再通过 PermissionManager；获准后 ToolScheduler 串行调用 AgentTool。
-4. Manager 创建不可复用 task ID、冻结不可变 parent policy 上限与输入快照，放入有界队列，返回 task ID。Definition 必须使用 frontmatter 的 `tools.allow`（空列表为空普通工具集）；Fork 默认使用启动时父有效可见工具快照，请求 allowlist 仅进一步收窄。Worker 创建隔离子环境并运行既有 AgentLoop。
-5. 父主线程在 mode、Skill whitelist、Permission 或其他有效可见范围收窄时发布新的不可变策略快照。child 每轮模型请求前及每次工具调用前通过 Manager 读取最新快照，并与启动上限相交；不得从 worker 直接读取父 AgentLoop/ChatSession 或可变对象。每个工具仍经过 child mode/visibility、独立 PermissionManager、ToolScheduler、executor/sandbox/MCP 路径。
-6. child 终态摘要脱敏并限长，Manager 在锁内更新状态。foreground 通过 wait/collect 单次领取；background 形成有界完成通知。
-7. 主 AgentLoop 在下一次主请求构造前按 session scope 安全取通知，按完成序写入 parent session；旧 scope 通知被丢弃，worker 不接触父 session。
-8. CLI 在 clear/resume/退出时撤销 scope，取消任务并限时等待；child worker 自己 finally 清理 child Context artifact；其他既有 cleanup 仍继续。
+- `WorktreeRequest`: task ID、Definition slug、base revision 和父仓库身份；路径/branch 均由 manager 生成。
+- `WorktreeLease`: canonical repo root/common dir、task ID、branch、path、ownership token/version、创建进程与锁身份、状态；不可由模型构造。
+- `WorktreeStatus`: validating/creating/ready/running/completed/failed/cancelled/timed_out/cleaned/preserved/cleanup_failed。
+- `ChildExecutionContext`: immutable canonical `workspace_root`, `cwd`, `workspace_identity`, `worktree_lease`；shared 模式只填主 workspace identity。
+- `WorktreeManager.create(request) -> lease`: 路径/仓库/分支校验、owner marker 和锁、Git add、注册验证；任何不确定失败均不启动 child。
+- `WorktreeManager.verify(lease) -> registration`: 只读查询 Git registry/common-dir/top-level/branch/HEAD 和 ownership marker。
+- `WorktreeManager.finish(lease, reason) -> outcome`: cancel/timeout/exception 后检查 registration、status/upstream，安全删除 clean tree，否则 preserve。
+- `WorktreeManager.cleanup_stale(repo, now)`: 只在三层过滤全通过时清理超龄 manager-owned tree。
+- `WorktreeSetupPolicy`: user trust ceiling 与 project request 的交集，包括 exact copy files、ignored files、dependency roots；Chapter 14 hook execution allowlist 固定为空。
+- `CommandSandbox`: platform capability contract；要么接收 root/cwd 并证明进程访问约束，要么返回 unavailable，由 Worktree child 禁用 `run_command`。child Git 仅允许经结构化解析和参数限制的只读 `status --no-optional-locks`、`diff --no-ext-diff --no-textconv`、`log`、`show`、`cat-file`、`ls-files`、受限 `rev-parse`；`add`、`commit`、`update-ref` 及其他写操作一律拒绝。当前 Worktree admin dir（含 index/HEAD/config/logs）与 shared metadata 对 child 全部只读，不开放 index/HEAD 写入；本章不支持 child commit，因为没有 task 独占的 objects/refs。raw shell、命令拼接或无法证明参数/ACL/hooks 隔离时，子进程启动前 fail closed。
 
-## Phase 拆分与安全门
+所有异常映射稳定错误码；原始 Git stderr、环境、stack trace 不进 ToolResult、session 或日志。
 
-### Phase 1（T1–T4）：Definition 模型、发现与目录
+## Module Design 与文件组织
 
-**目标：** 定义 frontmatter、路径安全、来源优先级、同名覆盖和安全诊断，不运行 child。
+```text
+newcode/worktrees/__init__.py           对外类型与受控接口
+newcode/worktrees/types.py              lease/status/policy/error 类型
+newcode/worktrees/paths.py              slug、relative path、branch/ref 及 containment
+newcode/worktrees/git.py                固定 argv、超时、受控 env、empty hooks override、只读查询、Git result parse
+newcode/worktrees/manager.py            lock、ownership、create/verify/finish/cleanup
+newcode/worktrees/setup.py              safe config 合并与 allowlisted 初始化
+newcode/worktrees/command_sandbox.py    child run_command 的能力接口与 fail-closed adapter
+newcode/subagents/types.py              Definition isolation 字段
+newcode/subagents/discovery.py          解析/验证 isolation
+newcode/subagents/runner.py             获取 lease、创建 child context、finally finish
+newcode/tools/types.py                  ToolContext 的 cwd/identity
+newcode/tools/workspace.py              root-bound canonical 路径校验
+newcode/tools/file_tools.py             六工具继承 child root/cwd
+newcode/tools/search_tools.py           六工具继承 child root/cwd
+newcode/tools/command_tool.py           显式 child cwd + capability enforcement
+newcode/permissions/normalizer.py       PermissionRequest 使用 child root
+newcode/permissions/sandbox.py          sandbox root 固定为 child root
+newcode/context/artifacts.py            artifact root 使用 child context root
+newcode/memory/store.py                 workspace/fingerprint/cache 身份不跨 root
+newcode/cli.py                          注入 manager 并有界清理
+.gitignore                              只追加 .newcode/worktrees/
+tests/test_worktrees_*.py               Worktree 单元/集成测试
+tests/test_subagents_worktrees.py       Runner/AgentLoop/Permission 集成
+tests/test_cli_worktrees.py             生命周期和 fake CLI
+```
 
-**依赖：** 已批准 Chapter 13 spec；复用现有 Skill discovery 的 Markdown/YAML/symlink 经验与 package resource 布局。
+只在实际存在对应缓存的模块增加 canonical root key；不为没有缓存的 Instructions/Prompt 引入额外缓存。
 
-**涉及文件：** `newcode/subagents/__init__.py`、`types.py`、`discovery.py`；`tests/test_subagents_types.py`、`tests/test_subagents_discovery.py`。
+## Phase 划分
 
-**风险/安全门：** 插件根不得通过扫描任意系统目录发现；无效高优先级文件必须容错而非遮蔽有效低优先级文件；名字/工具/model 不得来自执行中的动态代码。
+### Phase 1：模型、路径、仓库和配置安全（T1–T4）
 
-**退出标准：** project/user/builtin/显式 plugin precedence 与 duplicate behavior 可重复；坏文件单独隔离；link/path escape 拒绝；正文不会被 startup catalog 暴露。
+**目标：** 明确 isolation schema；纯函数校验 directory/branch/path; Git argv/结果模型；Worktree 配置 strict loader 与 user/project allowlist 合并。追加唯一 ignore 行。
 
-### Phase 2（T5–T8）：Task model、状态机与有界 manager
+**依赖：** 无。先读 `AgentDefinition`、现有 `ToolContext`、`.gitignore` 和 Permission path normalization。
 
-**目标：** 稳定 ID、生命周期、队列、后台切换、wait/collect、once-only delivery、预算边界和关闭；task record 总数最多 128。
+**验证：** schema default/invalid; 分段/长度/盘符/UNC/斜杠/反斜杠; canonical containment; junction/symlink; `git check-ref-format` 临时本地 repo; YAML 单项错误隔离、project 不能扩权/秘密 allowlist deny 优先；argv 列表与 shell=False。
 
-**依赖：** Phase 1 的纯类型与安全错误码。
+**风险门：** 不实现 Git mutations；如路径/reparse 检查不可靠，本 Phase fail 且不可进入创建阶段。
 
-**涉及文件：** `types.py`、`budget.py`、`manager.py`；`tests/test_subagents_manager.py`、`tests/test_subagents_budget.py`。
+### Phase 2：WorktreeManager create、ownership 与注册恢复校验（T5–T8）
 
-**风险/安全门：** 锁内状态转换/结果领取；后台通知不能丢/重复/串 session；队列满立即安全失败；daemon worker 退出 deadline 有界，worker 异常不可逃逸。
+**目标：** 锁、owner marker、生命周期状态、受控 create、registration validation；仅可复用当前 Manager 仍登记且未占用的同 task lease。
 
-**退出标准：** 状态转换表、并发/队列/session/record 上限、终态记录淘汰、轮次/超时/token budget、cancel、explicit/automatic/manual background、result claim 与 restart 非持久化均有 fake-clock/thread tests。
+**依赖：** Phase 1。
 
-### Phase 3（T9–T13）：Policy、Definition/Fork runner 与隔离预算
+**验证：** 临时本地 repo worktree create/list/remove; branch/dir 冲突; common dir/path/ref/HEAD/marker 检查; 伪造/重复/丢失注册拒绝; 并发锁; Git failure/timeout; repo/user/global fixture hooks sentinel 必须证明每条 Manager 命令（特别 `worktree add`）零执行；清理只回滚本次已证明创建对象。
 
-**目标：** child AgentLoop 安全运行；Definition SOP、Fork snapshot、模型工厂、文件 cache、Permission/MCP/Skill/Context/Memory 策略齐全。
+**风险门：** 不按目录存在恢复；任何验证不可用时不启动 child、不回退 shared；manager 绝不调用 `--force`、prune、remote。
 
-**依赖：** Phase 1 definitions，Phase 2 manager API。
+### Phase 3：cwd/root 贯通、Permission sandbox 和工具路径/cache（T9–T14）
 
-**涉及文件：** `policy.py`、`runner.py`、`budget.py`、必要时 `skills/policy.py`；`tests/test_subagents_policy.py`、`tests/test_subagents_runner.py`。
+**目标：** 引入 immutable ChildExecutionContext；Worktree root 作为 sandbox，cwd 明确传给所有 file/search/command 工具；缓存按 root identity 隔离；Process command sandbox capability 未验证时禁止 Worktree `run_command`。
 
-**风险/安全门：** 工具集合只收窄；deny 优先；没有 HITL；Fork 不复制工具/system/dynamic 敏感内容；provider model 不 fallback；child 不写主历史、不共享 Memory/Context/Skill/Hook 状态；cache 前仍做 Permission。
+**依赖：** Phase 2。
 
-**退出标准：** Definition 必填 allow/空集语义、Fork 默认父快照/请求 allowlist 收窄、permission trace、非交互拒绝、文件 cache 隔离/失效、token usage、Context artifact finally、MCP gate 与 background read-only gate 全部经本地 fake 验证。运行中的 child 在父 Do→Plan 及 Skill whitelist 收窄后，下一轮模型工具集合与下一次工具调用均体现收窄；父策略更新不可扩权，session 关闭会撤销快照并取消 child。
+**验证：** 六个内置工具 fake context 观察 root/cwd；所有文件操作拒绝 traversal/absolute/link escape; Permission normalized path root; file cache 两个 worktree 同相对路径无复用；command backend 验证 cwd 和 OS 限制或明确零执行拒绝。Git 命令矩阵只允许受限只读查询，拒绝 `add`、`commit`、`update-ref`、ref/config/worktree 写入及未列命令；检查拒绝前后 shared objects/refs、当前 index/HEAD、main 与其他 Worktree admin metadata 无变化。当前 Worktree admin dir 也不可写。若解析、ACL 或 hooks 隔离不能证明，Git/`run_command` 均不得启动子进程。
 
-### Phase 4（T14–T18）：统一 Agent Tool 与 AgentLoop 安全集成
+**风险门：** 这是最大风险 Phase。仅设置 subprocess cwd 不算隔离；若无法证明进程级 confinement，Worktree Definition 可继续使用非 command 工具，但 `run_command` 必须不可见或 fail closed。shared 模式不变。
 
-**目标：** 固定 schema、Plan/Do 可见、串行调度、Permission 链、主请求安全点通知与 dynamic catalog。
+### Phase 4：初始化 allowlist 与 Definition Runner/结果整合（T15–T18）
 
-**依赖：** Phase 2 manager 和 Phase 3 runner/policy。
+**目标：** user trust ceiling/project subset 的本地配置、安全文件复制、忽略文件精确复制、Git hooks 全面禁用、dependency link 只读验证；Definition Runner 创建 Worktree、注入 SOP/path context、保持 Permission/预算/cancel 和受限结果语义。
 
-**涉及文件：** `tool.py`、`__init__.py`、`agent/loop.py`、`prompt/modules.py`、必要时 `skills/policy.py`；`tests/test_subagents_tool.py`、`tests/test_agent_loop_subagents.py`、`tests/test_prompt_subagents.py`。
+**依赖：** Phase 1–3。
 
-**风险/安全门：** 工具名及完整字段 schema 固定；六个 operation 的字段组合和稳定错误码经过契约测试；AgentTool 非只读；child 无 agent Tool；Plan child read-only；Agent 调用不可绕过 Permission；通知只在 AgentLoop 主线程、主请求构造前写历史。
+**验证：** copy exact allowlist 和 hard-deny secrets/runtime; project expansion 被拒; O_EXCL/atomic cleanup; fixture repo/user/global hooks 均零执行且不复制 hook 源; dependency link unknown/writeable/outside denied; child result sanitized branch/path/status;初始化失败隔离。
 
-**退出标准：** 普通工具 call observation、deny/result ordering、hook recursion guard、背景通知 once/order/session binding、无配置默认行为，以及固定 schema 下所有 start/status/wait/background/cancel/collect 组合与错误行为均通过 fake AgentLoop/Tool 测试。
+**风险门：** defaults 全为空；hooks execution allowlist 固定为空；无法验证 links/权限则跳过该资源，不降低安全标准；不能清理时安全保留并报错。
 
-### Phase 5（T19–T21）：CLI、session scope 与资源清理
+### Phase 5：完成保护、过期清理、CLI 生命周期（T19–T22）
 
-**目标：** CLI 构造 ProviderFactory/Manager，注册单工具；clear/resume/所有退出路径取消任务；Hook placeholder 维持不变。
+**目标：** status/ahead 判定、clean-only remove，否则 preserve；三层 stale filter 与跨进程锁；create/cancel/timeout/clear/resume/exit/exception 的 manager 生命周期；cleanup 有界且不阻断 Hook→Memory→Context→MCP。
 
-**依赖：** Phase 4 AgentLoop integration。
+**依赖：** Phase 2–4。
 
-**涉及文件：** `cli.py`、必要时 `agent/loop.py`；`tests/test_cli_subagents.py`、`tests/test_cli_hooks.py`（仅验证 placeholder 不变）、必要时既有 CLI tests。
+**验证：** tracked/staged/untracked/ignored file 与目录/leading commit/no upstream/offline/status error/incomplete scan; child ignored file 必须 preserve; 30天边界; fake lock active; symlink、用户 worktree、main/root 外拒绝; CLI EOF/exit/KeyboardInterrupt/startup error; cleanup fault isolation/order。
 
-**风险/安全门：** 不改 slash 命令语义；新 session generation 不复用；MCP/Hook/Memory/Context cleanup 不被阻塞；无真实网络或凭据。
+**风险门：** unknown 一律 preserve；删除前重新检查 owner、registration、activity 和 dirty/upstream 状态；不得递归删除 worktree root。
 
-**退出标准：** CLI 子 Agent E2E、model unavailable/no fallback、session switches、异常/EOF/exit/KeyboardInterrupt cleanup 与全局服务清理顺序均有自动化证据。
+### Phase 6：Chapter 14 与 Chapter 4–13 回归、静态审计、local Git/CLI acceptance（T23–T26）
 
-### Phase 6（T22–T24）：Chapter 回归、静态审计与最终验收
-
-**目标：** 完成 Chapter 4–12 targeted regression、全量 compileall/pytest、静态边界核对和本地 fake E2E。
+**目标：** 全工具/AgentLoop/CLI integration、错误脱敏和边界审计；完成本地 fake acceptance 和完整 pytest。
 
 **依赖：** Phase 1–5 全部通过。
 
-**涉及文件：** 默认不修改文件；若回归失败，仅允许最小相关生产改动及对应测试。
+**验证：** compileall；Worktree targeted pytest；Chapter4–13 regression；全量 pytest；diff check；临时 repository E2E；静态依赖/命令审计。
 
-**风险/安全门：** 不因 full-suite skip 隐去平台限制；不跑真实 Provider/网络/MCP；不得顺手重构历史章节。
+**退出门：** 任何测试、安全审计、共享 Git metadata ACL、Manager Git hooks override 或 platform command confinement 失败均停止 Phase 6；不使用真实远端、tmux、生产 secret 或 Git 全局设置。
 
-**退出标准：** Chapter checklist 全部有命令/fixture 证据；所有 skip 明确原因；`git diff --check` clean；工作树变更只属于 Chapter13。
+## 生命周期数据流
 
-## 风险与决策记录
+1. AgentLoop 依旧执行 mode → Permission → ToolScheduler → Agent executor；只有允许的 Definition task 才调用 Runner。
+2. Runner 依据 immutable request 调 WorktreeManager create；Manager 在固定 repo root 上执行安全 Git argv，确认注册和 owner 后返回 lease。
+3. 初始化步骤只处理 allowlisted files；构造 `ToolContext(workspace_root=worktree, cwd=worktree, workspace_identity=lease.identity)`；构造 child Permission sandbox 仍独立。
+4. child AgentLoop 完成/失败/cancel/timeout；Runner finally 调 `finish`；Manager 重新验证后清洁删除或安全 preserve。
+5. Worker 仅返回脱敏 summary 和 Worktree outcome metadata；SubAgentManager 按 Chapter 13 规则交给父 AgentLoop 主线程安全点。
+6. Session close/CLI shutdown 先取消 Worktree child 并有限等待，然后继续现有 Hook、Memory、Context、MCP cleanup。
 
-| 风险/问题 | 已定决策 |
+## 风险与缓解
+
+| 风险 | 缓解/退出门 |
 |---|---|
-| 当前 Provider 没有 model catalog/cache contract | 仅当前配置 model 可用；无 cache 能力声明则普通请求运行，不承诺缓存/费用 |
-| 同步 Provider call 难以强制中断 | child client 请求 timeout ≤30 秒；task 总 deadline 300 秒；manager 只等待有界期限 |
-| session message 是可变列表 | child 使用脱敏不可变快照并构造独立 ChatSession |
-| Skill/Hook 可能引入额外状态/递归 | 不继承或激活 parent Skill；不把 HookEngine 传入 child；Hook subagent 本章仍 unavailable |
-| 父级策略在 child 运行中收窄 | 主线程发布不可变策略快照；Manager 是 worker 唯一读取入口；每轮和每工具调用复核并与启动上限取交集；不向父级扩权 |
-| 工具 allowlist 空值语义 | Definition `tools.allow` 必填且空列表表示无普通工具；Fork 缺省继承父启动快照，显式列表（包括空列表）只收窄；deny 缺省为空且优先 |
-| 固定 Agent Tool 多操作字段歧义 | 单一固定 schema 允许所有六种 operation 字段，但运行时严格校验 operation 专属必填/可选组合；非法组合统一 `subagent_invalid_request` |
-| MCP adapter/同 server 并发 | 复用现有 MCPManager server lock；child Permission 仍 fail-closed |
-| 共享 workspace 修改冲突 | 明确没有文件隔离，写入冲突不保证自动合并；不引入 Worktree |
-| 当前无插件子系统 | 插件只经显式注入的可信资源根，默认 CLI 不加载外部插件 |
+| shell 能绕出 cwd 或修改共享 Git 元数据 | Worktree 不是 OS sandbox；raw shell 不向 Worktree child 开放。只有命令解析、只读 Git allowlist、metadata ACL 与 hooks 隔离均通过测试时才可执行受限查询，否则 Git/`run_command` 子进程零启动。 |
+| Git registry 与磁盘目录不一致 | 注册列表、common dir、top-level、ref、HEAD、owner marker 多因子校验；不确定就保留/拒绝恢复。 |
+| branch/path collision | manager-generated task ID，独立校验，禁止覆盖/force。 |
+| ignored credentials/runtime state 外泄 | checkout tracked-only；精确 allowlist、hard deny、目录复制禁止。 |
+| hook/junction 可执行或逃逸 | Manager 每条 Git 命令强制 empty hooks path、禁用 system/global config；child hooks 默认不执行；依赖链接 default empty。 |
+| cleanup race/user work/ignored data | locks + task lease + tracked/untracked/ignored 全量复查；unknown 或 ignored child file preserve。 |
+| Worktree root 被 Git track | 专门 `.gitignore` 单行并测试 `git check-ignore`；不把其它 `.newcode` 内容忽略。 |
+| MCP/config semantics drift | MCP cwd 保持目前 server spawn 语义；不共享 Manager task cwd。 |
 
-## 验收和回归命令
+## 配置设计
 
-每个 Phase 先运行 `.venv\Scripts\python.exe -m compileall newcode`，再运行 checklist 对应 targeted pytest，测试通过才进入下一 Phase。最终运行：
+optional user config `~/.newcode/worktree.yaml` 建立 permission ceiling；project config `.newcode/worktree.yaml` 只能请求 user allowlist 子集。配置项只含精确相对 file lists、approved dependency root IDs 与清理年龄上限（年龄下限固定不得低于 spec 的 30 天）。Chapter 14 Git hook execution allowlist 固定为空，配置不得启用/覆盖 hooksPath、Git executable、branch、worktree root、绝对路径、命令或 sandbox disable。坏 user config 禁用可选 setup 行为；坏 project config 忽略该 project 请求；两者都不阻断共享 Agent。
+
+## 决策记录
+
+| 决策 | 方案 | 理由 |
+|---|---|---|
+| 默认隔离 | Definition 缺省 shared；显式 worktree 才创建 | 兼容 Chapter 13。 |
+| Worktree 根 | repo root `.newcode/worktrees/` | 固定、可 gitignore 和验证，跟随该 repo。 |
+| reused tree | 仅本 Manager lease 恢复；不跨进程恢复 | 章节非目标含跨会话持久化，减少冒认风险。 |
+| 有变更的删除 | 始终 preserve；本章没有确认丢弃入口 | 防止删除用户代码/领先 commit。 |
+| run_command | 仅结构化、参数受限的只读 Git allowlist；`add/commit/update-ref` 与全部写命令 deny；解析或隔离不可证明则 deny | index/HEAD 也只读；没有独占 objects/refs，故不支持 child commit。 |
+| MCP stdio cwd | 保持现有 NewCode 进程 cwd 语义 | 避免无授权改变 server 配置行为。 |
+| env/config/hooks/link | 默认空；hooks execution allowlist 固定空；依赖链接由用户信任上限控制 | 不复制 secret/runtime state；所有 Manager Git 命令强制 hooks off。 |
+| Git 命令 | 内部固定 argv/shell=False/no network | 防止任意 Git 命令、命令注入及远程副作用。 |
+
+## 测试与验收命令
+
+每 Phase：
 
 ```powershell
 .venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter13-final"
+.venv\Scripts\python.exe -m pytest <该 Phase tests> -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-phaseN"
 git -c safe.directory=F:/agent/Newcode diff --check
 ```
 
-`.venv` 不存在时记录并使用当前 Python；不安装 tmux 或其他依赖。人工/CLI 验收仅用 fake Provider、临时 home/workspace 与本地 fixture。
+最终还须 Chapter 4–14 targeted regression 与：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-final"
+```
+
+人工 acceptance 使用 fake Provider、临时 home/workspace、本地 `git init` fixture 与受控 command sandbox fake；禁止网络、真实 MCP、真实生产 hooks、生产 secret、tmux、push 和全局 Git 配置变更。

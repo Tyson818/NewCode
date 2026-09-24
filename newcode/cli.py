@@ -4,6 +4,7 @@ import argparse
 import json
 import secrets
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -59,6 +60,10 @@ from newcode.subagents.discovery import AgentDiscovery
 from newcode.subagents.manager import SubAgentManager
 from newcode.subagents.runner import ProviderFactory, SubAgentRunner
 from newcode.subagents.types import AgentCatalog, SessionScope, WorkerResult
+from newcode.worktrees.git import WorktreeGitAdapter
+from newcode.worktrees.manager import WorktreeManager
+from newcode.worktrees.setup import load_worktree_config
+from newcode.worktrees.types import WorktreeSetupPolicy
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -224,12 +229,15 @@ def run_conversation(
     memory_cleanup_state: dict[str, bool] | None = None,
     subagent_provider_factory: ProviderFactory | None = None,
     agent_user_home: Path | None = None,
+    worktree_manager: WorktreeManager | None = None,
 ) -> int:
     hook_actions: HookActionRunner | None = None
     hook_engine: HookEngine | None = None
     subagent_manager: SubAgentManager | None = None
     subagent_scope: SessionScope | None = None
     subagent_task_ids: set[str] = set()
+    worktree_hooks_temp: tempfile.TemporaryDirectory[str] | None = None
+    worktree_setup_policy = WorktreeSetupPolicy()
     try:
         registry = registry or create_default_registry()
         tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
@@ -273,6 +281,47 @@ def run_conversation(
                 if "runner" in runner_holder
                 else WorkerResult(error_code="subagent_provider_error")
             )
+            if worktree_manager is None:
+                try:
+                    worktree_hooks_temp = tempfile.TemporaryDirectory(prefix="newcode-manager-hooks-")
+                    hooks_path = Path(worktree_hooks_temp.name).resolve(strict=True)
+                    workspace_root = tool_context.workspace_root.resolve(strict=True)
+                    try:
+                        hooks_path.relative_to(workspace_root)
+                    except ValueError:
+                        pass
+                    else:
+                        raise ValueError("hooks_dir_inside_workspace")
+                    try:
+                        workspace_root.relative_to(hooks_path)
+                    except ValueError:
+                        pass
+                    else:
+                        raise ValueError("hooks_dir_contains_workspace")
+                    worktree_manager = WorktreeManager(
+                        empty_hooks_dir=hooks_path,
+                        git=WorktreeGitAdapter(empty_hooks_dir=hooks_path, timeout_seconds=1.0),
+                        lock_wait_seconds=0.25,
+                    )
+                except Exception:
+                    if worktree_hooks_temp is not None:
+                        worktree_hooks_temp.cleanup()
+                        worktree_hooks_temp = None
+                    worktree_manager = None
+                    print("Worktree 初始化跳过：worktree_manager_unavailable", file=error_output)
+            config_result = load_worktree_config(
+                tool_context.workspace_root,
+                user_home=agent_user_home or Path.home(),
+            )
+            worktree_setup_policy = config_result.policy
+            for diagnostic in config_result.diagnostics:
+                print(f"Worktree 配置跳过：{diagnostic.code}", file=error_output)
+            if worktree_manager is not None:
+                _safe_worktree_cleanup(
+                    worktree_manager,
+                    tool_context.workspace_root,
+                    worktree_setup_policy,
+                )
             subagent_scope = subagent_manager.open_session(session.session_id)
             subagent_runner = SubAgentRunner(
                 manager=subagent_manager,
@@ -281,6 +330,8 @@ def run_conversation(
                 registry=registry,
                 tool_context=tool_context,
                 parent_permission_manager=permission_manager,
+                worktree_manager=worktree_manager,
+                worktree_setup_policy=worktree_setup_policy,
             )
             runner_holder["runner"] = subagent_runner
         command_dispatcher = SkillCommandDispatcher(
@@ -316,6 +367,11 @@ def run_conversation(
             print("Hook 配置跳过：hook_config_invalid", file=error_output)
     except BaseException:
         _safe_subagent_shutdown(subagent_manager, subagent_scope)
+        if worktree_hooks_temp is not None:
+            try:
+                worktree_hooks_temp.cleanup()
+            except Exception:
+                pass
         _safe_hook_shutdown(hook_actions)
         _safe_memory_shutdown(memory_service)
         if memory_cleanup_state is not None:
@@ -518,6 +574,11 @@ def run_conversation(
         if system_open:
             _safe_emit_cli_hook(hook_engine, HookEvent.SYSTEM_END, session, mode, tool_context)
         _safe_subagent_shutdown(subagent_manager, subagent_scope, subagent_task_ids, session)
+        if worktree_hooks_temp is not None:
+            try:
+                worktree_hooks_temp.cleanup()
+            except Exception:
+                pass
         _safe_hook_shutdown(hook_actions)
         _safe_memory_shutdown(memory_service)
         if memory_cleanup_state is not None:
@@ -828,6 +889,24 @@ def _safe_subagent_shutdown(
         remaining = max(0.0, 1.0 - (time.monotonic() - started))
         manager.shutdown(wait_timeout=remaining)
     except Exception:
+        return
+
+
+def _safe_worktree_cleanup(
+    manager: WorktreeManager | None,
+    repository_root: Path | None,
+    policy: WorktreeSetupPolicy,
+) -> None:
+    if manager is None or repository_root is None:
+        return
+    try:
+        manager.cleanup_stale(
+            repository_root,
+            cleanup_after_days=policy.cleanup_after_days,
+            max_candidates=1,
+        )
+    except Exception:
+        # Worktree cleanup is best effort and must not block Hook/Memory/Context/MCP cleanup.
         return
 
 

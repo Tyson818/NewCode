@@ -38,6 +38,11 @@ class AgentPermissionMode(str, Enum):
     TRUSTED = "trusted"
 
 
+class AgentIsolation(str, Enum):
+    SHARED = "shared"
+    WORKTREE = "worktree"
+
+
 class AgentValidationError(ValueError):
     """仅携带稳定错误码，不包含输入文本或路径。"""
 
@@ -87,6 +92,8 @@ TASK_ERROR_CODES = frozenset(
         "subagent_policy_invalid",
         "subagent_policy_expansion_rejected",
         "subagent_policy_publish_thread_invalid",
+        "subagent_worktree_unavailable",
+        "subagent_worktree_setup_failed",
     }
 )
 
@@ -282,6 +289,7 @@ class AgentDefinition:
     digest: str = field(default="", repr=False)
     root: Path = field(default=Path("."), repr=False)
     entry: Path = field(default=Path("."), repr=False)
+    isolation: AgentIsolation = AgentIsolation.SHARED
 
 
 @dataclass(frozen=True)
@@ -313,7 +321,7 @@ def parse_agent_frontmatter(value: object) -> tuple[str, str, tuple[str, ...], t
 
     if not isinstance(value, dict):
         raise AgentValidationError("subagent_definition_invalid")
-    allowed = {"name", "description", "tools", "model", "max_iterations", "permission_mode"}
+    allowed = {"name", "description", "tools", "model", "max_iterations", "permission_mode", "isolation"}
     if set(value) - allowed or not {"name", "description", "tools", "max_iterations", "permission_mode"}.issubset(value):
         raise AgentValidationError("subagent_definition_invalid")
 
@@ -354,7 +362,17 @@ def parse_agent_frontmatter(value: object) -> tuple[str, str, tuple[str, ...], t
         permission_mode = AgentPermissionMode(value["permission_mode"])
     except (TypeError, ValueError) as exc:
         raise AgentValidationError("subagent_definition_invalid") from exc
+    parse_agent_isolation(value)
     return name, description, allow, deny, model, iterations, permission_mode
+
+
+def parse_agent_isolation(value: object) -> AgentIsolation:
+    if not isinstance(value, dict):
+        raise AgentValidationError("subagent_definition_invalid")
+    try:
+        return AgentIsolation(value.get("isolation", AgentIsolation.SHARED.value))
+    except (TypeError, ValueError) as exc:
+        raise AgentValidationError("subagent_definition_invalid") from exc
 
 
 def _tool_list(value: object) -> tuple[str, ...]:

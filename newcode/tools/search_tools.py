@@ -39,8 +39,13 @@ class FindFilesTool:
         for path in workspace.root.rglob(pattern):
             if len(matches) >= max_results:
                 break
-            if path.is_file() and not is_skipped_path(path.relative_to(workspace.root)):
-                matches.append(workspace.relative(path))
+            if not workspace.contains_resolved(path):
+                continue
+            try:
+                if path.is_file() and not is_skipped_path(path.relative_to(workspace.root)):
+                    matches.append(workspace.relative(path))
+            except (OSError, ValueError, ToolFailure):
+                continue
         return ToolResult.success(
             self.spec.name,
             {"matches": matches, "truncated": len(matches) >= max_results},
@@ -80,6 +85,8 @@ class SearchCodeTool:
         for path in workspace.root.rglob(pattern):
             if len(matches) >= max_results:
                 break
+            if not workspace.contains_resolved(path):
+                continue
             if not path.is_file() or is_skipped_path(path.relative_to(workspace.root)):
                 continue
             try:

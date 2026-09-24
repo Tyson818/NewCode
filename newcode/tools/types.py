@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,9 +99,27 @@ class ToolContext:
     default_timeout_seconds: float = 30.0
     command_timeout_seconds: float = 30.0
     sensitive_values: tuple[str, ...] = ()
+    cwd: Path | None = None
+    worktree_task_id: str | None = None
+    workspace_identity: str = field(init=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "workspace_root", self.workspace_root.resolve())
+        root = Path(self.workspace_root).resolve(strict=False)
+        cwd = Path(self.cwd).resolve(strict=False) if self.cwd is not None else root
+        try:
+            cwd.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("tool_context_cwd_outside_workspace") from exc
+        if self.worktree_task_id is not None and (
+            not isinstance(self.worktree_task_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.worktree_task_id)
+        ):
+            raise ValueError("tool_context_worktree_identity_invalid")
+        identity_input = os.path.normcase(str(root)).encode("utf-8", errors="strict")
+        identity = hashlib.sha256(identity_input).hexdigest()[:24]
+        object.__setattr__(self, "workspace_root", root)
+        object.__setattr__(self, "cwd", cwd)
+        object.__setattr__(self, "workspace_identity", identity)
 
 
 class ToolFailure(Exception):

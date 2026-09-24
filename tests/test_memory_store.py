@@ -65,6 +65,20 @@ def test_project_scope_requires_matching_workspace_fingerprint(tmp_path: Path):
     assert other.select_for_prompt() == ()
 
 
+def test_project_memory_identity_does_not_cross_worktree_roots(tmp_path: Path):
+    main = tmp_path / "main"
+    child = tmp_path / "child"
+    main.mkdir()
+    child.mkdir()
+    user_root = tmp_path / "home" / ".newcode" / "memory" / "user"
+    main_store = MemoryStore(main, user_root=user_root)
+    child_store = MemoryStore(child, user_root=user_root)
+    note = child_store.create(MemoryScope.PROJECT, MemoryCategory.PROJECT_KNOWLEDGE, "child-only")
+
+    assert child_store.select_for_prompt() == (note,)
+    assert main_store.select_for_prompt() == ()
+
+
 def test_index_enforces_both_line_and_byte_caps_for_create(tmp_path: Path):
     store = _store(tmp_path)
     for _ in range(MAX_INDEX_LINES):

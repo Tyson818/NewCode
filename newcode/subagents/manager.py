@@ -511,6 +511,8 @@ _SAFE_WORKER_ERROR_CODES = frozenset(
         "subagent_token_budget_exceeded",
         "subagent_provider_error",
         "subagent_policy_unavailable",
+        "subagent_worktree_unavailable",
+        "subagent_worktree_setup_failed",
     }
 )
 

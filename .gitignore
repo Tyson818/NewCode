@@ -10,5 +10,6 @@ __pycache__/
 .env
 .pytest-basetemp-*/
 Newcode.lnk
+.newcode/worktrees/
 .newcode/context-artifacts/
 .newcode/memory/

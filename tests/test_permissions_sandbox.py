@@ -51,6 +51,30 @@ def test_normalizer_extracts_file_path_fields(tmp_path):
     assert request.normalized_args["relative_path"] == "src/app.py"
 
 
+def test_permission_request_uses_worktree_root_not_parent_workspace(tmp_path):
+    main = tmp_path / "main"
+    child = tmp_path / "child"
+    main.mkdir()
+    child.mkdir()
+    context = ToolContext(child, worktree_task_id="task-1234")
+
+    child_request = build_permission_request(
+        tool_call("read_file", {"path": "src/app.py"}), context, PermissionMode.DEFAULT,
+    )
+    main_request = build_permission_request(
+        tool_call("read_file", {"path": str(main / "secret.py")}), context, PermissionMode.DEFAULT,
+    )
+    decision = PermissionManager(mode=PermissionMode.TRUSTED).check(
+        tool_call("read_file", {"path": str(main / "secret.py")}), context,
+    )
+
+    assert child_request.workspace_root == child.resolve()
+    assert child_request.normalized_args["resolved_path"] == str(child / "src" / "app.py")
+    assert main_request.normalized_args.get("relative_path") is None
+    assert decision.decision is PermissionDecisionValue.DENY
+    assert decision.layer is PermissionLayer.WORKSPACE_SANDBOX
+
+
 def test_normalizer_extracts_find_files_pattern_and_search_query(tmp_path):
     context = ToolContext(workspace_root=tmp_path)
 

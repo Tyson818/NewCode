@@ -6,6 +6,8 @@ from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 import json
+import hashlib
+import os
 from pathlib import Path
 import threading
 from typing import Protocol
@@ -25,11 +27,15 @@ from newcode.skills.state import ActiveSkillState
 from newcode.skills.types import SkillCatalog
 from newcode.tools.registry import ToolRegistry
 from newcode.tools.types import Tool, ToolCall, ToolContext, ToolFailure, ToolResult
+from newcode.worktrees.manager import WorktreeManager
+from newcode.worktrees.setup import WorktreeSetupPolicy, initialize_worktree
+from newcode.worktrees.types import WorktreeError, WorktreeRequest, WorktreeState
 
 from .manager import SubAgentManager
 from .policy import child_tool_names, isolated_registry_view, most_restrictive_permission_mode
 from .types import (
     AgentDefinition,
+    AgentIsolation,
     AgentPermissionMode,
     MAX_TASK_SUMMARY_CHARS,
     ParentPolicySnapshot,
@@ -96,19 +102,30 @@ def capture_fork_snapshot(
 class ChildReadCache:
     """按文件 stat 签名校验的 child-local、有界 read_file cache。"""
 
-    def __init__(self, max_items: int = MAX_READ_CACHE_ITEMS, max_bytes: int = MAX_READ_CACHE_BYTES) -> None:
+    def __init__(
+        self,
+        max_items: int = MAX_READ_CACHE_ITEMS,
+        max_bytes: int = MAX_READ_CACHE_BYTES,
+        *,
+        workspace_root: Path | None = None,
+        workspace_identity: str | None = None,
+    ) -> None:
         self.max_items = max_items
         self.max_bytes = max_bytes
         self._items: OrderedDict[str, tuple[tuple[int, int, int, int], ToolResult, int]] = OrderedDict()
         self._bytes = 0
         self._lock = threading.RLock()
+        self.workspace_root = workspace_root.resolve(strict=False) if workspace_root is not None else None
+        self.workspace_identity = workspace_identity
 
     def get(self, path: Path) -> ToolResult | None:
         try:
-            signature = _stat_signature(path)
-        except OSError:
+            key = self._key(path)
+            signature = _stat_signature(path.resolve(strict=True))
+        except (OSError, RuntimeError):
             return None
-        key = str(path)
+        except ValueError:
+            return None
         with self._lock:
             entry = self._items.get(key)
             if entry is None:
@@ -122,13 +139,13 @@ class ChildReadCache:
 
     def put(self, path: Path, result: ToolResult) -> None:
         try:
-            signature = _stat_signature(path)
+            key = self._key(path)
+            signature = _stat_signature(path.resolve(strict=True))
             size = len(json.dumps(result.to_dict(), ensure_ascii=False, default=str).encode("utf-8"))
-        except (OSError, TypeError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError):
             return
         if size > self.max_bytes:
             return
-        key = str(path)
         with self._lock:
             old = self._items.pop(key, None)
             if old:
@@ -138,6 +155,18 @@ class ChildReadCache:
             while len(self._items) > self.max_items or self._bytes > self.max_bytes:
                 _, removed = self._items.popitem(last=False)
                 self._bytes -= removed[2]
+
+    def _key(self, path: Path) -> str:
+        canonical = path.resolve(strict=True)
+        root = self.workspace_root or canonical.parent
+        try:
+            canonical.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("cache_path_outside_workspace") from exc
+        identity = self.workspace_identity or hashlib.sha256(
+            os.path.normcase(str(root)).encode("utf-8")
+        ).hexdigest()[:24]
+        return f"{identity}:{root}:{canonical}"
 
     def invalidate(self) -> None:
         with self._lock:
@@ -165,6 +194,8 @@ class SubAgentRunner:
         registry: ToolRegistry,
         tool_context: ToolContext,
         parent_permission_manager: PermissionManager,
+        worktree_manager: WorktreeManager | None = None,
+        worktree_setup_policy: WorktreeSetupPolicy | None = None,
     ) -> None:
         self.manager = manager
         self.provider_factory = provider_factory
@@ -172,6 +203,8 @@ class SubAgentRunner:
         self.registry = registry
         self.tool_context = tool_context
         self.parent_permission_manager = parent_permission_manager
+        self.worktree_manager = worktree_manager
+        self.worktree_setup_policy = worktree_setup_policy or WorktreeSetupPolicy()
 
     def __call__(self, task: WorkerTaskContext) -> WorkerResult:
         payload = task.payload
@@ -194,6 +227,8 @@ class SubAgentRunner:
     ) -> WorkerResult:
         if task.launch_policy is None:
             return WorkerResult(error_code="subagent_policy_unavailable")
+        if definition.isolation is AgentIsolation.WORKTREE:
+            return self._run_worktree_definition(task, definition, mode=mode)
         return self._run_child(
             task,
             mode=mode,
@@ -204,6 +239,91 @@ class SubAgentRunner:
             system_prompt=definition.body,
             max_iterations=definition.max_iterations,
         )
+
+    def _run_worktree_definition(
+        self, task: WorkerTaskContext, definition: AgentDefinition, *, mode: AgentMode,
+    ) -> WorkerResult:
+        manager = self.worktree_manager
+        if manager is None:
+            return WorkerResult(error_code="subagent_worktree_unavailable")
+        if task.cancel_event.is_set():
+            return WorkerResult(error_code="subagent_cancelled")
+
+        lease = None
+        running_lease = None
+        try:
+            lease = manager.create(WorktreeRequest(
+                repository=self.tool_context.workspace_root,
+                agent_slug=definition.name,
+                task_id=task.task_id,
+            ))
+            manager.verify(lease)
+            running_lease = manager.claim(lease)
+        except WorktreeError:
+            return WorkerResult(error_code="subagent_worktree_unavailable")
+        except Exception:
+            return WorkerResult(error_code="subagent_worktree_unavailable")
+
+        result = WorkerResult(error_code="subagent_worktree_setup_failed")
+        terminal_state = WorktreeState.FAILED
+        release_failed = False
+        setup_result = None
+        try:
+            setup_result = initialize_worktree(
+                lease.repository_root,
+                running_lease.path,
+                self.worktree_setup_policy,
+                is_tracked=lambda name: manager.is_tracked_source_path(lease.repository_root, name),
+                is_ignored=lambda name: manager.is_ignored_source_path(lease.repository_root, name),
+            )
+            child_context = ToolContext(
+                workspace_root=running_lease.path,
+                cwd=running_lease.path,
+                default_timeout_seconds=self.tool_context.default_timeout_seconds,
+                command_timeout_seconds=self.tool_context.command_timeout_seconds,
+                sensitive_values=self.tool_context.sensitive_values,
+                worktree_task_id=task.task_id,
+            )
+            result = self._run_child(
+                task,
+                mode=mode,
+                allow=definition.tools_allow,
+                deny=definition.tools_deny,
+                model=definition.model,
+                permission_mode=definition.permission_mode,
+                system_prompt=definition.body,
+                max_iterations=definition.max_iterations,
+                tool_context=child_context,
+            )
+            terminal_state = _worktree_terminal_state(result, task)
+            if result.error_code is None:
+                relative_path = running_lease.path.relative_to(lease.repository_root).as_posix()
+                note = (
+                    f"\n\nWorktree: status={terminal_state.value}; retained_for_safety=true; "
+                    f"branch={running_lease.branch}; path={relative_path}."
+                )
+                if setup_result.diagnostics:
+                    note += " Optional dependency links were skipped because read-only isolation was not proven."
+                safe_summary = redact_text(result.summary, self.tool_context.sensitive_values)[:3_200]
+                result = WorkerResult(
+                    summary=(safe_summary + note)[:MAX_TASK_SUMMARY_CHARS],
+                    error_code=None,
+                )
+        except WorktreeError:
+            result = WorkerResult(error_code="subagent_worktree_setup_failed")
+            terminal_state = WorktreeState.FAILED
+        except BaseException:
+            result = WorkerResult(error_code="subagent_worktree_setup_failed")
+            terminal_state = WorktreeState.FAILED
+        finally:
+            try:
+                manager.release(running_lease, terminal_state)
+            except Exception:
+                release_failed = True
+
+        if release_failed:
+            return WorkerResult(error_code="subagent_worktree_unavailable")
+        return result
 
     def run_fork(
         self, task: WorkerTaskContext, snapshot: Sequence[ChatMessage], *,
@@ -231,6 +351,7 @@ class SubAgentRunner:
         permission_mode: AgentPermissionMode | None,
         system_prompt: str = "", max_iterations: int = 8,
         initial_messages: Sequence[ChatMessage] = (),
+        tool_context: ToolContext | None = None,
     ) -> WorkerResult:
         launch = task.launch_policy
         if launch is None:
@@ -246,18 +367,24 @@ class SubAgentRunner:
         except Exception:
             return WorkerResult(error_code="subagent_model_unavailable")
 
+        execution_context = tool_context or self.tool_context
         role_allow = frozenset(allow)
         role_deny = frozenset(deny)
-        cache = ChildReadCache()
+        cache = ChildReadCache(
+            workspace_root=execution_context.workspace_root,
+            workspace_identity=execution_context.workspace_identity,
+        )
         child_session = ChatSession(
             messages=list(initial_messages),
             session_id=f"subagent-{task.task_id[:48]}",
         )
         child_context = ToolContext(
-            workspace_root=self.tool_context.workspace_root,
-            default_timeout_seconds=self.tool_context.default_timeout_seconds,
-            command_timeout_seconds=self.tool_context.command_timeout_seconds,
-            sensitive_values=self.tool_context.sensitive_values,
+            workspace_root=execution_context.workspace_root,
+            cwd=execution_context.cwd,
+            default_timeout_seconds=execution_context.default_timeout_seconds,
+            command_timeout_seconds=execution_context.command_timeout_seconds,
+            sensitive_values=execution_context.sensitive_values,
+            worktree_task_id=execution_context.worktree_task_id,
         )
         child_permission = _child_permission_manager(
             self.parent_permission_manager,
@@ -286,15 +413,7 @@ class SubAgentRunner:
             for name in self.registry.names()
             if self.registry.get(name) is not None
         }
-        startup = child_tool_names(
-            self.registry,
-            launch=launch,
-            latest=launch,
-            allow=role_allow,
-            deny=role_deny,
-            mode=mode,
-            execution=TaskExecution.FOREGROUND,
-        )
+        startup = self._allowed(task, launch, role_allow, role_deny, mode)
         # registry 首轮按启动快照封闭；每轮 provider 和 executor 还会查 Manager 最新快照。
         child_registry = isolated_registry_view(self.registry, startup, wrappers)
         child_provider = _GuardedProvider(
@@ -351,7 +470,7 @@ class SubAgentRunner:
         allow: frozenset[str], deny: frozenset[str], mode: AgentMode,
     ) -> frozenset[str]:
         latest = self._latest(task)
-        return child_tool_names(
+        allowed = child_tool_names(
             self.registry,
             launch=launch,
             latest=latest,
@@ -360,6 +479,24 @@ class SubAgentRunner:
             mode=mode,
             execution=self.manager.status(task.scope, task.task_id).execution,
         )
+        if (
+            isinstance(task.payload, DefinitionTask)
+            and task.payload.definition.isolation is AgentIsolation.WORKTREE
+        ):
+            # 尚无通过进程级验证的 backend；即使进入后续 Worktree runner，也不暴露命令工具。
+            allowed = frozenset(name for name in allowed if name != "run_command")
+        return allowed
+
+
+def _worktree_terminal_state(result: WorkerResult, task: WorkerTaskContext) -> WorktreeState:
+    code = task.budget.stop_code or result.error_code
+    if code == "subagent_cancelled":
+        return WorktreeState.CANCELLED
+    if code == "subagent_timeout":
+        return WorktreeState.TIMED_OUT
+    if result.error_code is not None:
+        return WorktreeState.FAILED
+    return WorktreeState.COMPLETED
 
 
 class _GuardedProvider:
@@ -514,7 +651,7 @@ def _safe_read_path(root: Path, arguments: dict) -> Path | None:
         if not resolved.is_relative_to(root.resolve()) or candidate.is_symlink() or not resolved.is_file():
             return None
         return resolved
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return None
 
 

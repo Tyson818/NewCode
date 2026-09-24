@@ -18,10 +18,12 @@ def _definition(
     model: str | None = None,
     iterations: int = 3,
     permission_mode: str = "inherit",
+    isolation: str | None = None,
     body: str = "Private role SOP.",
 ) -> str:
     deny_field = f"  deny:\n{os.linesep.join('  ' + line for line in deny.splitlines())}\n" if deny is not None else ""
     model_field = f"model: {model}\n" if model is not None else ""
+    isolation_field = f"isolation: {isolation}\n" if isolation is not None else ""
     return (
         "---\n"
         f"name: {name}\n"
@@ -30,6 +32,7 @@ def _definition(
         f"  allow:\n{os.linesep.join('  ' + line for line in allow.splitlines())}\n"
         f"{deny_field}"
         f"{model_field}"
+        f"{isolation_field}"
         f"max_iterations: {iterations}\n"
         f"permission_mode: {permission_mode}\n"
         "---\n"
@@ -131,6 +134,38 @@ def test_startup_projection_contains_only_name_and_description(tmp_path: Path):
     assert "private-model" not in repr(entry)
     assert "run_command" not in repr(entry)
     assert str(workspace) not in repr(entry)
+
+
+@pytest.mark.parametrize(("isolation", "expected"), [(None, "shared"), ("shared", "shared"), ("worktree", "worktree")])
+def test_definition_isolation_defaults_and_accepts_supported_values(tmp_path: Path, isolation: str | None, expected: str):
+    from newcode.subagents.types import AgentIsolation
+
+    workspace, home, builtin = tmp_path / "workspace", tmp_path / "home", tmp_path / "builtin"
+    _write(workspace / ".newcode" / "agents" / "agent.md", _definition("agent", isolation=isolation))
+    catalog = _discover(workspace, home, builtin)
+    assert len(catalog.definitions) == 1
+    assert catalog.definitions[0].isolation is AgentIsolation(expected)
+
+
+def test_invalid_isolation_isolated_without_shared_fallback(tmp_path: Path):
+    workspace, home, builtin = tmp_path / "workspace", tmp_path / "home", tmp_path / "builtin"
+    root = workspace / ".newcode" / "agents"
+    _write(root / "bad.md", _definition("bad", isolation="worktree-ish"))
+    _write(root / "good.md", _definition("good"))
+    catalog = _discover(workspace, home, builtin)
+    assert [item.name for item in catalog.definitions] == ["good"]
+    assert [item.code for item in catalog.diagnostics] == ["subagent_definition_invalid"]
+
+
+def test_invalid_high_priority_isolation_falls_back_to_valid_lower_source(tmp_path: Path):
+    workspace, home, builtin = tmp_path / "workspace", tmp_path / "home", tmp_path / "builtin"
+    _write(workspace / ".newcode" / "agents" / "agent.md", _definition("same", "Invalid project", isolation="unsafe"))
+    _write(home / ".newcode" / "agents" / "agent.md", _definition("same", "Valid user"))
+    catalog = _discover(workspace, home, builtin)
+    assert [(item.name, item.description, item.isolation.value) for item in catalog.definitions] == [
+        ("same", "Valid user", "shared")
+    ]
+    assert any(item.code == "subagent_definition_invalid" and item.source is AgentSource.PROJECT for item in catalog.diagnostics)
 
 
 @pytest.mark.parametrize("field,value", [("allow", "- missing_tool"), ("deny", "- missing_tool")])

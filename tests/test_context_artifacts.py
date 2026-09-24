@@ -15,6 +15,24 @@ def test_artifact_is_redacted_and_inside_workspace(tmp_path: Path):
     assert json.loads(path.read_text(encoding="utf-8"))["data"]["token"] == "[REDACTED]"
 
 
+def test_artifact_store_is_bound_to_each_worktree_root(tmp_path: Path):
+    main = tmp_path / "main"
+    child = tmp_path / "child"
+    main.mkdir()
+    child.mkdir()
+    main_store = ArtifactStore(main, "same-session")
+    child_store = ArtifactStore(child, "same-session")
+
+    main_result = main_store.write("read_file", {"content": "main"})
+    child_result = child_store.write("read_file", {"content": "child"})
+
+    assert (main / main_result.relative_path).is_file()
+    assert (child / child_result.relative_path).is_file()
+    child_store.cleanup_current()
+    assert (main / main_result.relative_path).is_file()
+    assert not (child / child_result.relative_path).exists()
+
+
 def test_artifact_rejects_unsafe_session_and_cleanup_stays_in_root(tmp_path: Path):
     with pytest.raises(ValueError):
         ArtifactStore(tmp_path, "../escape")

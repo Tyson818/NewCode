@@ -17,6 +17,7 @@ from .types import (
     AgentSource,
     AgentValidationError,
     parse_agent_frontmatter,
+    parse_agent_isolation,
 )
 
 
@@ -174,6 +175,7 @@ def _load_definition(
     except yaml.YAMLError as exc:
         raise AgentValidationError("subagent_definition_invalid") from exc
     name, description, allow, deny, model, iterations, permission_mode = parse_agent_frontmatter(raw_metadata)
+    isolation = parse_agent_isolation(raw_metadata)
     if available_tools is not None and any(tool not in available_tools for tool in (*allow, *deny)):
         raise AgentValidationError("subagent_tool_unknown")
     return AgentDefinition(
@@ -189,6 +191,7 @@ def _load_definition(
         digest=hashlib.sha256(raw).hexdigest(),
         root=root,
         entry=entry,
+        isolation=isolation,
     )
 
 

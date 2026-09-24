@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+from newcode.worktrees.command_sandbox import reject_unisolated_command
+
 from .types import (
     JsonObject,
     ToolContext,
@@ -48,10 +50,13 @@ class RunCommandTool:
             )
         except ToolFailure as exc:
             return ToolResult.failure(self.spec.name, exc.code, exc.message, exc.details)
+        if context.worktree_task_id is not None:
+            # cwd/参数过滤不构成进程级文件系统隔离；没有已验证 backend 就绝不启动。
+            return reject_unisolated_command(self.spec.name)
         try:
             completed = subprocess.run(
                 command,
-                cwd=context.workspace_root,
+                cwd=context.cwd,
                 capture_output=True,
                 shell=True,
                 text=True,

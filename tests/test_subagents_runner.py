@@ -29,6 +29,7 @@ from newcode.subagents.runner import (
 )
 from newcode.subagents.types import (
     AgentDefinition,
+    AgentIsolation,
     AgentPermissionMode,
     AgentSource,
     ParentPolicySnapshot,
@@ -92,15 +93,15 @@ class FakeMCPTool(FakeTool):
         self.mcp_metadata = {"mcp_server": "srv", "mcp_tool": "remote", "transport": "stdio"}
 
 
-def make_definition(*, body="", tools=("read_file",), model=None, permission=AgentPermissionMode.INHERIT, max_iterations=8):
+def make_definition(*, body="", tools=("read_file",), model=None, permission=AgentPermissionMode.INHERIT, max_iterations=8, isolation=AgentIsolation.SHARED):
     return AgentDefinition(
         name="worker", description="test worker", source=AgentSource.BUILTIN,
         tools_allow=tuple(tools), tools_deny=(), max_iterations=max_iterations,
-        permission_mode=permission, model=model, body=body,
+        permission_mode=permission, model=model, body=body, isolation=isolation,
     )
 
 
-def setup_runner(tmp_path, provider, registry, *, parent_permission=None, model="test-model", permission_mode=PermissionMode.TRUSTED):
+def setup_runner(tmp_path, provider, registry, *, parent_permission=None, model="test-model", permission_mode=PermissionMode.TRUSTED, tool_context=None):
     holder = {}
     manager = SubAgentManager(lambda context: holder["runner"](context))
     scope = manager.open_session("parent-session")
@@ -112,7 +113,7 @@ def setup_runner(tmp_path, provider, registry, *, parent_permission=None, model=
         provider_factory=factory,
         default_model=model,
         registry=registry,
-        tool_context=ToolContext(tmp_path, sensitive_values=("secret-value",)),
+        tool_context=tool_context or ToolContext(tmp_path, sensitive_values=("secret-value",)),
         parent_permission_manager=parent_permission or PermissionManager(mode=PermissionMode.TRUSTED),
     )
     holder["runner"] = runner
@@ -139,7 +140,12 @@ def test_definition_runner_has_private_session_injects_sop_each_request_and_clea
             super().__init__(**kwargs)
 
     monkeypatch.setattr(runner_module, "AgentLoop", CapturingLoop)
-    manager, scope, factory, _runner = setup_runner(tmp_path, provider, registry)
+    child_root = tmp_path / "child-root"
+    child_root.mkdir()
+    child_cwd = child_root / "nested"
+    child_cwd.mkdir()
+    supplied_context = ToolContext(child_root, cwd=child_cwd, sensitive_values=("secret-value",))
+    manager, scope, factory, _runner = setup_runner(tmp_path, provider, registry, tool_context=supplied_context)
     try:
         definition = make_definition(body="DEFINITION SOP: do not leak")
         task = manager.start(scope, "do the task", payload=DefinitionTask(definition))
@@ -153,12 +159,80 @@ def test_definition_runner_has_private_session_injects_sop_each_request_and_clea
             names = [item["function"]["name"] for item in call["tools"]]
             assert "agent" not in names and "load_skill" not in names
         assert parent_session == [ChatMessage("user", "parent-only")]
-        artifact_root = tmp_path / ".newcode" / "context-artifacts"
+        artifact_root = child_root / ".newcode" / "context-artifacts"
         assert not list(artifact_root.glob("subagent-*")) if artifact_root.exists() else True
         assert factory.created[0][0] == "test-model"
         assert captured["hook_engine"] is None and captured["memory_service"] is None
         assert captured["skill_state"].activations == ()
         assert "agent" not in captured["registry"].names()
+        child_context = captured["tool_context"]
+        assert child_context.workspace_root == child_root.resolve()
+        assert child_context.cwd == child_cwd.resolve()
+        assert child_context.workspace_identity == supplied_context.workspace_identity
+    finally:
+        manager.shutdown()
+
+
+def test_worktree_definition_fails_closed_until_phase4_runner_lease_integration(tmp_path):
+    registry = ToolRegistry()
+    manager, scope, factory, _runner = setup_runner(tmp_path, FakeProvider([]), registry)
+    try:
+        task = manager.start(
+            scope,
+            "run isolated task",
+            payload=DefinitionTask(make_definition(isolation=AgentIsolation.WORKTREE)),
+        )
+        result = manager.wait(scope, task.task_id, 2).result
+        assert result is not None
+        assert result.error_code == "subagent_worktree_unavailable"
+        assert factory.created == []
+    finally:
+        manager.shutdown()
+
+
+def test_worktree_definition_policy_hides_unverified_run_command(tmp_path):
+    from newcode.tools.registry import create_default_registry
+
+    registry = create_default_registry()
+    holder = {}
+    captured = []
+
+    def worker(task):
+        runner = holder["runner"]
+        captured.extend(runner._allowed(
+            task,
+            task.launch_policy,
+            frozenset(registry.names()),
+            frozenset(),
+            AgentMode.DO,
+        ))
+        return WorkerResult(summary="checked")
+
+    manager = SubAgentManager(worker)
+    scope = manager.open_session("parent-session")
+    policy = ParentPolicySnapshot(scope, frozenset(registry.names()), PermissionMode.TRUSTED)
+    manager.publish_policy_snapshot(scope, policy)
+    runner = SubAgentRunner(
+        manager=manager,
+        provider_factory=Factory([]),
+        default_model="test-model",
+        registry=registry,
+        tool_context=ToolContext(tmp_path),
+        parent_permission_manager=PermissionManager(mode=PermissionMode.TRUSTED),
+    )
+    holder["runner"] = runner
+    try:
+        task = manager.start(
+            scope,
+            "check worktree command exposure",
+            payload=DefinitionTask(make_definition(
+                tools=tuple(registry.names()), isolation=AgentIsolation.WORKTREE,
+            )),
+        )
+        result = manager.wait(scope, task.task_id, 2).result
+        assert result is not None and result.summary == "checked"
+        assert "run_command" not in captured
+        assert {"read_file", "find_files", "search_code"}.issubset(captured)
     finally:
         manager.shutdown()
 
@@ -397,6 +471,34 @@ def test_cache_bounds_stat_invalidation_and_child_cache_hit_still_reaches_permis
         assert calls >= 4  # 两次 AgentLoop precheck + 两次 cache/executor guard 检查。
     finally:
         manager.shutdown()
+
+
+def test_child_read_cache_identity_separates_worktree_roots(tmp_path):
+    from newcode.subagents.runner import ChildReadCache
+
+    main = tmp_path / "main"
+    child = tmp_path / "child"
+    main.mkdir()
+    child.mkdir()
+    main_file = main / "same.txt"
+    child_file = child / "same.txt"
+    main_file.write_text("main", encoding="utf-8")
+    child_file.write_text("child", encoding="utf-8")
+    main_context = ToolContext(main)
+    child_context = ToolContext(child, worktree_task_id="task-1234")
+    main_cache = ChildReadCache(workspace_root=main, workspace_identity=main_context.workspace_identity)
+    child_cache = ChildReadCache(workspace_root=child, workspace_identity=child_context.workspace_identity)
+    main_result = ToolResult.success("read_file", {"content": "main"})
+    child_result = ToolResult.success("read_file", {"content": "child"})
+
+    main_cache.put(main_file, main_result)
+    child_cache.put(child_file, child_result)
+
+    assert main_context.workspace_identity != child_context.workspace_identity
+    assert main_cache.get(main_file) == main_result
+    assert main_cache.get(child_file) is None
+    assert child_cache.get(child_file) == child_result
+    assert child_cache.get(main_file) is None
 
 
 @pytest.mark.parametrize("action", ["write_file", "run_command"])
