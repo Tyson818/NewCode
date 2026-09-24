@@ -22,6 +22,12 @@ from newcode.commands.dispatcher import CommandDispatcher
 from newcode.commands.types import CommandOutcomeKind, CommandParseKind
 from newcode.commands.ui import CLIUIControl
 from newcode.context.manager import ContextManager
+from newcode.hooks.actions import (
+    BoundedHostResolver, HookActionRunner, HookToolGateway, PinnedHttpsTransport,
+)
+from newcode.hooks.engine import HookEngine
+from newcode.hooks.loader import load_hook_rules
+from newcode.hooks.types import HookContext, HookEvent
 from newcode.config import ConfigError, load_config, resolve_api_key
 from newcode.mcp.adapter import MCPToolAdapter
 from newcode.mcp.config import load_mcp_config
@@ -42,6 +48,7 @@ from newcode.tools.registry import ToolRegistry, create_default_registry
 from newcode.tools.types import ToolContext
 from newcode.skills.commands import SkillCommandDispatcher, SkillCommandOverlay
 from newcode.skills.discovery import SkillDiscovery
+from newcode.skills.policy import visible_tool_names
 from newcode.skills.runner import SkillRunner
 from newcode.skills.state import ActiveSkillState
 
@@ -67,44 +74,45 @@ def main(argv: list[str] | None = None) -> int:
     mcp_runtime = None
     mcp_manager = None
     memory_service = None
+    memory_cleanup_state = {"attempted": False}
     mcp_status_summary = "MCP 状态未提供。"
     try:
-        config = load_config(Path(args.config))
-        api_key = resolve_api_key(config.api_key_env)
-        provider = DeepSeekProvider(config=config, api_key=api_key)
-        registry = create_default_registry()
-        tool_context = ToolContext(
-            workspace_root=Path(config.workspace_root),
-            default_timeout_seconds=config.tool_timeout_seconds,
-            command_timeout_seconds=config.command_timeout_seconds,
-            sensitive_values=(api_key,),
-        )
-        permission_rules = load_permission_rules(tool_context.workspace_root)
-        mcp_config = load_mcp_config(tool_context.workspace_root)
-        mcp_runtime = MCPRuntime()
-        mcp_manager = MCPManager(mcp_config.servers.values(), runtime=mcp_runtime)
-        for name, error in mcp_config.errors.items():
-            print(f"MCP server unavailable ({name}): {error.code}", file=sys.stderr)
-        discovered_servers = mcp_manager.discover_all()
-        for name, descriptors in discovered_servers.items():
-            config_entry = mcp_config.servers[name]
-            for descriptor in descriptors:
-                try:
-                    validate_input_schema(descriptor.input_schema)
-                    adapter = MCPToolAdapter(mcp_manager, config_entry, descriptor)
-                    registry.register(adapter, read_only=False, do_visible=True)
-                except (MCPToolSchemaError, ValueError):
-                    print(f"MCP tool unavailable ({name}): mcp_tool_schema_invalid", file=sys.stderr)
-        discovered_tools = sum(len(descriptors) for descriptors in discovered_servers.values())
-        mcp_status_summary = f"MCP 已配置 {len(mcp_config.servers)} 个服务，已发现 {discovered_tools} 个工具。"
-    except ConfigError as exc:
-        print(f"配置错误：{exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"启动失败：{exc}", file=sys.stderr)
-        return 1
+        try:
+            config = load_config(Path(args.config))
+            api_key = resolve_api_key(config.api_key_env)
+            provider = DeepSeekProvider(config=config, api_key=api_key)
+            registry = create_default_registry()
+            tool_context = ToolContext(
+                workspace_root=Path(config.workspace_root),
+                default_timeout_seconds=config.tool_timeout_seconds,
+                command_timeout_seconds=config.command_timeout_seconds,
+                sensitive_values=(api_key,),
+            )
+            permission_rules = load_permission_rules(tool_context.workspace_root)
+            mcp_config = load_mcp_config(tool_context.workspace_root)
+            mcp_runtime = MCPRuntime()
+            mcp_manager = MCPManager(mcp_config.servers.values(), runtime=mcp_runtime)
+            for name, error in mcp_config.errors.items():
+                print(f"MCP server unavailable ({name}): {error.code}", file=sys.stderr)
+            discovered_servers = mcp_manager.discover_all()
+            for name, descriptors in discovered_servers.items():
+                config_entry = mcp_config.servers[name]
+                for descriptor in descriptors:
+                    try:
+                        validate_input_schema(descriptor.input_schema)
+                        adapter = MCPToolAdapter(mcp_manager, config_entry, descriptor)
+                        registry.register(adapter, read_only=False, do_visible=True)
+                    except (MCPToolSchemaError, ValueError):
+                        print(f"MCP tool unavailable ({name}): mcp_tool_schema_invalid", file=sys.stderr)
+            discovered_tools = sum(len(descriptors) for descriptors in discovered_servers.values())
+            mcp_status_summary = f"MCP 已配置 {len(mcp_config.servers)} 个服务，已发现 {discovered_tools} 个工具。"
+        except ConfigError as exc:
+            print(f"配置错误：{exc}", file=sys.stderr)
+            return 1
+        except Exception:
+            print("启动失败：startup_failed", file=sys.stderr)
+            return 1
 
-    try:
         session_archive = SessionArchive(
             tool_context.workspace_root,
             sensitive_values=tool_context.sensitive_values,
@@ -127,14 +135,21 @@ def main(argv: list[str] | None = None) -> int:
             session_archive=session_archive,
             memory_service=memory_service,
             mcp_status_summary=mcp_status_summary,
+            memory_cleanup_state=memory_cleanup_state,
         )
     finally:
-        if memory_service is not None:
+        if memory_service is not None and not memory_cleanup_state["attempted"]:
             _safe_memory_shutdown(memory_service)
         if mcp_manager is not None:
-            mcp_manager.shutdown()
+            try:
+                mcp_manager.shutdown()
+            except Exception:
+                pass
         if mcp_runtime is not None:
-            mcp_runtime.shutdown()
+            try:
+                mcp_runtime.shutdown()
+            except Exception:
+                pass
 
 
 def run_conversation(
@@ -154,37 +169,82 @@ def run_conversation(
     session_archive: SessionArchive | None = None,
     memory_service: MemoryService | None = None,
     mcp_status_summary: str = "MCP 状态未提供。",
+    memory_cleanup_state: dict[str, bool] | None = None,
 ) -> int:
-    registry = registry or create_default_registry()
-    tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
-    permission_manager = permission_manager or _build_permission_manager(
-        mode=permission_mode,
-        rules=permission_rules,
-        confirmer=permission_confirmer
-        or CliPermissionConfirmer(input_func=input_func, output=output),
-    )
-    if session_archive is not None:
-        _safe_cleanup_stale(session_archive, session.session_id)
-        if session.session_id is None:
-            _safe_create_session(session_archive, session)
-    context_manager = context_manager or ContextManager(
-        session,
-        tool_context.workspace_root,
-        tool_context.sensitive_values,
-    )
-    mode = AgentMode.DO
-    command_registry = create_builtin_registry()
-    skill_state = ActiveSkillState()
-    skill_discovery = SkillDiscovery()
-    skill_catalog = skill_discovery.discover(tool_context.workspace_root)
-    command_dispatcher = SkillCommandDispatcher(
-        CommandDispatcher(command_registry),
-        SkillCommandOverlay(command_registry, skill_state),
-    )
-    command_ui = CLIUIControl(output=output, error_output=error_output)
-
-    print("NewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
+    hook_actions: HookActionRunner | None = None
+    hook_engine: HookEngine | None = None
     try:
+        registry = registry or create_default_registry()
+        tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
+        permission_manager = permission_manager or _build_permission_manager(
+            mode=permission_mode,
+            rules=permission_rules,
+            confirmer=permission_confirmer
+            or CliPermissionConfirmer(input_func=input_func, output=output),
+        )
+        if session_archive is not None:
+            _safe_cleanup_stale(session_archive, session.session_id)
+            if session.session_id is None:
+                _safe_create_session(session_archive, session)
+        context_manager = context_manager or ContextManager(
+            session,
+            tool_context.workspace_root,
+            tool_context.sensitive_values,
+        )
+        mode = AgentMode.DO
+        loop: AgentLoop | None = None
+        command_registry = create_builtin_registry()
+        skill_state = ActiveSkillState()
+        skill_discovery = SkillDiscovery()
+        skill_catalog = skill_discovery.discover(tool_context.workspace_root)
+        command_dispatcher = SkillCommandDispatcher(
+            CommandDispatcher(command_registry),
+            SkillCommandOverlay(command_registry, skill_state),
+        )
+        command_ui = CLIUIControl(output=output, error_output=error_output)
+        try:
+            hook_config = load_hook_rules(tool_context.workspace_root)
+            for diagnostic in hook_config.diagnostics:
+                print(f"Hook 配置跳过：{diagnostic.code}", file=error_output)
+            if hook_config.rules:
+                http_enabled = hook_config.network.enabled and bool(hook_config.network.allow_hosts)
+                hook_actions = HookActionRunner(
+                    network=hook_config.network,
+                    resolver=BoundedHostResolver() if http_enabled else None,
+                    http_transport=PinnedHttpsTransport() if http_enabled else None,
+                    shell_gateway=HookToolGateway(
+                        permission_manager, registry, tool_context,
+                        tool_visible=lambda name: name in visible_tool_names(mode, registry, skill_state),
+                    ),
+                    sensitive_values=tool_context.sensitive_values,
+                )
+                hook_engine = HookEngine(
+                    hook_config.rules,
+                    action_sink=hook_actions.submit,
+                    on_session_reset=hook_actions.reset_session,
+                )
+        except Exception:
+            _safe_hook_shutdown(hook_actions)
+            hook_actions = None
+            hook_engine = None
+            print("Hook 配置跳过：hook_config_invalid", file=error_output)
+    except BaseException:
+        _safe_hook_shutdown(hook_actions)
+        _safe_memory_shutdown(memory_service)
+        if memory_cleanup_state is not None:
+            memory_cleanup_state["attempted"] = True
+        if context_manager is not None:
+            _safe_context_cleanup(context_manager)
+        raise
+
+    system_open = False
+    session_open = False
+    try:
+      print("NewCode 已启动。输入问题开始对话，输入 /exit 退出。", file=output)
+      _safe_emit_cli_hook(hook_engine, HookEvent.SYSTEM_START, session, mode, tool_context)
+      system_open = True
+      _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_START, session, mode, tool_context)
+      session_open = True
       while True:
         try:
             user_input = input_func("你> ")
@@ -231,6 +291,8 @@ def run_conversation(
                 command_ui.set_mode(mode.value)
                 continue
             if outcome.kind is CommandOutcomeKind.CLEAR_SESSION:
+                _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_END, session, mode, tool_context)
+                session_open = False
                 session, context_manager = _clear_session(
                     session,
                     context_manager,
@@ -238,6 +300,11 @@ def run_conversation(
                     tool_context,
                 )
                 skill_state.reset_for_new_session()
+                loop = None
+                if hook_engine is not None:
+                    hook_engine.reset_session()
+                _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_START, session, mode, tool_context)
+                session_open = True
                 skill_catalog = skill_discovery.discover(tool_context.workspace_root)
                 command_ui.info("已开始新会话。")
                 continue
@@ -246,6 +313,8 @@ def run_conversation(
                 if restored is None:
                     command_ui.error("session_restore_failed", "会话不可恢复。")
                     continue
+                _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_END, session, mode, tool_context)
+                session_open = False
                 _safe_checkpoint(session_archive, session)
                 _safe_context_cleanup(context_manager)
                 session = restored.session
@@ -255,6 +324,11 @@ def run_conversation(
                     tool_context.sensitive_values,
                 )
                 skill_state.reset_for_resume()
+                loop = None
+                if hook_engine is not None:
+                    hook_engine.reset_session()
+                _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_START, session, mode, tool_context)
+                session_open = True
                 skill_catalog = skill_discovery.discover(tool_context.workspace_root)
                 command_ui.info(f"已恢复会话：{session.session_id}")
                 if restored.needs_time_span_reminder:
@@ -292,17 +366,20 @@ def run_conversation(
                 continue
 
         print("NewCode> ", end="", file=output, flush=True)
-        loop = AgentLoop(
-            provider=provider,
-            session=session,
-            registry=registry,
-            tool_context=tool_context,
-            permission_manager=permission_manager,
-            context_manager=context_manager,
-            memory_service=memory_service,
-            skill_state=skill_state,
-            skill_discovery=skill_discovery,
-        )
+        if loop is None:
+            loop = AgentLoop(
+                provider=provider,
+                session=session,
+                registry=registry,
+                tool_context=tool_context,
+                permission_manager=permission_manager,
+                context_manager=context_manager,
+                memory_service=memory_service,
+                skill_state=skill_state,
+                skill_discovery=skill_discovery,
+                hook_engine=hook_engine,
+                hook_actions=hook_actions,
+            )
 
         try:
             natural = _consume_agent_events(
@@ -316,10 +393,20 @@ def run_conversation(
             print("\n已中断当前任务。", file=output)
         print("", file=output)
     finally:
-        skill_state.clear()
+        try:
+            skill_state.clear()
+        except Exception:
+            pass
+        if session_open:
+            _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_END, session, mode, tool_context)
         _safe_checkpoint(session_archive, session)
         _safe_cleanup_stale(session_archive, session.session_id)
+        if system_open:
+            _safe_emit_cli_hook(hook_engine, HookEvent.SYSTEM_END, session, mode, tool_context)
+        _safe_hook_shutdown(hook_actions)
         _safe_memory_shutdown(memory_service)
+        if memory_cleanup_state is not None:
+            memory_cleanup_state["attempted"] = True
         _safe_context_cleanup(context_manager)
 
 
@@ -527,6 +614,40 @@ def _safe_memory_shutdown(memory_service: MemoryService | None) -> None:
         return
     try:
         memory_service.shutdown()
+    except Exception:
+        return
+
+
+def _safe_emit_cli_hook(
+    engine: HookEngine | None,
+    event: HookEvent,
+    session: ChatSession,
+    mode: AgentMode,
+    tool_context: ToolContext,
+) -> None:
+    if engine is None:
+        return
+    try:
+        engine.emit(
+            event,
+            HookContext(
+                event,
+                {
+                    "session.id": session.session_id or f"in-memory-{id(session)}",
+                    "mode": mode.value,
+                },
+                sensitive_values=tool_context.sensitive_values,
+            ),
+        )
+    except Exception:
+        return
+
+
+def _safe_hook_shutdown(actions: HookActionRunner | None) -> None:
+    if actions is None:
+        return
+    try:
+        actions.shutdown(timeout_seconds=1.0)
     except Exception:
         return
 

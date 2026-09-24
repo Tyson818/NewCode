@@ -1,8 +1,18 @@
 from io import StringIO
 
+import pytest
+
 from newcode import cli
+from newcode.hooks.types import HookLoadResult, HookNetworkPolicy
 from newcode.providers.base import ProviderError, TextDelta
 from newcode.session import ChatSession
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hook_config(monkeypatch):
+    """CLI 基线测试不读取本机用户级 Hook 配置。"""
+
+    monkeypatch.setattr(cli, "load_hook_rules", lambda _root: HookLoadResult((), HookNetworkPolicy()))
 
 
 class FakeProvider:

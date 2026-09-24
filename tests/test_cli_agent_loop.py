@@ -2,12 +2,22 @@ from __future__ import annotations
 
 from io import StringIO
 
+import pytest
+
 from newcode import cli
 from newcode.agent.mode import AgentMode
+from newcode.hooks.types import HookLoadResult, HookNetworkPolicy
 from newcode.providers.base import TextDelta, ToolCallEvent
 from newcode.session import ChatSession
 from newcode.tools.registry import create_default_registry
 from newcode.tools.types import ToolCall, ToolContext
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hook_config(monkeypatch):
+    """原有 AgentLoop CLI 测试不读取本机用户级 Hook 配置。"""
+
+    monkeypatch.setattr(cli, "load_hook_rules", lambda _root: HookLoadResult((), HookNetworkPolicy()))
 
 
 class FakeProvider:

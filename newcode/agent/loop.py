@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 import platform
+import re
 from typing import Any
 
 from newcode.agent.collector import StreamingTurnCollector
@@ -20,7 +21,11 @@ from newcode.agent.mode import AgentMode, allowed_tool_names, is_tool_allowed
 from newcode.agent.scheduler import ToolExecutionRecord, ToolScheduler
 from newcode.context.manager import ContextManager
 from newcode.memory.service import MemoryService
+from newcode.hooks.actions import HookActionRunner
+from newcode.hooks.engine import HookEngine
+from newcode.hooks.types import HookContext, HookEvent
 from newcode.permissions.manager import PermissionManager
+from newcode.permissions.normalizer import build_permission_request
 from newcode.permissions.types import (
     PermissionDecision,
     PermissionDecisionValue,
@@ -54,6 +59,8 @@ class AgentLoop:
         skill_state: ActiveSkillState | None = None,
         skill_catalog: SkillCatalog | None = None,
         skill_discovery: SkillDiscovery | None = None,
+        hook_engine: HookEngine | None = None,
+        hook_actions: HookActionRunner | None = None,
     ) -> None:
         self.provider = provider
         self.session = session
@@ -65,6 +72,9 @@ class AgentLoop:
         self.permission_manager = permission_manager or PermissionManager()
         self.context_manager = context_manager
         self.memory_service = memory_service
+        self.hook_engine = hook_engine
+        self.hook_actions = hook_actions
+        self._turn_index = 0
         self.skill_state = skill_state or ActiveSkillState()
         self._skill_discovery = skill_discovery or SkillDiscovery()
         self._fixed_skill_catalog = skill_catalog is not None
@@ -87,6 +97,43 @@ class AgentLoop:
         mode: AgentMode = AgentMode.DO,
         cancel_flag: Any | None = None,
     ) -> Iterator[AgentEvent]:
+        """在原有事件流外发射内部 Hook，不改变 AgentEvent 顺序。"""
+
+        self._turn_index += 1
+        if not _is_cancelled(cancel_flag):
+            self._emit_hook(HookEvent.TURN_START, mode)
+        ended = False
+        try:
+            for event in self._run_core(user_input, mode=mode, cancel_flag=cancel_flag):
+                if isinstance(event, AgentFinalAnswer):
+                    self._emit_hook(HookEvent.TURN_END, mode, {"stop.reason": "final_answer"})
+                    ended = True
+                elif isinstance(event, AgentStopped):
+                    if event.reason is StopReason.USER_CANCELLED:
+                        self._emit_hook(HookEvent.TURN_CANCELLED, mode, {"stop.reason": "user_cancelled"})
+                    elif event.reason is StopReason.PROVIDER_ERROR:
+                        self._emit_hook(HookEvent.TURN_EXCEPTION, mode, {"exception.kind": "provider_error"})
+                    self._emit_hook(HookEvent.TURN_END, mode, {"stop.reason": event.reason.value})
+                    ended = True
+                yield event
+        except GeneratorExit:
+            if not ended:
+                self._emit_hook(HookEvent.TURN_CANCELLED, mode, {"stop.reason": "generator_closed"})
+                self._emit_hook(HookEvent.TURN_END, mode, {"stop.reason": "user_cancelled"})
+            raise
+        except Exception:
+            if not ended:
+                self._emit_hook(HookEvent.TURN_EXCEPTION, mode, {"exception.kind": "agent_exception"})
+                self._emit_hook(HookEvent.TURN_END, mode, {"stop.reason": "exception"})
+            raise
+
+    def _run_core(
+        self,
+        user_input: str,
+        *,
+        mode: AgentMode,
+        cancel_flag: Any | None,
+    ) -> Iterator[AgentEvent]:
         if _is_cancelled(cancel_flag):
             yield AgentStopped(
                 StopReason.USER_CANCELLED,
@@ -95,7 +142,13 @@ class AgentLoop:
             )
             return
 
+        previous_count = len(self.session.messages)
         self.session.add_user_message(user_input)
+        if len(self.session.messages) > previous_count:
+            self._emit_hook(HookEvent.USER_MESSAGE_RECEIVED, mode, {
+                "message.id": f"{self._hook_session_id()}:{self._turn_index}:{len(self.session.messages)}",
+                "message.summary": user_input,
+            })
         consecutive_unknown_tools = 0
         tool_error_count = 0
 
@@ -118,8 +171,10 @@ class AgentLoop:
             try:
                 if self.context_manager is not None:
                     self.context_manager.prepare(self._generate_summary)
+                self._emit_hook(HookEvent.BEFORE_MODEL_REQUEST, mode)
+                injections = self.hook_actions.consume_prompt_injections() if self.hook_actions is not None else ()
                 provider_events = self.provider.stream_chat(
-                    self._provider_messages(mode, iteration),
+                    self._provider_messages(mode, iteration, injections),
                     tools=self.registry.to_openai_tools(self._visible_tool_names(mode)),
                     allow_tool_calls=True,
                 )
@@ -141,6 +196,8 @@ class AgentLoop:
                     iteration=iteration,
                 )
                 return
+
+            self._emit_hook(HookEvent.AFTER_MODEL_RESPONSE, mode)
 
             if self.context_manager is not None:
                 self.context_manager.record_usage(turn_result.usage)
@@ -197,6 +254,10 @@ class AgentLoop:
                 turn_result.tool_calls,
             )
 
+            hook_records, allowed_tool_calls, allowed_indexes = self._precheck_hooks(
+                allowed_tool_calls, allowed_indexes, mode,
+            )
+
             scheduled_records = self.scheduler.execute(
                 allowed_tool_calls,
                 self._execute_tool_call,
@@ -211,9 +272,14 @@ class AgentLoop:
                 for record in scheduled_records
             ]
             execution_records = sorted(
-                [*permission_records, *execution_records],
+                [*permission_records, *hook_records, *execution_records],
                 key=lambda record: record.index,
             )
+            executed_indexes = {
+                allowed_indexes[record.index]
+                for record in scheduled_records
+                if self.registry.get(record.tool_call.name) is not None
+            }
 
             for record in execution_records:
                 if _is_cancelled(cancel_flag):
@@ -227,6 +293,12 @@ class AgentLoop:
                 tool_call = record.tool_call
                 result = record.result
                 self.session.add_tool_result(tool_call.id, result)
+                if record.index in executed_indexes:
+                    self._emit_hook(HookEvent.AFTER_TOOL, mode, {
+                        **self._hook_tool_fields(tool_call),
+                        "tool.result.ok": result.ok,
+                        "tool.error_code": self._safe_tool_error_code(result),
+                    })
 
                 if result.ok:
                     consecutive_unknown_tools = 0
@@ -286,6 +358,7 @@ class AgentLoop:
         self,
         mode: AgentMode,
         iteration: int,
+        hook_injections: tuple[str, ...] = (),
     ) -> list[ChatMessage]:
         context = PromptBuildContext(
             mode=mode,
@@ -298,13 +371,88 @@ class AgentLoop:
             permission_mode=self.permission_manager.mode.value,
         )
         active_skills = self.skill_state.prompt_background()
-        if not active_skills:
+        if not active_skills and not hook_injections:
             return self.prompt_builder.build_messages(self.session.messages, context)
         return self.prompt_builder.build_messages(
             self.session.messages,
             context,
-            dynamic_background=DynamicPromptBackground(active_skills=active_skills),
+            dynamic_background=DynamicPromptBackground(
+                active_skills=active_skills,
+                hook_injections="\n\n".join(hook_injections),
+            ),
         )
+
+    def _hook_session_id(self) -> str:
+        return self.session.session_id or f"in-memory-{id(self.session)}"
+
+    def _emit_hook(
+        self, event: HookEvent, mode: AgentMode,
+        extra: dict[str, Any] | None = None, *, hook_origin: bool = False,
+    ) -> bool:
+        if self.hook_engine is None:
+            return False
+        fields: dict[str, Any] = {
+            "session.id": self._hook_session_id(),
+            "turn.index": self._turn_index,
+            "mode": mode.value,
+        }
+        fields.update(extra or {})
+        try:
+            context = HookContext(
+                event, fields,
+                sensitive_values=self.tool_context.sensitive_values,
+            )
+            return self.hook_engine.emit(event, context, hook_origin=hook_origin).denied
+        except Exception:
+            # Hook 内部失败不会改变主 Agent 流程，也不是合法 deny。
+            return False
+
+    def _hook_tool_fields(self, tool_call: ToolCall) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "tool.name": tool_call.name,
+            "tool.call_id": tool_call.id,
+            "tool.read_only": self.registry.is_read_only(tool_call.name),
+        }
+        try:
+            tool = self.registry.get(tool_call.name)
+            request = build_permission_request(tool_call, self.tool_context, self.permission_manager.mode, tool)
+            fields["tool.normalized_args"] = request.normalized_args
+        except Exception:
+            pass
+        return fields
+
+    def _precheck_hooks(
+        self, allowed_calls: list[ToolCall], allowed_indexes: list[int], mode: AgentMode,
+    ) -> tuple[list[ToolExecutionRecord], list[ToolCall], list[int]]:
+        if self.hook_engine is None:
+            return [], allowed_calls, allowed_indexes
+        denied: list[ToolExecutionRecord] = []
+        remaining_calls: list[ToolCall] = []
+        remaining_indexes: list[int] = []
+        for tool_call, index in zip(allowed_calls, allowed_indexes, strict=True):
+            if self.registry.get(tool_call.name) is None:
+                remaining_calls.append(tool_call)
+                remaining_indexes.append(index)
+                continue
+            if self._emit_hook(HookEvent.BEFORE_TOOL, mode, self._hook_tool_fields(tool_call)):
+                denied.append(ToolExecutionRecord(
+                    index=index, tool_call=tool_call,
+                    result=make_failure_result(
+                        tool_call.name, "hook_tool_denied", "Hook 拒绝该工具调用。",
+                        context=self.tool_context,
+                    ),
+                ))
+                continue
+            remaining_calls.append(tool_call)
+            remaining_indexes.append(index)
+        return denied, remaining_calls, remaining_indexes
+
+    @staticmethod
+    def _safe_tool_error_code(result: ToolResult) -> str:
+        if result.error is None:
+            return ""
+        code = result.error.code
+        return code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_-]{1,64}", code) else "tool_error"
 
     def _generate_summary(self, prompt: str) -> str:
         messages = [

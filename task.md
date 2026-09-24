@@ -1,58 +1,124 @@
-# Chapter 11：Skill System 原子任务
+# Chapter 12：Hook 系统——原子任务
 
-## T1：Skill 模型与错误码
+## T1：Hook 模型与安全错误码
 
-前置：无。允许：`newcode/skills/__init__.py`、`types.py`、`tests/test_skills_types.py`。动作：定义 frontmatter、metadata、mode、参数、activation、资源摘要、稳定错误；isolated `history_messages` 仅允许 0–20。测试：schema/name/mode、history 的 0/20/越界、model/参数边界。完成：纯数据模型。边界：不读文件、不改 Prompt/Agent。
+- 前置条件：无。
+- 允许文件：新增 newcode/hooks/__init__.py、types.py、tests/test_hooks_types.py。
+- 实现：定义 stable ID、event/action、仅 before_tool 的规则级 deny、condition/context/outcome/diagnostic、once scope identity 和受限 timeout 校验。
+- 测试：合法/非法 ID、event/action/deny、五种 scope key、once/async、诊断脱敏。
+- 完成：纯数据、JSON-safe，不导入 Provider/MCP/执行层。
+- 禁止：YAML、文件、网络、工具、注册或 action。
 
-## T2：路径安全与三级发现
+## T2：YAML loader、路径安全、合并
 
-前置：T1。允许：`discovery.py`、`tests/test_skills_discovery.py`、`tests/test_skills_paths.py`。动作：三根、单文件/目录入口、project 覆盖、坏项隔离、digest、root/resource sandbox，以及模型启动目录投影。测试：symlink、绝对/`..`、同名、坏 YAML、普通文件限制；目录注入仅 name/description，tools/mode/model/parameters/path/digest/SOP 零泄露。完成：只返回内部 metadata 与最小模型目录。边界：不加载 SOP 正文到 Prompt。
+- 前置条件：T1。
+- 允许文件：新增 hooks/loader.py，修改 hooks/__init__.py，新增 tests/test_hooks_loader.py。
+- 实现：加载用户和项目 hooks.yaml，验证项目 sandbox/普通文件，逐条隔离，按未覆盖 user 后接 project 合并；只从用户文件读取 network.enabled/allow_hosts，拒绝项目 network 配置。
+- 测试：缺文件、坏 YAML、缺字段、非法 event/action、重复 ID、覆盖、顺序、符号链接/逃逸、用户授权合并、项目不得启用 HTTP/增加 host。
+- 完成：错误仅安全诊断，不接 CLI。
+- 禁止：AppConfig、Permission loader、CLI 改动。
 
-## T3：内置模板资源
+## T3：受限条件 matcher
 
-前置：T1。允许：`newcode/resources/skills/{commit,review,test}/SKILL.md`、discovery 测试。动作：提供固定模板与白名单：commit/test 可声明 `run_command`，review 维持只读。测试：发现、描述、白名单、commit 不自动提交；commit/test 的 `run_command` 在 Permission deny 或需确认时零绕过。完成：无自动脚本执行。边界：不新增依赖或网络。
+- 前置条件：T1。
+- 允许文件：新增 hooks/conditions.py，修改 types.py，新增 tests/test_hooks_conditions.py。
+- 实现：allowlisted field 的 exact/glob/regex/not 与单层 all/any。
+- 测试：每种匹配、混用拒绝、非法 regex、缺字段、不匹配 skip、Permission regression；pattern 上限 256 字符、目标字段上限 1024 字符；灾难性回溯形态拒绝/有界完成；预算超限仅拒绝对应匹配，AgentLoop 继续。
+- 完成：无表达式或模板执行；匹配器有线性复杂度上界，不对不可信项目配置使用无界 Python re。
+- 禁止：修改 Permission rules 语义。
 
-## T4：按需 loader 与参数
+## T4：引擎的顺序、once、递归抑制
 
-前置：T1–T2。允许：`loader.py`、`tests/test_skills_loader.py`。动作：完整 SOP、参数替换、资源索引、模型/工具校验。测试：未声明/缺失/额外参数、secret 脱敏、未知工具、指定模型失败。完成：失败零激活。边界：不调用 Provider/工具。
+- 前置条件：T1–T3。
+- 允许文件：新增 hooks/engine.py，修改 types.py、__init__.py，新增 tests/test_hooks_engine.py。
+- 实现：稳定 emit、once key、origin guard、safe diagnostics、同步 before_tool 规则级 deny outcome，命中 deny 时跳过该条 action；固定 process/session/turn/message/tool scope 映射。
+- 测试：顺序、skip、system process ID、session ChatSession ID、turn session ID+index、message session ID+message ID、tool session ID+tool call ID；clear/new/resume reset；跨 CLI process 不恢复。
+- 完成：引擎不实际执行 action，合法 deny 与失败可区分。
+- 禁止：AgentLoop/CLI 接入和 ToolCall 参数改写。
 
-## T5：激活状态与热更新
+## T5：Action runner 与 transient prompt queue
 
-前置：T2、T4。允许：`state.py`、`tests/test_skills_state.py`。动作：多激活排序、stale/invalid、clear/new/resume 空状态、白名单交集。测试：变更/删除/损坏、顺序无关、load_skill 例外。完成：不持久化到 session。边界：不改 Context 算法。
+- 前置条件：T4。
+- 允许文件：新增 hooks/actions.py、lifecycle.py，修改 engine.py/types.py，新增/修改 hooks action/engine tests。
+- 实现：单 worker、有界队列、timeout、prompt 单次消费、HTTP fake transport/default disabled、subagent placeholder、redaction。
+- 测试：async 顺序/队列满、timeout、shutdown、prompt exact next-request timing、HTTP user/project merge、固定 header allowlist、凭证/代理 header 拒绝、localhost/IP literal/private/link-local/reserved 拒绝、DNS 解析到非公网时零请求、pin/peer 校验、placeholder；响应/错误/headers/status 只进遮蔽截断诊断。
+- 完成：before_tool async 非法，无直接 subprocess/真实网络。
+- 禁止：Provider/MCP client 或工具实现修改。
 
-## T6：Prompt 动态注入
+## T6：Shell gateway 安全契约
 
-前置：T5。允许：`newcode/prompt/modules.py`、`builder.py`、`tests/test_prompt_skills.py`，必要 prompt 测试。动作：active SOP 在动态背景首项，每轮生成，带来源/非授权标签。测试：顺序、多个 Skill、session/JSONL 零写入、stale 排除。完成：完整 SOP 不在启动 prompt。边界：不改稳定 Prompt。
+- 前置条件：T5。
+- 允许文件：hooks/actions.py、hooks/lifecycle.py、必要时 newcode/permissions/manager.py；tests/test_hooks_actions.py、必要时 tests/test_agent_scheduler.py、tests/test_permissions_manager.py。
+- 实现：固定 command 经 Permission→ToolScheduler→executor，origin suppression、输出截断遮蔽。
+- 测试：Permission deny/confirmation、sandbox/hard deny、serial scheduler；Permission=require_confirmation 时 sync 与 async shell 均不调用 confirmer/Input、不执行命令、不自动批准，仅产受限安全诊断；普通 Agent 工具原有交互 confirmer 测试继续通过。
+- 完成：Hook shell 不能将 deny 或 require_confirmation 转 allow；拒绝时命令执行计数为零。
+- 禁止：放宽 run_command schema 或 Permission policy。
 
-## T7：系统 load_skill 与工具策略
+## T7：AgentLoop turn/message/model events
 
-前置：T4–T6。允许：`tool.py`、`policy.py`、`newcode/agent/loop.py`、必要 `tools/registry.py`、测试。动作：注册 load_skill、接入 AgentLoop 可见工具过滤与刷新。测试：load_skill 在 Plan/Do 均可见可调用、写 activation state 始终串行且不进入只读并发批、完整 Permission→Scheduler→executor 链路、MCP、unknown whitelist、普通工具交集与系统例外。完成：Provider 不导入 Skill。边界：不直调 executor/MCP client。
+- 前置条件：T4–T6。
+- 允许文件：newcode/agent/loop.py、newcode/prompt/modules.py、必要时 agent/events.py、tests/test_agent_loop_hooks.py、tests/test_prompt_hooks.py。
+- 实现：精确发 turn、message、model、cancel、exception events；user_message_received 只提供先脱敏再截断到 512 字符的 message.summary；实现 injection 事件后下一个主请求的消费时序。
+- 测试：event order/context、message.summary、exact/glob/regex、脱敏/512 上限、normal/error/cancel/max iterations；before_model_request 同步 injection 进入当前请求；after_tool/after_model_response injection 进后续请求；async 错过当前请求不得修改已构造 messages；单次消费、session-end discard、持久化零写入。
+- 完成：Provider 无 Hook import，Context summary 不触发 Hook。
+- 禁止：Context/Memory/Skill/Provider 核心策略修改。
 
-## T8：short command overlay
+## T8：before_tool deny 和 after_tool
 
-前置：T2、T5、T7。允许：`commands.py`、必要 `newcode/commands/*`、`tests/test_skills_commands.py`。动作：成功 activation 后的不可变 overlay、`key=value` 参数、冲突、隐藏、help、completion、热更新。测试：发现不注册、load 成功注册、clear/resume/无效移除、不改 sealed registry；静态 `/review` 固定行为优先，review Skill 可加载但不创建 overlay，其他无冲突 Skill 仍创建短命令。完成：无任意命令注册。边界：不改十个内置命令语义。
+- 前置条件：T7。
+- 允许文件：agent/loop.py，必要时 agent/scheduler.py，相关 Hook/Permission/MCP/Skill tests。
+- 实现：mode/visible/Permission allow 后同步 before_tool；仅规则级合法 deny 以 hook_tool_denied ToolResult 原序回灌；shell 内部 ToolResult 不进 session；其他 action 结果仅诊断。
+- 测试：Plan/Do、Permission、hard deny、sandbox、Skill/MCP whitelist、工具原序和 read-only 调度；shell/HTTP/prompt/subagent 成功、拒绝、timeout、失败均不回灌或进入主 ChatSession。
+- 完成：Hook 不绕过任何 gate，也不递归。
+- 禁止：新 AI 工具、MCP runtime、Permission semantics 改动。
 
-## T9：shared 执行
+## T9：AgentLoop 组合回归
 
-前置：T6–T8。允许：`runner.py`、`newcode/cli.py`、`tests/test_skills_runner.py`、`tests/test_cli_skills.py`。动作：short command/shared skill 经正常 AgentLoop，加载/激活并保持历史。测试：固定参数、工具 gate、Context/Memory/session 回归。完成：无直接 Provider 调用。边界：不绕过 Permission/Plan-Do。
+- 前置条件：T7–T8。
+- 允许文件：测试；失败直接证明时仅最小 hooks 或 AgentLoop 修复。
+- 实现：组合 fake provider、tools、Context/Memory/MCP/Skill fixtures。
+- 测试：Hook 和既有 AgentLoop、Context、Memory、Permission、MCP、Plan/Do、Skill tests。
+- 完成：无 Hook 时行为和工具排序不变。
+- 禁止：为便利改 CLI/Provider。
 
-## T10：isolated 执行与回流
+## T10：CLI 加载与 system/session 生命周期
 
-前置：T9。允许：runner、CLI、相关测试。动作：有限历史 child session、同 gate、模型能力、摘要回流、finally cleanup。测试：`history_messages=0` 不携带历史、20 上限、只携带最近已脱敏 user/assistant 非工具消息、工具调用/结果零携带、主/子 session/memory/artifact/active Skills 零共享、敏感值不回流、失败隔离。完成：child 原文零持久化。边界：不创建远端会话/网络。
+- 前置条件：T2、T7–T9。
+- 允许文件：newcode/cli.py、tests/test_cli_hooks.py，必要时 tests/test_cli_session.py。
+- 实现：启动加载、system/session events，clear/resume 结束旧 scope 并建新 scope。
+- 测试：new/restore/clear、配置诊断、once/pending reset、静态命令回归。
+- 完成：session archive 不保存 injection/state。
+- 禁止：新增 Hook slash command 或修改 Command Registry。
 
-## T11：CLI 生命周期与回归
+## T11：CLI finally 与后台 shutdown
 
-前置：T8–T10。允许：`newcode/cli.py`、`tests/test_cli_skills.py`及失败直接证明的最小测试。动作：启动 catalog、每回合刷新、clear/new/resume 清激活、finally 关闭隔离。测试：EOF、exit、异常、MCP/Memory/Context cleanup 顺序。完成：既有命令不回归。边界：不改 Provider 配置。
+- 前置条件：T10。
+- 允许文件：cli.py，必要时 Hook lifecycle/actions，CLI Hook/lifecycle tests。
+- 实现：checkpoint→Hook shutdown→Memory→Context→MCP，所有退出路径隔离失败。
+- 测试：EOF、exit、KeyboardInterrupt、异常、正常退出、shutdown timeout。
+- 完成：不残留 worker 或跨 session state。
+- 禁止：阻断或重排现有服务内部 cleanup，tmux/真实网络。
 
-## T12：全量验收
+## T12：targeted 回归与静态审计
 
-前置：T1–T11。允许：仅失败直接证明的最小模块与测试。动作：全量验证、静态审计、fake CLI 验收。完成：记录 skip 原因。边界：不进入 Chapter 12。
+- 前置条件：T1–T11。
+- 允许文件：原则仅测试；失败直接证明时最小修复和回归测试。
+- 实现：审计 Provider、递归、持久化、路径、shell/HTTP 与执行边界。
+- 测试：全部 Hook 和相关 AgentLoop/CLI/Permission/Context/Memory/MCP/Skill/Command tests；包含 regex 灾难回溯/长度/预算、shell confirmation zero-execution、HTTP SSRF/header 和 DNS pinning fake/local tests。
+- 完成：compileall、targeted pytest、git diff --check 通过。
+- 禁止：范围外特性或真实网络/secret。
 
-每任务均执行：
+## T13：full pytest 与受控 CLI 验收
 
-```powershell
-.venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest <该任务 targeted tests> -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter11-tN"
-```
+- 前置条件：T12。
+- 允许文件：仅失败直接证明的最小修复。
+- 实现：fake provider、临时 home/workspace、fake/local HTTP 流完成 lifecycle。
+- 测试：全量 pytest，记录 skip 原因。
+- 完成：无真实网络、生产 secret、第三方 MCP、tmux 安装、提交或 push。
+- 禁止：扩展本章范围。
 
-出现路径逃逸、启动目录 metadata/SOP 泄露、gate 绕过、静态 `/review` 被 overlay 覆盖、模型静默回退或范围外设计需求时立即停止。
+## 执行顺序
+
+T1 → T2 → T3 → T4 → T5 → T6 → T7 → T8 → T9 → T10 → T11 → T12 → T13。
+
+每个 Phase 必跑 python -m compileall newcode 与该 Phase targeted pytest。任一失败、Hook 可能绕过安全 gate、需要真实网络或范围外文件时停止并请求审批。

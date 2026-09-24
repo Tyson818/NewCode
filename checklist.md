@@ -1,43 +1,41 @@
-# Chapter 11：Skill System 执行清单
+# Chapter 12：Hook 系统——执行清单
 
-> 每项先执行 `.venv\Scripts\python.exe -m compileall newcode`，再使用系统 TEMP basetemp 运行所列 targeted pytest；全量验证不能替代局部验证。
+> 每项必须有命令或可观察行为作为证据。每个 Phase 先通过 compileall 和 targeted pytest；测试 basetemp 固定在系统 TEMP。
 
-- [ ] **T1 模型**：前置无；允许 `newcode/skills/{__init__,types}.py`、类型测试。核对 name/description/tools/mode/history/model/parameters、稳定错误，isolated history 仅 0–20。禁止读文件/Prompt/Agent。验证：`tests/test_skills_types.py`。
-- [ ] **T2 发现与 sandbox**：前置 T1；允许 discovery、发现/路径测试。核对 project>user>builtin、单文件/目录、坏项隔离、digest、普通文件、symlink/绝对/`..` 拒绝；模型启动目录逐项仅 name/description，tools/mode/model/parameters/path/digest/SOP 零泄露。禁止 SOP 全量加载。验证：`tests/test_skills_discovery.py tests/test_skills_paths.py`。
-- [ ] **T3 内置模板**：前置 T1；允许三份内置 `SKILL.md`、发现测试。核对 commit/test 可声明 `run_command`、review 只读；commit 不自动提交；commit/test 的命令调用在 Permission deny 或确认时零绕过。禁止自动脚本/网络。验证：发现及 Permission 回归测试。
-- [ ] **T4 loader/参数**：前置 T1–T2；允许 loader/测试。核对按需 SOP、一次纯文本替换、资源索引、模型与工具校验。禁止 Provider/工具调用。验证：`tests/test_skills_loader.py`。
-- [ ] **T5 state/热更新**：前置 T2、T4；允许 state/测试。核对激活排序、交集、stale、invalid、clear/new/resume 清空。禁止 session/JSONL/Memory 持久化。验证：`tests/test_skills_state.py`。
-- [ ] **T6 Prompt**：前置 T5；允许 prompt modules/builder/测试。核对 active SOP 为第一动态背景、来源/非授权标记、每轮钉入、零 session 写入。禁止改稳定 prompt/启动全量 SOP。验证：`tests/test_prompt_skills.py tests/test_prompt_memory.py`。
-- [ ] **T7 load_skill/gate**：前置 T4–T6；允许 tool/policy/loop、必要 registry、测试。核对 `load_skill` 在 Plan/Do 均可见可调用，不受 whitelist 交集限制，但完整经过 AgentLoop→Permission→串行 Scheduler→executor，且 activation 写操作绝不进入只读并发批；普通工具仍取 Plan/Do 与 whitelist 交集，覆盖 MCP/unknown 工具。禁止 Provider 依赖或 executor 直调。验证：`tests/test_skills_tool.py tests/test_agent_loop_skills.py tests/test_agent_loop_permissions.py tests/test_agent_loop_mcp.py`。
-- [ ] **T8 overlay**：前置 T2、T5、T7；允许 commands 与必要 Chapter 10 文件/测试。核对成功 load 后才注册短命令、`key=value` 参数、冲突、help/completion、隐藏、热更新失效、clear/resume 移除，不改 sealed registry；静态 `/review` 固定行为优先，review Skill 可加载但零 overlay，其他无冲突 Skill 可注册。禁止任意自定义命令。验证：`tests/test_skills_commands.py tests/test_commands_registry.py tests/test_commands_dispatcher.py`。
-- [ ] **T9 shared**：前置 T6–T8；允许 runner/CLI/测试。核对短命令/shared 经 AgentLoop、Context、Memory、session 和工具 gate。禁止直接 Provider。验证：`tests/test_skills_runner.py tests/test_cli_skills.py tests/test_agent_loop_context.py tests/test_agent_loop_memory.py`。
-- [ ] **T10 isolated**：前置 T9；允许 runner/CLI/测试。核对 history=0 零历史、20 上限、最近已脱敏 user/assistant 非工具消息、tool call/result 零携带、主/子 session/memory/artifact/active Skills 零共享、同 gate、安全摘要回流、artifact finally 清理。禁止 child 原文/工具输出持久化、远端会话。验证：runner/CLI/Context/Permission/MCP 测试。
-- [ ] **T11 生命周期**：前置 T8–T10；允许 CLI/测试和失败证明的最小文件。核对刷新、clear/new/resume、EOF/exit/异常、cleanup 隔离。禁止改 Provider 配置或旧命令语义。验证：`tests/test_cli_skills.py tests/test_cli_session.py tests/test_cli_context.py tests/test_cli_memory.py tests/test_cli_mcp.py`。
-- [ ] **T12 验收**：前置 T1–T11；仅最小修复。核对静态 import、路径、敏感值、无网络/RAG/同步/动态执行；记录 skip。验证：全量 pytest、compileall、diff check、fake CLI。
+## Phase 1：T1–T3
 
-## Phase 验证
+- [ ] T1 模型与诊断。依赖：无。允许：hooks/__init__.py、types.py、test_hooks_types.py。核对 stable ID、event/action、仅 before_tool 的规则级 deny、once/async、五种 scope identity、安全 diagnostics 和 JSON-safe context。禁止文件、工具、Provider、MCP、网络。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_hooks_types.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t1"。证据：非法值仅给安全码。
+- [ ] T2 loader、sandbox 和合并。依赖：T1。允许：hooks/loader.py、__init__.py、test_hooks_loader.py。核对 user/project YAML、普通文件/路径边界、单条隔离、project 覆盖与顺序；仅 user 可启用 network/定义 allow_hosts；project network 字段拒绝，project action 仅精确引用 user host。禁止改 AppConfig、Permission loader、CLI。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_hooks_types.py tests/test_hooks_loader.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t2"。证据：project 不能启用 HTTP 或扩大 host allowlist，坏 YAML 不阻断有效规则。
+- [ ] T3 条件。依赖：T1。允许：hooks/conditions.py、types.py、test_hooks_conditions.py。核对 exact/glob/regex/not、单层 all/any、缺字段和 skip；regex pattern ≤256 字符、目标字段 ≤1024 字符（message.summary ≤512），仅使用线性时间安全子集/实现，不对项目输入运行无界 Python re。测试灾难性回溯形态、长度边界、超时/预算拒绝且 AgentLoop 不受阻。禁止改 Permission 匹配。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_hooks_types.py tests/test_hooks_loader.py tests/test_hooks_conditions.py tests/test_permissions_rules.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t3"。证据：越界/不安全 regex 仅使规则无效或不匹配，Permission 回归通过。
 
-| Phase | 任务 | targeted pytest |
-|---|---|---|
-| 1 | T1–T3 | `test_skills_types.py test_skills_discovery.py test_skills_paths.py` |
-| 2 | T4–T6 | `test_skills_loader.py test_skills_state.py test_prompt_skills.py test_prompt_memory.py` |
-| 3 | T7–T8 | `test_skills_tool.py test_agent_loop_skills.py test_skills_commands.py test_commands_registry.py test_commands_dispatcher.py test_agent_loop_permissions.py test_agent_loop_mcp.py` |
-| 4 | T9–T11 | `test_skills_runner.py test_cli_skills.py test_cli_session.py test_cli_context.py test_cli_memory.py test_cli_mcp.py` |
-| 5 | T12 | 全量 pytest、compileall、diff check、fake CLI fixture |
+Phase 1 退出门：T1–T3 全部通过；无 action 执行，路径未越界。
 
-每个 Phase：
+## Phase 2：T4–T6
 
-```powershell
-.venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest <上表 tests> -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter11-phaseN"
-```
+- [ ] T4 引擎。依赖：T1–T3。允许：hooks/engine.py、types.py、__init__.py、test_hooks_engine.py。核对声明顺序、once scope 映射：system=process ID；session=ChatSession ID；turn=session ID+turn index；message=session ID+message ID；tool=session ID+tool call ID；origin guard、异常隔离、同步 first rule-level deny 且跳过其 action。clear/new/resume 建新 session scope，不持久化、不跨 process。禁止执行 action、改 ToolCall、接入 AgentLoop/CLI。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_hooks_types.py tests/test_hooks_loader.py tests/test_hooks_conditions.py tests/test_hooks_engine.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t4"。证据：分别验证五种 scope、reset、deny/内部失败区别及零递归。
+- [ ] T5 actions、prompt queue、HTTP。依赖：T4。允许：hooks/actions.py、lifecycle.py、engine.py、types.py、Hook action tests。核对单 worker/有界队列、before_tool 禁 async；每个 injection 只进入其 event 之后下一次主请求；同步 before_model_request 在最终 messages 构造前发射并进入当前请求；其他 event injection 进入后续请求；async 错过当前请求不得改已构造/发送 messages；session end 可丢弃。HTTP 测试固定 header allowlist，拒绝 Authorization/Cookie/Proxy-Authorization；测试 localhost、私有/IP literal、loopback/link-local/reserved 与 DNS 返回非公网地址全部在发请求前拒绝，验证连接 pin/peer 检查；仅 user 开启/授权，project 不得扩大。结果只进诊断。禁止真实网络、直接 subprocess、Provider/MCP client。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_hooks_engine.py tests/test_hooks_actions.py tests/test_hooks_loader.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t5"。证据：时序、单次消费、timeout、队列满、shutdown，SSRF 拒绝时 fake transport 请求数为零。
+- [ ] T6 shell gateway。依赖：T5。允许：hooks/actions.py、lifecycle.py、必要时 permissions/manager.py；tests/test_hooks_actions.py，必要时 test_agent_scheduler.py、test_permissions_manager.py。核对固定 command 经 Permission→ToolScheduler→executor，hard deny/sandbox/confirm 优先、输出截断遮蔽。Hook 调用 Permission 非交互检查路径；require_confirmation 的 sync/async 均不得调用 CLI/HITL confirmer、不得视为 allow、不得执行或自动批准，action 安全失败只记受限诊断；普通 Agent 工具仍走既有 confirmer。禁止放宽 run_command 或 Permission 语义。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_hooks_actions.py tests/test_agent_scheduler.py tests/test_permissions_manager.py tests/test_permissions_sandbox.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t6"。证据：confirmation 分支命令执行计数为零、Hook confirmer 调用数为零、既有 Agent confirmer 行为通过。
 
-## 最终验收证据
+Phase 2 退出门：before_tool 同步串行，async cleanup 有界，无 shell/HTTP/subagent 旁路。
 
-- [ ] 三级发现、覆盖、坏项隔离、frontmatter、参数、资源 sandbox、内置模板均有可重复证据。
-- [ ] 模型启动目录仅 name/description；完整 SOP 仅成功按需加载，active SOP 每轮在最前动态注入且不写 session/JSONL/Memory/artifact。
-- [ ] `load_skill` 在 Plan/Do 均可见、串行且完整经过 AgentLoop、Permission、ToolScheduler、executor；shared、isolated 均保持 MCP、Context 和会话安全，普通工具多 Skill 白名单交集稳定。
-- [ ] 短命令不覆盖静态命令；静态 `/review` 固定行为优先、review Skill 可加载但零 overlay；帮助/补全不泄露隐藏或敏感信息、clear/new/resume 清激活。
-- [ ] isolated 覆盖 history=0、20 边界与仅非工具消息；commit/test 的 `run_command` 在 deny/confirmation 时保持零绕过。
-- [ ] 指定模型失败无静默回退；无网络、市场、同步、RAG、向量库、动态脚本或命令级权限绕过。
-- [ ] 全量结果、所有 skip 原因与 fake CLI 验收已记录；未使用 tmux、真实网络、生产 secret 或第三方 MCP。
+## Phase 3：T7–T9
+
+- [ ] T7 turn/message/model 事件。依赖：T4–T6。允许：agent/loop.py、prompt/modules.py、必要时 agent/events.py、test_agent_loop_hooks.py、test_prompt_hooks.py。user_message_received 只允许可选 message.summary：最多 512 字符，先遮蔽敏感值/敏感键再截断；exact/glob/regex 只作用摘要；context 永无完整用户消息、prompt、tool result、raw exception。核对事件顺序和精确 injection timing。禁止 Provider Hook import、Context/Memory summary 递归、session/JSONL/artifact/log/CLI 持久化 injection。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_agent_loop_hooks.py tests/test_prompt_hooks.py tests/test_prompt_builder.py tests/test_agent_loop_context.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t7"。证据：before_model injection 进入当前请求、其他/async 进入后续请求、单次消费及摘要边界。
+- [ ] T8 tool events 和结果隔离。依赖：T7。允许：agent/loop.py、必要时 agent/scheduler.py、相关 tests。核对 mode/Skill/Permission allow 后 before_tool，只有合法 deny 产生 hook_tool_denied observation；shell 内部 ToolResult 仅供 runner 判断；shell/HTTP/prompt/subagent 成功、拒绝、timeout、失败只进受限脱敏诊断，不入主 ChatSession、不回灌；after_tool 顺序稳定。禁止 Hook allow、参数改写、并发 before_tool、MCP/Permission 改动。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_agent_loop_hooks.py tests/test_agent_scheduler.py tests/test_agent_loop_permissions.py tests/test_agent_loop_mcp.py tests/test_agent_modes.py tests/test_skills_tool.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t8"。证据：Plan、hard deny、sandbox、Permission、whitelist 全优先，非 deny 结果零模型可见。
+- [ ] T9 AgentLoop 组合回归。依赖：T7–T8。允许：测试；失败直接证明时最小 Hook/AgentLoop 修复。核对 Context、Memory、MCP、Skill、scheduler、Plan/Do、异常路径。禁止为便利改 CLI/Provider。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_agent_loop_hooks.py tests/test_agent_loop.py tests/test_agent_loop_context.py tests/test_agent_loop_memory.py tests/test_agent_loop_mcp.py tests/test_agent_loop_permissions.py tests/test_agent_modes.py tests/test_skills_tool.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t9"。证据：无 Hook 顺序不变。
+
+Phase 3 退出门：事件安全且不递归，injection 非持久化，所有既有 gate 优先。
+
+## Phase 4：T10–T11
+
+- [ ] T10 CLI load 与 session lifecycle。依赖：T2、T7–T9。允许：cli.py、test_cli_hooks.py、必要时 test_cli_session.py。核对 system/session events、clear/resume 旧 scope 结束/新 scope 创建、once/pending reset。禁止新命令或改变 review、plan、do、compact、Command Registry。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_cli_hooks.py tests/test_cli_session.py tests/test_cli_commands.py tests/test_cli_context.py tests/test_cli_skills.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t10"。证据：archive 无 Hook state/injection。
+- [ ] T11 finally shutdown。依赖：T10。允许：cli.py、必要时 hooks lifecycle/actions、CLI lifecycle tests。核对 EOF、exit、KeyboardInterrupt、异常、正常退出均 checkpoint→Hook→Memory→Context→MCP，单失败不阻断。禁止 tmux 安装、真实网络、重排既有内部 cleanup。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_cli_hooks.py tests/test_cli_context.py tests/test_cli_memory.py tests/test_cli_mcp.py tests/test_cli_skills.py tests/test_cli_tool_flow.py -q --basetemp "$env:TEMP\newcode-pytest-chapter12-t11"。证据：无 worker/跨 session state 遗留。
+
+Phase 4 退出门：所有 CLI 退出路径隔离，既有命令与生命周期无回归。
+
+## Phase 5：T12–T13
+
+- [ ] T12 targeted 回归与审计。依赖：T1–T11。允许：原则仅测试，失败直接证明时最小修复。核对 Provider 独立、Hook 无直接执行旁路、无递归/持久化、路径与 HTTP 安全；测试 message.summary 512 字符、所有 once scope、注入时序、non-deny 结果隔离、user/project network merge 与 project 无法扩大 host；regex 灾难回溯拒绝/有界、长度和超时；shell confirmation 零执行；HTTP header allowlist、私网/IP literal/DNS 非公网拒绝时零请求。禁止范围外特性、真实网络、secret。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest tests/test_hooks_types.py tests/test_hooks_loader.py tests/test_hooks_conditions.py tests/test_hooks_engine.py tests/test_hooks_actions.py tests/test_agent_loop_hooks.py tests/test_cli_hooks.py tests/test_agent_loop.py tests/test_cli.py tests/test_permissions_manager.py tests/test_context_manager.py tests/test_memory_service.py tests/test_mcp_manager.py tests/test_skills_tool.py tests/test_commands_dispatcher.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter12-t12"。另运行 git diff --check。证据：每个 skip 有平台原因。
+- [ ] T13 全量和受控 CLI 验收。依赖：T12。允许：仅失败直接证明的最小修复。用 fake provider、临时 home/workspace、fake/local HTTP 走配置→session→deny→injection→exit。禁止真实网络、生产 secret、第三方 MCP、tmux、commit/push/Git 配置。Compileall：.venv\Scripts\python.exe -m compileall newcode。Pytest：.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter12-final"。证据：全量通过，skip 原因记录。
+
+最终退出门：compileall、Chapter 12 targeted、full pytest、git diff --check 全部通过，安全和非目标边界保持。

@@ -1,86 +1,86 @@
-# Chapter 11：Skill System —— 让 NewCode 可复用 AI 操作
+# Chapter 12：Hook 系统——生命周期钩子与自动化
 
-## 背景与目标
+## 目标
 
-NewCode 已有请求级动态背景、Context Management、Plan/Do、Permission、ToolScheduler、MCP、会话归档、自动记忆及封存的命令注册中心。本章引入本地、受控、可复用的 Skill：Skill 用 Markdown SOP 表达重复 AI 操作，在需要时才加载完整内容，并且绝不成为绕过既有工具与安全边界的第二执行通道。
+NewCode 新增声明式 Hook 系统：在受控生命周期节点按 event、可选 if 和 action 执行固定自动化。它服务用户和项目自动化，但绝不成为 Provider、Permission、Plan/Do、workspace sandbox、ToolScheduler、MCP、Context、Memory、Skill 或 Command 的旁路。
 
-目标是发现可信本地 Skill、按需激活、收窄工具可见性、支持 shared 与 isolated 两种受控执行，并提供内置 commit、review、test 模板。Skill 不等于任意脚本、远端插件或命令扩展平台。
+## 配置、规则与加载
 
-## 功能需求
+配置入口固定为用户级 ~/.newcode/hooks.yaml 与项目级 <workspace>/.newcode/hooks.yaml，均是顶层 hooks: YAML 列表；沿用现有独立 Permission YAML loader 形态，不向当前 AppConfig 假定未有字段。缺失文件代表空规则。项目配置必须由已解析 workspace 根推导，拒绝符号链接、父目录逃逸、根外路径和非普通文件。
 
-### F1：Skill 格式、参数与资源包
+每项规则为 YAML object，包含稳定唯一 id、必填 event、必填 action，以及可选 if、once、async。仅 before_tool 还可有规则级 deny（含有限静态 reason）；deny 不是第五种 action，命中时直接拒绝且不执行该条 action。示例字段为 id: format_after_write；event: after_tool；if: all 包含 field tool.name 和 exact write_file；action type shell、command git status --short、timeout_seconds 10。
 
-单文件 Skill 是 YAML frontmatter 加 Markdown SOP 正文。frontmatter 必填：唯一 `name`、一句 `description`、`tools` 白名单、`mode`（`shared` 或 `isolated`）；`isolated` 必填整数 `history_messages`，范围为 `0–20`；可选 `model` 与 `parameters`。名称规范化使用 `casefold()`，只允许 `[a-z][a-z0-9-]{0,63}`。`description` 不得承载 SOP、secret 或路径凭据。
+- ID 必须匹配 [a-z0-9][a-z0-9_-]{0,63}，不自动生成，用于覆盖、once、诊断和测试。
+- action type 只允许 shell、prompt_injection、http_request、subagent；deny 只允许 before_tool，其他 event 使用 deny 即为非法规则。
+- 不合法字段、事件、action、条件、ID、timeout 或单条 YAML 仅产生安全诊断并跳过该条，绝不阻断其他规则或 CLI。
+- 有效顺序：先按用户文件声明顺序取未被项目同 ID 覆盖的规则，再按项目文件声明顺序取项目规则。项目同 ID 覆盖用户；同源重复 ID 首条保留、后续隔离为 hook_rule_invalid。无 priority，无模型、命令或运行时动态注册。
+- 配置仅 CLI 启动时读取；本章不做热更新。
 
-正文可使用已声明参数的 `{{parameter_name}}` 占位符。替换是纯文本、一次性、无 shell/模板表达式/文件包含/代码执行；未声明、缺失、重复或额外参数安全失败。短命令参数固定为以 Unicode 空白分隔的 `key=value`，不支持引号、环境变量或 shell 求值；`load_skill` 使用 JSON object 参数。参数值作为用户提供内容明确标记，不自动获得工具权限。
+## 事件与安全 context
 
-目录型 Skill 的入口固定为 Skill 根内 `SKILL.md`；根内可包含模板、示例、辅助脚本和参考文档。辅助脚本仅作为索引资源，绝不因加载或激活自动执行。所有入口和资源必须为普通文件，解析后的真实路径必须位于该 Skill 根内；绝对路径、`..`、符号链接逃逸、根外资源和不安全文件均拒绝。资源索引只包含安全相对路径、类型与大小摘要，不默认读取正文。
+Hook context 只能含 allowlisted、JSON-safe、已脱敏且受长度限制的快照；不得含 API key、env、headers、URL credential、完整 prompt、完整工具输出、远端响应或 stack trace。唯一允许匹配的用户文本字段是 user_message_received 中可选的 message.summary：最多 512 个 Unicode 字符，先用既有 sensitive-value/敏感键规则遮蔽，再截断；exact、glob、regex 都仅作用于该脱敏截断摘要字符串。其他条件字段为 event、mode、session.id、turn.index、message.id、tool.name、tool.call_id、tool.read_only、安全 normalized args 摘要、tool.result.ok、tool.error_code、stop.reason 和安全 exception.kind。完整用户消息、完整 prompt、完整工具结果和原始异常永远不在条件 context 中。
 
-### F2：三级发现、覆盖与容错
+| 事件 | 精确位置 | 可拦截 | 内容 |
+|---|---|---:|---|
+| system_start / system_end | CLI 服务启动完成后 / 顶层 finally、服务 shutdown 前 | 否 | workspace、服务、结束安全摘要 |
+| session_start / session_end | ChatSession 与 Context 就绪后 / checkpoint 前；clear/resume 的旧 session 也 end | 否 | session、结束原因 |
+| turn_start / turn_end | AgentLoop 前 / final answer 或 stopped 已决定后 | 否 | mode、轮次、stop 摘要 |
+| user_message_received | user message 已加入 ChatSession 后 | 否 | 可选 message.summary，最多 512 字符，遮蔽后截断 |
+| before_model_request / after_model_response | Context prepare 后、stream 前 / collector 完成、工具决策前 | 否 | iteration、请求或响应摘要 |
+| before_tool / after_tool | mode、Skill whitelist、Permission 已 allow 后、scheduler/executor 前 / ToolResult 写入会话并按原顺序发出后 | 仅前者 | ToolCall 或结果摘要 |
+| turn_cancelled / turn_exception | 取消与非取消异常路径 | 否 | 取消/异常类别 |
 
-发现根按优先级为：项目 `<workspace>/.newcode/skills/`、用户 `~/.newcode/skills/`、内置 `newcode/resources/skills/`。每根只识别直接子项中的 `*.md` 单文件及 `<directory>/SKILL.md` 目录包；不递归把模板或参考文档误作独立 Skill。
+Hook action、后台任务、日志和 deny 回灌都带 hook-origin 抑制标记，不再次触发 Hook。
 
-相同规范名的有效 Skill 以项目覆盖用户、用户覆盖内置。低优先级版本保留为安全诊断的来源类别，不在帮助、短命令或模型发现表中重复出现。单项读取、frontmatter、schema、路径、模型、资源或工具白名单校验失败时跳过该项，记录不包含正文、secret、绝对路径或完整异常的稳定诊断，不阻断其他 Skill。
+## 条件
 
-发现内部可保留 `SkillMetadata` 以供本地校验和后续按需加载；但启动及刷新时注入模型的 Skill 目录严格只包含每个有效 Skill 的 `name` 与一句 `description`。目录不得包含 tools、mode、model、参数定义、文件路径、digest、完整 SOP、资源正文或参数值；`load_skill` 本身的工具 schema 可按既有 ToolRegistry 正常提供。
+条件只匹配安全 context，不执行 Python、表达式字符串、模板或文件读取。叶子为 field 加恰好一个 exact、glob 或 regex，可选 not true；组合为恰好一个 all 或 any，组合内仅有叶子，禁止混用或递归嵌套。缺字段或条件不匹配只是 skip。
 
-### F3：两阶段加载、激活与热更新
+exact/glob 复用 Permission 的规范化和 fnmatchcase 思路。现有 Permission 仅支持 exact/glob；regex/反向是独立 Hook matcher 新能力，绝不改变 Permission rule 解析或决策。regex 编译失败使单条规则无效且只给安全码。
 
-`load_skill` 是系统级内置控制工具。它在 Plan Mode 与 Do Mode 均可见且可调用，接受已发现 Skill 名称及参数，在需要时读取并校验完整 SOP、做参数替换、生成安全资源索引，并把成功版本激活到当前会话。它不受已激活 Skill 的工具白名单限制，但仍完整经过 ToolRegistry、AgentLoop、PermissionManager、ToolScheduler 与 executor，以及既有 MCP 与错误脱敏边界；不得直接调用 loader 或绕过工具执行链。它会改变 activation state，因此一律串行调度，不得作为只读工具加入并发批。
+regex pattern 最长 256 Unicode 字符；被匹配的字符串字段最长 1024 Unicode 字符，message.summary 仍受 512 字符上限约束。不得对不可信项目配置使用无界 Python re。实现必须将受限 regex 子集编译为有线性时间上界的 matcher；子集仅允许字面字符、转义字面字符、字符类、点、^/$ 锚点、? 量词和上限不超过 256 的有界 {m,n} 量词，拒绝分组、反向引用、前后查找、交替、*、+ 和嵌套/歧义量词。超长 pattern/字段、子集之外语法或执行预算超限使对应规则无效或本次不匹配，只记录安全诊断，不能阻断 AgentLoop。
 
-激活后的完整 SOP、参数替换结果、来源类别、模式、白名单及 digest 在每轮请求的动态环境上下文中置于所有普通动态背景之前，明确标为“受控 Skill 指令，不授予权限”。它不写入 ChatSession、JSONL、Memory 或 Context artifact。可同时激活多个 Skill，按激活先后稳定排序。
+## Actions 和安全边界
 
-每个主回合前进行轻量发现刷新：新增有效 Skill 可被 `load_skill` 发现；有效内容变更使现有激活标记为 stale，但当前激活快照继续用于当前会话，只有再次 `load_skill` 才替换为新版本；已删除、变为无效或不再通过安全校验的激活立即失效并从动态背景、白名单与短命令状态移除。`/clear`、新 ChatSession 及 `/resume` 均以空激活集开始；激活状态不写入持久会话。
+### before_tool deny
 
-### F4：两种执行模式与模型选择
+仅同步 before_tool 的规则级 deny 可拒绝；该事件配置 async true 即非法。首个命中的合法 deny 停止剩余 before_tool rules，且不运行该条 action，生成 hook_tool_denied 的既有 ToolResult failure/observation，以原 call ID 和原始排序回灌模型。
 
-**shared** Skill 在当前 ChatSession/AgentLoop 内运行。它将已激活 SOP 放入请求背景，用户通过该 Skill 的受控短命令或模型 `load_skill` 后继续正常 AgentLoop；工具结果和最终回答留在主会话。
+mode 不可见、Skill whitelist、hard denylist、workspace sandbox、explicit Permission deny 与 confirmation deny 都在 Hook 前发生且优先。Hook 只能拒绝已允许调用，不能修改参数、不能 allow、不能复活被拒绝调用。Hook timeout、异常、skip、subagent placeholder 不属于 deny。
 
-**isolated** Skill 创建独立受控 ChatSession 与 ContextManager，`history_messages` 只能为 `0–20`：`0` 表示不携带任何主会话历史；大于 `0` 时，仅按最近顺序携带最多 N 条已脱敏的 user/assistant 非工具消息。工具调用与工具结果一律不携带。子会话不共享主会话的 session、Memory、artifact 或已激活 Skill 集；其激活状态仅含本次 isolated Skill 的独立快照。它仍使用相同 workspace、ToolRegistry、PermissionManager、Plan/Do、ToolScheduler、MCP 生命周期和 Context 策略。完成或失败后清理子 Context artifact；只将脱敏后最多 4,000 字符、标明来源的安全摘要回流主会话，不额外发起第二次摘要 LLM 请求。绝不回流子会话原文、完整工具输出、headers、env、URL credential、完整异常或内部链路。
+### shell
 
-可选 `model` 只能引用当前 Provider 公开声明且应用配置允许的模型名；它不能直接构造 Provider、URL、key 或网络客户端。若指定模型不可用、切换失败或 Provider 不支持受控切换，整个 Skill 加载/执行以 `skill_model_unavailable` 安全失败，**不静默回退**；省略 `model` 时继续使用当前主模型。
+shell 只接受 YAML 固定非空 command 与受限 timeout；禁止任何变量、模板、format 或用户消息插值，检测到插值标记即加载失败。它构造 run_command ToolCall，经现有 PermissionManager、ToolScheduler、executor，在 workspace 下执行；hard deny、sandbox、confirmation、timeout 和遮蔽仍生效。Hook 使用 PermissionManager 的非交互检查路径，保留当前规则、模式、hard deny 和 sandbox 判断，但对 require_confirmation 采用 deny-by-default，不调用 CLI/HITL confirmer。若 Permission 结果是 require_confirmation，Hook 不等待输入，也不将其视为 allow；该命令零执行，action 安全失败并仅记录受限诊断。同步与 async shell 都遵守此规则，任何路径不得绕过或自动批准 Permission；普通 Agent 工具仍使用既有交互确认语义。Hook 对 stdout、stderr、详情和日志再截断脱敏，且绝不改 MCP 或工具参数。
 
-### F5：工具白名单与组合
+### prompt injection 时序
 
-加载时，frontmatter 白名单中的每一项必须存在于启动后最终 ToolRegistry（含已验证 MCP adapter）；任何不存在项使该 Skill 以 `skill_tool_unknown` 失败。激活 Skill 后，主/子 AgentLoop 可见且可执行的普通工具集合为：当前 Plan/Do 可见集合与所有激活 Skill 白名单的**交集**。没有激活 Skill 时保持原有工具集合。空交集是有效的最小权限状态。
+每个 injection 只消费一次，且只进入其产生 Hook event 之后的下一次主模型请求。before_model_request 必须在最终主请求 messages 构造之前同步发射，因此该事件的同步 injection 可进入当前即将发送的请求。其他事件（包括 after_tool、after_model_response）产生的 injection 只能进入后续主请求。异步 Hook 若在当前请求构造/发送之后完成，不能修改已构造或已发送的请求；该 injection 仅可排队给下一次请求，或在 session 结束时丢弃。没有后续主请求时丢弃。
 
-`load_skill` 是唯一系统例外：在 Plan/Do 两种模式始终可见，不被 Skill 白名单交集移除，且作为 activation-state 写操作始终串行；它仍走 Permission、ToolScheduler 与 executor。除该例外外，加载后的实际可见/可执行普通工具严格为当前 Plan/Do 工具集合与所有已激活 whitelist 的交集。多个 Skill 按激活顺序排列指令，白名单按集合交集组合；顺序不改变结果。硬 denylist、workspace sandbox、explicit deny、Permission confirmation、Plan Mode、ToolScheduler 串行规则及 MCP 的既有限制优先且不可绕过。
+action 仅接收有限静态文本，进入目标请求的动态背景，位于 active Skill 后、项目指令前，并标识 Hook 背景、非授权、需工具核验。请求后或无后续请求时丢弃；绝不写入 ChatSession、JSONL、Memory、Context artifact、日志或 CLI 原文。
 
-### F6：短命令、内置模板与 Chapter 10 集成
+### 非拦截 action 结果
 
-每个 **成功加载并激活** 的无冲突 Skill 自动获得会话级受控短命令 `/<normalized-skill-name>`；发现本身不注册 slash 命令。该命令不是用户任意注册 API，没有别名、不能携带 handler 或权限规则，且只接受已声明的 `key=value` 参数后交给既有 AgentLoop。Chapter 10 封存静态命令始终优先：静态 `/review` 保持原有固定行为，内置同名 `review` Skill 仍可通过 `load_skill` 加载，但绝不创建或覆盖 `/review` Skill overlay，记录 `skill_command_conflict`。与其他静态/退出/已激活 Skill 名称冲突时同样不注册短命令；其他无冲突 Skill 仍按上述语法生成短命令。
+只有 before_tool 的合法规则级 deny 可以形成模型可见的 hook_tool_denied ToolResult observation。shell、HTTP、prompt injection、subagent placeholder 的成功、拒绝、超时或失败结果均不得写入主 ChatSession 或回灌模型，只能形成受限、脱敏 Hook diagnostics/log。shell gateway 经既有 Permission→ToolScheduler→executor 得到的内部 ToolResult 仅供 Hook runner 判断和产生日志摘要，不得加入主 Agent 工具历史。
 
-短命令在复合命令视图中遵守帮助、隐藏和 Tab 补全规则；activation 变化生成新的不可变 overlay，不修改 Chapter 10 封存静态注册表。失效 Skill 的短命令、帮助和补全候选立即移除；热更新后的短命令保持当前 snapshot，须重新 `load_skill` 才替换为新 SOP。`/clear`、新会话与 resume 移除激活及其短命令。
+### HTTP 和 subagent
 
-内置提供三个受控模板：`commit`（`read_file`、`find_files`、`search_code`、`run_command`）与 `test`（`read_file`、`find_files`、`search_code`、`run_command`）可使用命令工具，因而不是只读模板；`review`（`read_file`、`find_files`、`search_code`）维持只读 whitelist。所有模板的每次工具调用仍须经过既有 Plan/Do、Permission、workspace sandbox、ToolScheduler 与 MCP 边界；“commit”模板绝不自动提交。
+HTTP 默认禁用。只有用户级 ~/.newcode/hooks.yaml 中的 network.enabled true 可启用 HTTP，且只有用户级 network.allow_hosts 可定义 host allowlist；项目配置不能启用 HTTP、不能定义或新增/扩大 allowlist。用户/project 配置合并时，project network 字段一律非法；project HTTP action 的 HTTPS host 必须与用户 allowlist 项精确匹配。仅 GET/POST、有限 timeout/请求/响应字节；禁止重定向、cookie/代理继承、复杂 OAuth 与 URL credential。可用 header 名称固定为 Accept、Content-Type、User-Agent；禁止 Authorization、Cookie、Proxy-Authorization 及其他凭证、身份验证、代理或 hop-by-hop header。精确匹配 allowlist 后，还必须拒绝 localhost、未指定、loopback、link-local、private、multicast、保留及其他非公网 IP。DNS 必须在请求时解析并验证全部候选地址，连接必须 pin 到已验证的公网地址并验证实际 peer，不能只检查 URL hostname 后让 HTTP client 自行解析或重新解析。任一解析结果非公网、解析失败或无法 pin/验证 peer 时不得发出请求。响应、错误、headers、URL credential 和状态只可进入脱敏、截断 diagnostics/log，绝不进入模型、主 ChatSession 或任何持久化内容。测试只能 fake transport 或 local fixture。
 
-### F7：安全、错误与关闭
+subagent action 在本章只返回 hook_subagent_not_available，零创建、零调度、零模拟 SubAgent、Worktree 或 Agent Teams。
 
-对外错误仅使用稳定码和安全摘要，包括 `skill_discovery_failed`、`skill_frontmatter_invalid`、`skill_name_invalid`、`skill_resource_unsafe`、`skill_tool_unknown`、`skill_parameter_invalid`、`skill_parameter_missing`、`skill_not_found`、`skill_load_failed`、`skill_command_conflict`、`skill_model_unavailable`、`skill_execution_failed`、`skill_isolated_failed`。诊断仅含来源级别、规范名和码；不得泄露 SOP、参数、资源内容、secret、headers、env、URL credential、绝对路径或 stack trace。
+## 可靠性与会话
 
-Skill 刷新、加载、激活、isolated 子会话与清理失败必须彼此隔离，不能阻断 CLI 的既有 checkpoint、Memory shutdown、Context artifact cleanup 与 MCP shutdown。禁止真实网络、远端下载、市场分发、版本管理、团队同步、跨设备同步、动态脚本执行、命令级权限绕过、RAG 或向量库。
+- once key 为 (rule_id, event, scope instance)，不持久化、不跨 CLI 进程恢复；scope 映射固定为：system 事件→当前 CLI process ID；session 事件→ChatSession ID；turn 事件→ChatSession ID + turn index；message 事件→ChatSession ID + message ID；tool 事件→ChatSession ID + tool call ID。clear、新会话、resume 都建立新 session scope，并清空 pending injection；旧 session 的结束事件仍在旧 scope 内完成。
+- async true 进入单 worker、有界、稳定顺序队列；每个 action 最多一次且有 timeout。before_tool 永远同步串行。
+- EOF、exit、KeyboardInterrupt、异常和正常退出停止接收后台任务、有限等待再安全放弃。cleanup 顺序是 checkpoint 后、Memory/Context/MCP cleanup 前；Hook cleanup 失败不阻断后续。
+- action 失败、timeout、队列满或内部异常只产生安全诊断，不中断主流程；合法 deny 例外。
 
-## 非功能要求
+## 错误、边界与非目标
 
-- 使用 fake provider、临时 workspace/user-home、临时内置资源、fake MCP/tool/permission/UI fixture 测试；不使用生产 secret、真实第三方 MCP 或网络。
-- 文件/资源大小、索引条数和隔离历史均有固定上限：单入口 SOP 最大 64 KiB、每包安全资源索引最多 200 项/1 MiB 元数据、isolated `history_messages` 为 0–20。
-- 每 Phase 必跑 `python -m compileall newcode` 与 targeted pytest；最终运行全量 pytest、`git diff --check` 和无网络受控 CLI 验收。
+外部仅暴露 hook_config_invalid、hook_rule_invalid、hook_event_invalid、hook_condition_invalid、hook_action_invalid、hook_timeout、hook_action_failed、hook_tool_denied、hook_http_disabled、hook_http_denied、hook_subagent_not_available、hook_shutdown_timeout。日志最多含 rule ID、event、action 类型和受限统计；不得泄露规则原文、命令全文、用户全文、secret、env、headers、URL credential、完整工具结果/远端响应/stack trace。
 
-## 不做的事项
+Provider 不理解 Hook；Hook 不替代 Command、Skill、MCP、Permission、Context、Memory。六个内置工具、MCP、Skill whitelist、静态命令与 session JSONL 格式保持兼容。不做 SubAgent、Worktree、Agent Teams、任意 Python/模板执行、动态命令、市场/下载、复杂 OAuth、网络 sandbox、RAG、向量库、团队同步或 Hook 执行历史持久化。
 
-- Skill 市场、远端下载、版本管理、签名/发布、团队或跨设备同步；
-- 动态脚本执行、目录资源自动执行、任意用户自定义 slash 命令；
-- 新 Provider/复杂模型路由、静默模型回退、网络 sandbox；
-- 命令级权限或绕过 AgentLoop、Context、Permission、ToolScheduler、MCP 的执行路径；
-- RAG、向量数据库、把所有 SOP 预置到 Prompt。
+## 验收标准与测试范围
 
-## 验收标准
-
-- AC1：单文件与目录 Skill 的 schema、参数替换、资源 sandbox、资源索引及错误脱敏通过。
-- AC2：三级发现、覆盖、冲突、坏项隔离、热更新/失效语义通过；模型启动目录逐项严格只含 name 与 description，绝不泄露其他 metadata。
-- AC3：`load_skill` 仅在成功后按需读取并激活 SOP，完整指令每轮最显眼动态注入而不写入 session/JSONL；clear/new/resume 清空激活。
-- AC4：shared 与 isolated 模式均保持 Context、Plan/Do、Permission、ToolScheduler、MCP 与会话边界；isolated 覆盖 `history_messages=0`、20 边界及仅非工具消息携带，并只回流安全摘要。
-- AC5：工具白名单未知引用失败，多 Skill 交集稳定；`load_skill` 在 Plan/Do 均可见、串行且完整经过 Permission/Scheduler/executor。
-- AC6：短命令、静态命令冲突、隐藏、补全、热更新和清除语义通过；静态 `/review` 优先、同名 review Skill 可加载但零 overlay；commit/test 的 `run_command` 在 deny/confirmation 下零绕过。
-- AC7：可选模型仅走 Provider 公开受控能力，不可用安全失败且不回退。
-- AC8：全量 `pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter11-final"`、compileall、diff check 与 fake CLI 验收通过。
+必须覆盖 YAML 缺字段、非法 event/action、单条隔离；user/project 合并与顺序；exact/glob/regex/not/all/any；regex 256 字符 pattern/1024 字符字段限制、安全子集、线性时间预算、灾难性回溯样例拒绝/有界完成且不阻断 AgentLoop；message.summary 字段脱敏、512 字符边界及三种 matcher；每个事件安全 context；before_tool deny 回灌和所有既有 gate 优先；system/session/turn/message/tool 五种 once scope、scope reset 和不跨进程；before_model 同步 injection 进入当前请求、其他同步事件进入后续请求、async 错过当前请求、单次消费和 session 结束丢弃；非 deny action 结果不得进模型/主历史；shell/HTTP 的 Permission、内部 ToolResult 隔离、确认时零执行、超时、遮蔽与 fake fixture；HTTP 固定 header allowlist、凭证/代理 header 拒绝、loopback/private/link-local/reserved IP literal 与 DNS 非公网解析拒绝且无请求发出、连接 pin/peer 验证；用户级网络授权、精确 host 匹配、project 无法启用或扩大；subagent 零创建；CLI clear/resume/退出；Context、Memory、MCP、Skill、Command、Plan/Do、Permission、scheduler 与完整 pytest 回归。

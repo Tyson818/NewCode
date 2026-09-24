@@ -9,6 +9,7 @@ import pytest
 
 from newcode import cli
 from newcode.config import AppConfig, ConfigError, load_config
+from newcode.hooks.types import HookLoadResult, HookNetworkPolicy
 from newcode.permissions.confirmer import CliPermissionConfirmer
 from newcode.permissions.manager import PermissionManager
 from newcode.permissions.modes import decision_for_risk
@@ -26,6 +27,13 @@ from newcode.providers.base import TextDelta, ToolCallEvent
 from newcode.session import ChatSession
 from newcode.tools.registry import ToolRegistry
 from newcode.tools.types import JsonObject, ToolCall, ToolContext, ToolResult, ToolSpec
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hook_config(monkeypatch):
+    """权限链回归使用空 Hook 配置，避免依赖本机 home。"""
+
+    monkeypatch.setattr(cli, "load_hook_rules", lambda _root: HookLoadResult((), HookNetworkPolicy()))
 
 
 class PromptRecorder:

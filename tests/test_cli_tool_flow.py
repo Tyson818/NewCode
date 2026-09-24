@@ -4,8 +4,11 @@ from io import StringIO
 from types import SimpleNamespace
 import sys
 
+import pytest
+
 from newcode import cli
 from newcode.config import AppConfig
+from newcode.hooks.types import HookLoadResult, HookNetworkPolicy
 from newcode.permissions.manager import PermissionManager
 from newcode.permissions.types import PermissionMode
 from newcode.providers.base import TextDelta, ToolCallEvent
@@ -17,6 +20,15 @@ from newcode.providers.deepseek import (
 from newcode.session import ChatSession
 from newcode.tools.registry import create_default_registry
 from newcode.tools.types import ToolCall, ToolContext
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hook_config(monkeypatch):
+    """既有工具流测试不依赖运行机器的用户级 Hook 配置。"""
+
+    monkeypatch.setattr(
+        cli, "load_hook_rules", lambda _root: HookLoadResult((), HookNetworkPolicy()),
+    )
 
 
 class FakeProvider:
