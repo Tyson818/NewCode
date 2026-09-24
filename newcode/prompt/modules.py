@@ -24,6 +24,7 @@ class DynamicPromptBackground:
     """不写入会话的请求级背景；字段顺序即注入优先级。"""
 
     active_skills: str = ""
+    agent_catalog: str = ""
     hook_injections: str = ""
     project_instructions: str = ""
     workspace_instructions: str = ""
@@ -35,6 +36,7 @@ def dynamic_background_messages(background: DynamicPromptBackground) -> list[str
     messages: list[str] = []
     for source, content in (
         ("已激活 Skill｜来源：受控会话状态", background.active_skills),
+        ("Agent 目录｜来源：本地受控定义 catalog", background.agent_catalog),
         ("Hook 背景｜非授权｜来源：请求级受控队列", background.hook_injections),
         ("项目指令｜来源：<workspace>/AGENTS.md", background.project_instructions),
         ("工作区指令｜来源：<workspace>/.newcode/INSTRUCTIONS.md", background.workspace_instructions),

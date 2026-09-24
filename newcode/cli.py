@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import secrets
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
@@ -13,6 +16,7 @@ from newcode.agent import (
     AgentTextDelta,
     AgentToolCallStarted,
     AgentToolError,
+    AgentToolResult,
     AgentUsage,
     StopReason,
 )
@@ -51,6 +55,10 @@ from newcode.skills.discovery import SkillDiscovery
 from newcode.skills.policy import visible_tool_names
 from newcode.skills.runner import SkillRunner
 from newcode.skills.state import ActiveSkillState
+from newcode.subagents.discovery import AgentDiscovery
+from newcode.subagents.manager import SubAgentManager
+from newcode.subagents.runner import ProviderFactory, SubAgentRunner
+from newcode.subagents.types import AgentCatalog, SessionScope, WorkerResult
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -60,6 +68,45 @@ DO_COMMAND = "/do"
 COMPACT_COMMAND = "/compact"
 SESSIONS_COMMAND = "/sessions"
 RESUME_COMMAND = "/resume"
+
+
+class _CLIProviderFactory:
+    """仅封装当前配置模型；每次调用建立独立、有界请求超时的 client。"""
+
+    def __init__(self, config, api_key: str, *, client_factory=None) -> None:
+        self.config = config
+        self._api_key = api_key
+        self._client_factory = client_factory
+
+    @property
+    def available_models(self) -> tuple[str, ...]:
+        return (self.config.model,)
+
+    @property
+    def default_model(self) -> str:
+        return self.config.model
+
+    def create(self, model: str, *, timeout_seconds: float) -> ChatProvider:
+        if model != self.config.model:
+            raise RuntimeError("subagent_model_unavailable")
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+            raise RuntimeError("subagent_model_unavailable")
+        request_timeout = min(float(timeout_seconds), 60.0)
+        if self._client_factory is None:
+            from openai import OpenAI
+
+            client = OpenAI(
+                api_key=self._api_key,
+                base_url=self.config.base_url,
+                timeout=request_timeout,
+            )
+        else:
+            client = self._client_factory(
+                api_key=self._api_key,
+                base_url=self.config.base_url,
+                timeout=request_timeout,
+            )
+        return DeepSeekProvider(config=self.config, api_key=self._api_key, client=client)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -76,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     memory_service = None
     memory_cleanup_state = {"attempted": False}
     mcp_status_summary = "MCP 状态未提供。"
+    subagent_provider_factory = None
     try:
         try:
             config = load_config(Path(args.config))
@@ -106,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"MCP tool unavailable ({name}): mcp_tool_schema_invalid", file=sys.stderr)
             discovered_tools = sum(len(descriptors) for descriptors in discovered_servers.values())
             mcp_status_summary = f"MCP 已配置 {len(mcp_config.servers)} 个服务，已发现 {discovered_tools} 个工具。"
+            # MCP discovery 已结束；child factory 仅声明当前配置模型，并为每个 child
+            # 独立创建有界超时的 SDK client。
+            subagent_provider_factory = _CLIProviderFactory(config, api_key)
         except ConfigError as exc:
             print(f"配置错误：{exc}", file=sys.stderr)
             return 1
@@ -136,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             memory_service=memory_service,
             mcp_status_summary=mcp_status_summary,
             memory_cleanup_state=memory_cleanup_state,
+            subagent_provider_factory=subagent_provider_factory,
         )
     finally:
         if memory_service is not None and not memory_cleanup_state["attempted"]:
@@ -170,9 +222,14 @@ def run_conversation(
     memory_service: MemoryService | None = None,
     mcp_status_summary: str = "MCP 状态未提供。",
     memory_cleanup_state: dict[str, bool] | None = None,
+    subagent_provider_factory: ProviderFactory | None = None,
+    agent_user_home: Path | None = None,
 ) -> int:
     hook_actions: HookActionRunner | None = None
     hook_engine: HookEngine | None = None
+    subagent_manager: SubAgentManager | None = None
+    subagent_scope: SessionScope | None = None
+    subagent_task_ids: set[str] = set()
     try:
         registry = registry or create_default_registry()
         tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
@@ -197,6 +254,35 @@ def run_conversation(
         skill_state = ActiveSkillState()
         skill_discovery = SkillDiscovery()
         skill_catalog = skill_discovery.discover(tool_context.workspace_root)
+        agent_catalog = AgentCatalog(())
+        if subagent_provider_factory is not None:
+            if session.session_id is None:
+                session.session_id = f"runtime-{secrets.token_hex(12)}"
+            discovery = AgentDiscovery()
+            agent_catalog = discovery.discover(
+                tool_context.workspace_root,
+                user_home=agent_user_home or Path.home(),
+                available_tools=registry.names(),
+            )
+            for diagnostic in agent_catalog.diagnostics:
+                print(f"Agent 定义跳过：{diagnostic.code}", file=error_output)
+
+            runner_holder: dict[str, SubAgentRunner] = {}
+            subagent_manager = SubAgentManager(
+                lambda task: runner_holder["runner"](task)
+                if "runner" in runner_holder
+                else WorkerResult(error_code="subagent_provider_error")
+            )
+            subagent_scope = subagent_manager.open_session(session.session_id)
+            subagent_runner = SubAgentRunner(
+                manager=subagent_manager,
+                provider_factory=subagent_provider_factory,
+                default_model=getattr(subagent_provider_factory, "default_model", ""),
+                registry=registry,
+                tool_context=tool_context,
+                parent_permission_manager=permission_manager,
+            )
+            runner_holder["runner"] = subagent_runner
         command_dispatcher = SkillCommandDispatcher(
             CommandDispatcher(command_registry),
             SkillCommandOverlay(command_registry, skill_state),
@@ -229,6 +315,7 @@ def run_conversation(
             hook_engine = None
             print("Hook 配置跳过：hook_config_invalid", file=error_output)
     except BaseException:
+        _safe_subagent_shutdown(subagent_manager, subagent_scope)
         _safe_hook_shutdown(hook_actions)
         _safe_memory_shutdown(memory_service)
         if memory_cleanup_state is not None:
@@ -293,12 +380,17 @@ def run_conversation(
             if outcome.kind is CommandOutcomeKind.CLEAR_SESSION:
                 _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_END, session, mode, tool_context)
                 session_open = False
+                _remember_subagent_task_ids(session, subagent_task_ids)
+                _close_subagent_scope(subagent_manager, subagent_scope, subagent_task_ids)
                 session, context_manager = _clear_session(
                     session,
                     context_manager,
                     session_archive,
                     tool_context,
                 )
+                subagent_scope = _open_subagent_scope(subagent_manager, session)
+                subagent_task_ids = set()
+                registry = _registry_without_agent_tool(registry)
                 skill_state.reset_for_new_session()
                 loop = None
                 if hook_engine is not None:
@@ -306,6 +398,11 @@ def run_conversation(
                 _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_START, session, mode, tool_context)
                 session_open = True
                 skill_catalog = skill_discovery.discover(tool_context.workspace_root)
+                agent_catalog = AgentDiscovery().discover(
+                    tool_context.workspace_root,
+                    user_home=agent_user_home or Path.home(),
+                    available_tools=registry.names(),
+                ) if subagent_provider_factory is not None else AgentCatalog(())
                 command_ui.info("已开始新会话。")
                 continue
             if outcome.kind is CommandOutcomeKind.RESUME_SESSION:
@@ -315,9 +412,14 @@ def run_conversation(
                     continue
                 _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_END, session, mode, tool_context)
                 session_open = False
+                _remember_subagent_task_ids(session, subagent_task_ids)
+                _close_subagent_scope(subagent_manager, subagent_scope, subagent_task_ids)
                 _safe_checkpoint(session_archive, session)
                 _safe_context_cleanup(context_manager)
                 session = restored.session
+                subagent_scope = _open_subagent_scope(subagent_manager, session)
+                subagent_task_ids = set()
+                registry = _registry_without_agent_tool(registry)
                 context_manager = ContextManager(
                     session,
                     tool_context.workspace_root,
@@ -330,6 +432,11 @@ def run_conversation(
                 _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_START, session, mode, tool_context)
                 session_open = True
                 skill_catalog = skill_discovery.discover(tool_context.workspace_root)
+                agent_catalog = AgentDiscovery().discover(
+                    tool_context.workspace_root,
+                    user_home=agent_user_home or Path.home(),
+                    available_tools=registry.names(),
+                ) if subagent_provider_factory is not None else AgentCatalog(())
                 command_ui.info(f"已恢复会话：{session.session_id}")
                 if restored.needs_time_span_reminder:
                     command_ui.info("该会话距离上次更新已超过 24 小时，请先确认当前状态。")
@@ -379,6 +486,9 @@ def run_conversation(
                 skill_discovery=skill_discovery,
                 hook_engine=hook_engine,
                 hook_actions=hook_actions,
+                subagent_manager=subagent_manager,
+                subagent_scope=subagent_scope,
+                agent_catalog=agent_catalog,
             )
 
         try:
@@ -386,11 +496,15 @@ def run_conversation(
                 loop.run(text, mode=mode),
                 output=output,
                 error_output=error_output,
+                tracked_session=session,
+                tracked_subagent_task_ids=subagent_task_ids,
             )
             if natural:
                 _safe_checkpoint(session_archive, session)
         except KeyboardInterrupt:
             print("\n已中断当前任务。", file=output)
+        finally:
+            _remember_subagent_task_ids(session, subagent_task_ids)
         print("", file=output)
     finally:
         try:
@@ -403,6 +517,7 @@ def run_conversation(
         _safe_cleanup_stale(session_archive, session.session_id)
         if system_open:
             _safe_emit_cli_hook(hook_engine, HookEvent.SYSTEM_END, session, mode, tool_context)
+        _safe_subagent_shutdown(subagent_manager, subagent_scope, subagent_task_ids, session)
         _safe_hook_shutdown(hook_actions)
         _safe_memory_shutdown(memory_service)
         if memory_cleanup_state is not None:
@@ -541,10 +656,18 @@ def _consume_agent_events(
     *,
     output: TextIO,
     error_output: TextIO,
+    tracked_session: ChatSession | None = None,
+    tracked_subagent_task_ids: set[str] | None = None,
 ) -> bool:
     printed_text = False
     natural = False
     for event in events:
+        if (
+            tracked_session is not None
+            and tracked_subagent_task_ids is not None
+            and isinstance(event, (AgentToolResult, AgentToolError))
+        ):
+            _remember_subagent_task_ids(tracked_session, tracked_subagent_task_ids)
         if isinstance(event, AgentTextDelta):
             printed_text = True
             print(event.text, end="", file=output, flush=True)
@@ -605,6 +728,105 @@ def _safe_cleanup_stale(archive: SessionArchive | None, active_session_id: str |
         return
     try:
         archive.cleanup_stale(active_session_id=active_session_id)
+    except Exception:
+        return
+
+
+def _open_subagent_scope(
+    manager: SubAgentManager | None,
+    session: ChatSession,
+) -> SessionScope | None:
+    if manager is None:
+        return None
+    if session.session_id is None:
+        session.session_id = f"runtime-{secrets.token_hex(12)}"
+    try:
+        return manager.open_session(session.session_id)
+    except Exception:
+        return None
+
+
+def _remember_subagent_task_ids(session: ChatSession, task_ids: set[str]) -> None:
+    """从本 session 已存在的 Agent Tool 交换中保存进程内 task ID。"""
+
+    start_calls: set[str] = set()
+    for message in session.messages:
+        if message.role == "assistant":
+            for call in message.tool_calls or ():
+                if call.name == "agent" and call.arguments.get("operation") == "start":
+                    start_calls.add(call.id)
+        elif message.role == "tool" and message.tool_call_id in start_calls:
+            try:
+                payload = json.loads(message.content or "")
+            except (TypeError, ValueError):
+                continue
+            data = payload.get("data") if isinstance(payload, dict) else None
+            task_id = data.get("task_id") if isinstance(data, dict) else None
+            if isinstance(task_id, str) and task_id:
+                task_ids.add(task_id)
+                start_calls.discard(message.tool_call_id or "")
+
+
+def _registry_without_agent_tool(registry: ToolRegistry) -> ToolRegistry:
+    """会话切换时复用受控工具，仅让新 AgentLoop 绑定新 scope 的 agent Tool。"""
+
+    if registry.get("agent") is None:
+        return registry
+    replacement = ToolRegistry()
+    for name in registry.names():
+        if name == "agent":
+            continue
+        tool = registry.get(name)
+        if tool is not None:
+            replacement.register(
+                tool,
+                read_only=registry.is_read_only(name),
+                do_visible=name in registry.do_visible_names(),
+            )
+    return replacement
+
+
+def _close_subagent_scope(
+    manager: SubAgentManager | None,
+    scope: SessionScope | None,
+    task_ids: set[str] | None = None,
+    *,
+    wait_budget_seconds: float = 0.1,
+) -> None:
+    if manager is None or scope is None:
+        return
+    deadline = time.monotonic() + max(0.0, min(wait_budget_seconds, 0.2))
+    for task_id in tuple(task_ids or ()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            # 有界等待已完成结果；结果只在本地领取，随后旧 scope 仍会整体撤销。
+            manager.wait(scope, task_id, timeout_seconds=remaining)
+        except Exception:
+            continue
+    try:
+        # Manager 会在锁内撤销策略、清 pending，并设置所有旧 task 的取消标记。
+        manager.close_session(scope)
+    except Exception:
+        return
+
+
+def _safe_subagent_shutdown(
+    manager: SubAgentManager | None,
+    scope: SessionScope | None,
+    task_ids: set[str] | None = None,
+    session: ChatSession | None = None,
+) -> None:
+    if manager is None:
+        return
+    started = time.monotonic()
+    if session is not None and task_ids is not None:
+        _remember_subagent_task_ids(session, task_ids)
+    _close_subagent_scope(manager, scope, task_ids, wait_budget_seconds=0.2)
+    try:
+        remaining = max(0.0, 1.0 - (time.monotonic() - started))
+        manager.shutdown(wait_timeout=remaining)
     except Exception:
         return
 

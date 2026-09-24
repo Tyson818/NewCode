@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import json
+import re
 from pathlib import Path
 import platform
-import re
 from typing import Any
 
 from newcode.agent.collector import StreamingTurnCollector
@@ -29,6 +30,7 @@ from newcode.permissions.normalizer import build_permission_request
 from newcode.permissions.types import (
     PermissionDecision,
     PermissionDecisionValue,
+    PermissionRule,
 )
 from newcode.prompt import PromptBuildContext, PromptBuilder, PromptEnvironment
 from newcode.prompt.modules import DynamicPromptBackground
@@ -42,6 +44,12 @@ from newcode.skills.policy import visible_tool_names
 from newcode.skills.state import ActiveSkillState
 from newcode.skills.tool import LoadSkillTool
 from newcode.skills.types import SkillCatalog
+
+
+_CATALOG_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|credential|authorization|cookie)\b(\s*[:=]\s*)[^\s,;]+"
+)
+_CATALOG_ABSOLUTE_PATH = re.compile(r"(?:(?:[A-Za-z]:[\\/]|/)[^\s,;\"']+|\\\\[^\\\s]+\\[^\s,;\"']+)")
 
 class AgentLoop:
     def __init__(
@@ -61,6 +69,10 @@ class AgentLoop:
         skill_discovery: SkillDiscovery | None = None,
         hook_engine: HookEngine | None = None,
         hook_actions: HookActionRunner | None = None,
+        subagent_manager: Any | None = None,
+        subagent_scope: Any | None = None,
+        agent_catalog: Any | None = None,
+        agent_tool: Any | None = None,
     ) -> None:
         self.provider = provider
         self.session = session
@@ -74,7 +86,11 @@ class AgentLoop:
         self.memory_service = memory_service
         self.hook_engine = hook_engine
         self.hook_actions = hook_actions
+        self.subagent_manager = subagent_manager
+        self.subagent_scope = subagent_scope
+        self.agent_catalog = agent_catalog
         self._turn_index = 0
+        self._active_mode = AgentMode.DO
         self.skill_state = skill_state or ActiveSkillState()
         self._skill_discovery = skill_discovery or SkillDiscovery()
         self._fixed_skill_catalog = skill_catalog is not None
@@ -89,6 +105,19 @@ class AgentLoop:
                 read_only=False,
                 do_visible=True,
             )
+        if agent_tool is None and self.subagent_manager is not None and self.subagent_scope is not None:
+            from newcode.subagents.tool import AgentTool
+            from newcode.subagents.types import AgentCatalog
+
+            agent_tool = AgentTool(
+                manager=self.subagent_manager,
+                scope=self.subagent_scope,
+                catalog=self.agent_catalog or AgentCatalog(()),
+                snapshot_provider=lambda: tuple(self.session.messages),
+                mode_provider=lambda: self._active_mode,
+            )
+        if agent_tool is not None and self.registry.get("agent") is None:
+            self.registry.register(agent_tool, read_only=False, do_visible=True)
 
     def run(
         self,
@@ -100,6 +129,7 @@ class AgentLoop:
         """在原有事件流外发射内部 Hook，不改变 AgentEvent 顺序。"""
 
         self._turn_index += 1
+        self._active_mode = mode
         if not _is_cancelled(cancel_flag):
             self._emit_hook(HookEvent.TURN_START, mode)
         ended = False
@@ -166,6 +196,9 @@ class AgentLoop:
                 max_iterations=self.config.max_iterations,
             )
             self._refresh_skills()
+            # 只在 AgentLoop 所在线程投递；必须早于 Context 估算和最终 prompt 构造。
+            self._publish_subagent_policy(mode)
+            self._deliver_subagent_notifications()
 
             collector = StreamingTurnCollector()
             try:
@@ -352,7 +385,11 @@ class AgentLoop:
         self.skill_state.refresh(self._skill_catalog)
 
     def _visible_tool_names(self, mode: AgentMode) -> frozenset[str]:
-        return visible_tool_names(mode, self.registry, self.skill_state)
+        names = set(visible_tool_names(mode, self.registry, self.skill_state))
+        if mode is AgentMode.PLAN and self.registry.get("agent") is not None:
+            if all("agent" in activation.loaded.metadata.frontmatter.tools for activation in self.skill_state.activations):
+                names.add("agent")
+        return frozenset(names)
 
     def _provider_messages(
         self,
@@ -371,16 +408,96 @@ class AgentLoop:
             permission_mode=self.permission_manager.mode.value,
         )
         active_skills = self.skill_state.prompt_background()
-        if not active_skills and not hook_injections:
+        agent_catalog = self._agent_catalog_prompt()
+        if not active_skills and not hook_injections and not agent_catalog:
             return self.prompt_builder.build_messages(self.session.messages, context)
         return self.prompt_builder.build_messages(
             self.session.messages,
             context,
             dynamic_background=DynamicPromptBackground(
                 active_skills=active_skills,
+                agent_catalog=agent_catalog,
                 hook_injections="\n\n".join(hook_injections),
             ),
         )
+
+    def _agent_catalog_prompt(self) -> str:
+        if self.agent_catalog is None:
+            return ""
+        entries = self.agent_catalog.startup_directory()
+        if not entries:
+            return ""
+        from newcode.context.redaction import redact_text
+
+        def safe_description(description: str) -> str:
+            safe = redact_text(description, self.tool_context.sensitive_values)
+            safe = _CATALOG_SECRET_ASSIGNMENT.sub(r"\1\2[REDACTED]", safe)
+            return _CATALOG_ABSOLUTE_PATH.sub("[PATH]", safe)
+
+        return json.dumps(
+            [
+                {
+                    "name": item.name,
+                    "description": safe_description(item.description),
+                }
+                for item in entries
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _publish_subagent_policy(self, mode: AgentMode) -> None:
+        if self.subagent_manager is None or self.subagent_scope is None:
+            return
+        from newcode.permissions.types import PermissionDecisionValue
+        from newcode.subagents.manager import SubAgentManagerError
+        from newcode.subagents.types import ParentPolicySnapshot
+
+        visible = self._visible_tool_names(mode) - {"agent", "load_skill"}
+        denied: list[PermissionRule] = []
+        for rule_set in (
+            self.permission_manager.session_rules,
+            self.permission_manager.local_project_rules,
+            self.permission_manager.project_rules,
+            self.permission_manager.user_global_rules,
+        ):
+            denied.extend(rule for rule in rule_set.rules if rule.action is PermissionDecisionValue.DENY)
+        snapshot = ParentPolicySnapshot(
+            self.subagent_scope,
+            frozenset(visible),
+            self.permission_manager.mode,
+            permission_deny_rules=tuple(denied),
+        )
+        try:
+            self.subagent_manager.publish_policy_snapshot(self.subagent_scope, snapshot)
+        except SubAgentManagerError:
+            # 扩权更新不得扩大已有 child 上限，也不能中断父对话。
+            return
+
+    def _deliver_subagent_notifications(self) -> None:
+        if self.subagent_manager is None or self.subagent_scope is None:
+            return
+        from newcode.context.redaction import redact_text
+        from newcode.subagents.manager import SubAgentManagerError
+        from newcode.subagents.types import MAX_TASK_SUMMARY_CHARS
+
+        if self.session.session_id != self.subagent_scope.session_id:
+            return
+        try:
+            results = self.subagent_manager.drain_notifications(self.subagent_scope)
+        except SubAgentManagerError:
+            return
+        for result in results:
+            prefix = (
+                "【子 Agent 后台任务通知】\n"
+                f"task_id：{result.task_id}\n"
+                f"state：{result.state.value}\n"
+                f"error_code：{result.error_code or 'none'}\n"
+                "摘要："
+            )
+            safe_summary = redact_text(result.summary, self.tool_context.sensitive_values)
+            remaining = max(0, MAX_TASK_SUMMARY_CHARS - len(prefix))
+            self.session.add_assistant_message(prefix + safe_summary[:remaining])
 
     def _hook_session_id(self) -> str:
         return self.session.session_id or f"in-memory-{id(self.session)}"
