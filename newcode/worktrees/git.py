@@ -94,6 +94,55 @@ class WorktreeGitAdapter:
     def ignored_paths(self, cwd: Path) -> bytes:
         return self._query(cwd, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
 
+    def integration_tree(self, cwd: Path, commit: str) -> bytes:
+        """Team Manager 专用只读查询，不加入 child capability。"""
+        if not _valid_object_id(commit):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        return self._query(cwd, "ls-tree", "-r", "-z", "--full-tree", commit)
+
+    def integration_index(self, cwd: Path) -> bytes:
+        return self._query(cwd, "ls-files", "--stage", "-z")
+
+    def integration_untracked(self, cwd: Path) -> bytes:
+        return self._query(cwd, "ls-files", "--others", "--exclude-standard", "-z")
+
+    def integration_changes(self, cwd: Path, base: str) -> tuple[bytes, bytes]:
+        if not _valid_object_id(base):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        options = ("--name-only", "-z", "--no-ext-diff", "--no-textconv", "--no-renames")
+        return (self._query(cwd, "diff", "--cached", *options, base, "--"),
+                self._query(cwd, "diff", *options, base, "--"))
+
+    def integration_ancestor(self, cwd: Path, base: str, head: str) -> bool:
+        if not _valid_object_id(base) or not _valid_object_id(head):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        return self._execute(cwd, ("merge-base", "--is-ancestor", base, head),
+                             allow_exit_codes=frozenset({0, 1})).returncode == 0
+
+    def integration_index_path(self, cwd: Path) -> Path:
+        value = Path(self._text(self._query(cwd, "rev-parse", "--git-path", "index")))
+        return value if value.is_absolute() else Path(cwd) / value
+
+    def integration_config(self, cwd: Path) -> bytes:
+        # 在 status/属性查询之前拒绝任何可调用外部驱动的本地配置。
+        return self._execute(cwd, ("config", "--null", "--get-regexp",
+            r"^(filter\..*|diff\..*|merge\..*|core\.attributesfile)$"),
+            allow_exit_codes=frozenset({0, 1})).stdout
+
+    def integration_attributes(self, cwd: Path, paths: Sequence[str]) -> bytes:
+        checked = tuple(_integration_relative_path(p) for p in paths)
+        if not checked:
+            return b""
+        return self._query(cwd, "check-attr", "-z", "--all", "--", *checked)
+
+    def integration_ignored_changes(self, cwd: Path, paths: Sequence[str]) -> bytes:
+        checked = tuple(_integration_relative_path(p) for p in paths)
+        if not checked:
+            return b""
+        data = b"\0".join(p.encode("utf-8") for p in checked) + b"\0"
+        return self._execute(cwd, ("check-ignore", "--no-index", "-z", "--stdin"),
+                             input_data=data, allow_exit_codes=frozenset({0, 1})).stdout
+
     def is_tracked_path(self, cwd: Path, relative_path: str) -> bool:
         checked = _validated_repository_relative_path(relative_path)
         result = self._execute(
@@ -152,10 +201,63 @@ class WorktreeGitAdapter:
             raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
         self._execute(cwd, ("worktree", "remove", str(Path(path))) )
 
+    def _integration_stage(self, cwd: Path, paths: Sequence[str]) -> str:
+        checked = tuple(_integration_relative_path(p) for p in paths)
+        if not checked:
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        self._integration_write(cwd, ("--literal-pathspecs", "add", "-A", "--", *checked))
+        return self.integration_index_tree(cwd)
+
+    def integration_index_tree(self, cwd: Path) -> str:
+        # write-tree 可能创建共享 object，只能从授权后的 Manager 路径使用。
+        value = self._text(self._integration_write(cwd, ("write-tree",)).stdout)
+        if not _valid_object_id(value):
+            raise WorktreeError(WorktreeErrorCode.GIT_OUTPUT_INVALID)
+        return value
+
+    def _integration_commit(self, cwd: Path, integration_id: str, kind: str) -> str:
+        import re
+        if not re.fullmatch(r"integration-[0-9a-f]{32}", integration_id) or kind not in {"source", "merge"}:
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        self._integration_write(cwd, ("-c", "user.name=NewCode", "-c", "user.email=newcode@localhost.invalid",
+            "commit", "--no-gpg-sign", "--no-verify", "-m", f"NewCode {integration_id} {kind}"))
+        return self.head(cwd)
+
+    def _integration_merge(self, cwd: Path, source: str) -> bool:
+        if not _valid_object_id(source):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        return self._integration_write(cwd, ("merge", "--no-ff", "--no-commit", "--no-edit", source),
+                                       allow_exit_codes=frozenset({0, 1})).returncode == 0
+
+    def _integration_ff(self, cwd: Path, result: str) -> None:
+        if not _valid_object_id(result):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        self._integration_write(cwd, ("merge", "--ff-only", "--no-edit", result))
+
+    def integration_commit_info(self, cwd: Path, commit: str):
+        if not _valid_object_id(commit):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        raw = self._query(cwd, "show", "-s", "--no-show-signature", "--format=%H%x00%P%x00%T%x00%B", commit)
+        values = raw.decode("utf-8").strip().split("\0")
+        if len(values) != 4 or values[0] != commit or not _valid_object_id(values[2]):
+            raise WorktreeError(WorktreeErrorCode.GIT_OUTPUT_INVALID)
+        parents = tuple(values[1].split())
+        if any(not _valid_object_id(p) for p in parents):
+            raise WorktreeError(WorktreeErrorCode.GIT_OUTPUT_INVALID)
+        return parents, values[2], values[3]
+
+    def _integration_write(self, cwd: Path, args: Sequence[str], *, allow_exit_codes=frozenset({0})):
+        if self.integration_config(cwd):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+        return self._execute(cwd, ("-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false",
+            "-c", "user.name=NewCode", "-c", "user.email=newcode@localhost.invalid",
+            "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "rerere.enabled=false",
+            "-c", "merge.autoStash=false", "-c", "merge.renames=false", *args), allow_exit_codes=allow_exit_codes)
+
     def _query(self, cwd: Path, *fixed_args: str) -> bytes:
         return self._execute(cwd, fixed_args).stdout
 
-    def _execute(self, cwd: Path, args: Sequence[str], *, allow_exit_codes: frozenset[int] = frozenset({0})):
+    def _execute(self, cwd: Path, args: Sequence[str], *, allow_exit_codes: frozenset[int] = frozenset({0}), input_data: bytes | None = None):
         try:
             root = Path(cwd).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -178,6 +280,8 @@ class WorktreeGitAdapter:
             "--no-pager", "-C", str(root), *args,
         ]
         env = _controlled_environment(self._base_env)
+        if input_data is not None and (not isinstance(input_data, bytes) or len(input_data) > MAX_GIT_OUTPUT_BYTES):
+            raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
         try:
             completed = self._runner(
                 argv,
@@ -188,6 +292,7 @@ class WorktreeGitAdapter:
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **({"input": input_data} if input_data is not None else {}),
             )
         except subprocess.TimeoutExpired as exc:
             raise WorktreeError(WorktreeErrorCode.GIT_TIMEOUT) from exc
@@ -291,6 +396,15 @@ def _validated_repository_relative_path(value: str) -> str:
     if normalized != value:
         raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
     return normalized
+
+
+def _integration_relative_path(value: str) -> str:
+    # literal pathspec；拒绝 Windows ADS、控制字符及 Git pathspec magic。
+    if (not isinstance(value, str) or len(value) > 1024 or value.startswith(("/", "-", ":"))
+            or "\\" in value or ":" in value or any(ord(c) < 32 for c in value)
+            or any(p in {"", ".", ".."} or p.endswith((".", " ")) for p in value.split("/"))):
+        raise WorktreeError(WorktreeErrorCode.GIT_FAILED)
+    return value
 
 
 @dataclass(frozen=True)

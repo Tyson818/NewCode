@@ -73,6 +73,7 @@ class AgentLoop:
         subagent_scope: Any | None = None,
         agent_catalog: Any | None = None,
         agent_tool: Any | None = None,
+        team_runtime: Any | None = None,
     ) -> None:
         self.provider = provider
         self.session = session
@@ -89,6 +90,12 @@ class AgentLoop:
         self.subagent_manager = subagent_manager
         self.subagent_scope = subagent_scope
         self.agent_catalog = agent_catalog
+        self.team_runtime = team_runtime
+        self._team_admissions = {}
+        if (team_runtime is not None and getattr(getattr(team_runtime, "coordinator", None), "enabled", False)
+                and (hook_engine is not None or hook_actions is not None or subagent_manager is not None)):
+            from newcode.teams.types import TeamError
+            raise TeamError("team_coordinator_unavailable")
         self._turn_index = 0
         self._active_mode = AgentMode.DO
         self.skill_state = skill_state or ActiveSkillState()
@@ -196,6 +203,18 @@ class AgentLoop:
                 max_iterations=self.config.max_iterations,
             )
             self._refresh_skills()
+            if self.team_runtime is not None:
+                self.team_runtime.publish(visible_tool_names(mode, self.registry, self.skill_state), mode)
+                publish_permissions = getattr(self.team_runtime, "publish_permissions", None)
+                if publish_permissions is not None:
+                    publish_permissions(self.permission_manager)
+                checkpoint = getattr(self.team_runtime, "checkpoint_observations", None)
+                if checkpoint is not None:
+                    try:
+                        checkpoint(self.session)
+                    except Exception:
+                        # 归档失败保留旧数据且不授予 ack，不阻断普通对话。
+                        pass
             # 只在 AgentLoop 所在线程投递；必须早于 Context 估算和最终 prompt 构造。
             self._publish_subagent_policy(mode)
             self._deliver_subagent_notifications()
@@ -377,7 +396,27 @@ class AgentLoop:
         )
 
     def _execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
+        if self.team_runtime is not None:
+            from newcode.teams.types import TeamError
+            try:
+                if tool_call.name not in self._visible_tool_names(self._active_mode):
+                    return ToolResult.failure(tool_call.name, "disallowed_tool", "当前工具策略已收窄。")
+                previous = self._team_admissions.get(tool_call.id)
+                if previous != self._permission_stamp():
+                    return ToolResult.failure(tool_call.name, "permission_denied", "工具权限已改变。")
+                with self.team_runtime.admission(tool_call.name, tool_call.arguments):
+                    result = execute_tool_call(tool_call, self.registry, self.tool_context)
+                    if tool_call.name == "load_skill" and result.ok:
+                        self.team_runtime.publish(visible_tool_names(self._active_mode, self.registry, self.skill_state), self._active_mode)
+                    return result
+            except TeamError as exc:
+                return ToolResult.failure(tool_call.name, exc.code, "团队策略未允许该操作。")
         return execute_tool_call(tool_call, self.registry, self.tool_context)
+
+    def _permission_stamp(self):
+        manager = self.permission_manager
+        return repr((manager.mode, manager.session_rules, manager.local_project_rules,
+                     manager.project_rules, manager.user_global_rules, manager.rule_load_errors))
 
     def _refresh_skills(self) -> None:
         if not self._fixed_skill_catalog:
@@ -389,6 +428,8 @@ class AgentLoop:
         if mode is AgentMode.PLAN and self.registry.get("agent") is not None:
             if all("agent" in activation.loaded.metadata.frontmatter.tools for activation in self.skill_state.activations):
                 names.add("agent")
+        if self.team_runtime is not None:
+            names = self.team_runtime.filter_tools(names)
         return frozenset(names)
 
     def _provider_messages(
@@ -624,7 +665,24 @@ class AgentLoop:
         allowed_tool_calls: list[ToolCall] = []
         allowed_indexes: list[int] = []
 
+        if self.team_runtime is not None:
+            self._team_admissions.clear()
+            self.team_runtime.publish(visible_tool_names(self._active_mode, self.registry, self.skill_state), self._active_mode)
+            publish_permissions = getattr(self.team_runtime, "publish_permissions", None)
+            if publish_permissions is not None:
+                publish_permissions(self.permission_manager)
+
         for index, tool_call in enumerate(tool_calls):
+            if self.team_runtime is not None:
+                from newcode.teams.tools import TEAM_TOOLS, validate_arguments
+                from newcode.teams.types import TeamError
+                try:
+                    if tool_call.name in TEAM_TOOLS:
+                        validate_arguments(tool_call.name, tool_call.arguments, self.team_runtime.role)
+                except TeamError as exc:
+                    denied_records.append(ToolExecutionRecord(index, tool_call,
+                        ToolResult.failure(tool_call.name, exc.code, "团队参数或角色无效。")))
+                    continue
             if self.registry.get(tool_call.name) is None:
                 allowed_tool_calls.append(tool_call)
                 allowed_indexes.append(index)
@@ -632,6 +690,8 @@ class AgentLoop:
 
             decision = self.permission_manager.check(tool_call, self.tool_context, self.registry.get(tool_call.name))
             if decision.decision is PermissionDecisionValue.ALLOW:
+                if self.team_runtime is not None:
+                    self._team_admissions[tool_call.id] = self._permission_stamp()
                 allowed_tool_calls.append(tool_call)
                 allowed_indexes.append(index)
                 continue

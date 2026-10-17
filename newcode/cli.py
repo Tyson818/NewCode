@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import sys
 import tempfile
@@ -9,6 +10,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
+from types import SimpleNamespace
 
 from newcode.agent import (
     AgentFinalAnswer,
@@ -64,6 +66,12 @@ from newcode.worktrees.git import WorktreeGitAdapter
 from newcode.worktrees.manager import WorktreeManager
 from newcode.worktrees.setup import load_worktree_config
 from newcode.worktrees.types import WorktreeSetupPolicy
+from newcode.teams.config import load_team_config
+from newcode.teams.coordinator import CoordinatorPolicy
+from newcode.teams.runtime import TeamAttachment, TeamRunnerFactory
+from newcode.teams.tools import register_team_tools, registry_without_team_tools
+from newcode.teams.types import TeamError
+from newcode.teams.integration import IntegrationBarrier
 
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -73,6 +81,25 @@ DO_COMMAND = "/do"
 COMPACT_COMMAND = "/compact"
 SESSIONS_COMMAND = "/sessions"
 RESUME_COMMAND = "/resume"
+
+
+def _confirm_team_integration(manager, context, bound):
+    """绑定本次 B/T/M/digest 的单写者确认；不生成 Permission session grant。"""
+    from newcode.permissions.types import (
+        ConfirmationScope, PermissionDecision, PermissionDecisionValue,
+        PermissionLayer, PermissionRequest, RiskLevel,
+    )
+    from newcode.teams.store import sanitize
+    safe = sanitize(bound, context.sensitive_values)
+    reason = "确认集成期间没有外部 Git/编辑器/写入者；仅本次允许：" + json.dumps(safe, ensure_ascii=False, sort_keys=True)
+    request = PermissionRequest("team_integrate", safe, safe, context.workspace_root, manager.mode)
+    decision = PermissionDecision(PermissionDecisionValue.REQUIRE_CONFIRMATION, "team_integrate", reason,
+        RiskLevel.HIGH, None, PermissionLayer.HITL_CONFIRMATION)
+    try:
+        result = manager.confirmer.confirm(request, decision)
+        return result.allowed is True and result.scope is ConfirmationScope.ONCE
+    except Exception:
+        return False
 
 
 class _CLIProviderFactory:
@@ -147,7 +174,9 @@ def main(argv: list[str] | None = None) -> int:
             mcp_manager = MCPManager(mcp_config.servers.values(), runtime=mcp_runtime)
             for name, error in mcp_config.errors.items():
                 print(f"MCP server unavailable ({name}): {error.code}", file=sys.stderr)
-            discovered_servers = mcp_manager.discover_all()
+            team_settings = load_team_config(tool_context.workspace_root).config
+            coordinator = CoordinatorPolicy.from_config(team_settings, os.environ)
+            discovered_servers = {} if coordinator.enabled else mcp_manager.discover_all()
             for name, descriptors in discovered_servers.items():
                 config_entry = mcp_config.servers[name]
                 for descriptor in descriptors:
@@ -230,9 +259,11 @@ def run_conversation(
     subagent_provider_factory: ProviderFactory | None = None,
     agent_user_home: Path | None = None,
     worktree_manager: WorktreeManager | None = None,
+    team_attachment: TeamAttachment | None = None,
 ) -> int:
     hook_actions: HookActionRunner | None = None
     hook_engine: HookEngine | None = None
+    integration_barrier = IntegrationBarrier()
     subagent_manager: SubAgentManager | None = None
     subagent_scope: SessionScope | None = None
     subagent_task_ids: set[str] = set()
@@ -241,6 +272,11 @@ def run_conversation(
     try:
         registry = registry or create_default_registry()
         tool_context = tool_context or ToolContext(workspace_root=Path.cwd())
+        team_settings = load_team_config(tool_context.workspace_root, user_home=agent_user_home or Path.home()).config
+        coordinator = CoordinatorPolicy.from_config(team_settings, dict(os.environ))
+        team_attachment = team_attachment or TeamAttachment(store=None, config=team_settings, coordinator=coordinator)
+        if team_attachment.coordinator.enabled != coordinator.enabled:
+            raise TeamError("team_coordinator_unavailable")
         permission_manager = permission_manager or _build_permission_manager(
             mode=permission_mode,
             rules=permission_rules,
@@ -258,12 +294,12 @@ def run_conversation(
         )
         mode = AgentMode.DO
         loop: AgentLoop | None = None
-        command_registry = create_builtin_registry()
+        command_registry = create_builtin_registry(include_team=True)
         skill_state = ActiveSkillState()
         skill_discovery = SkillDiscovery()
         skill_catalog = skill_discovery.discover(tool_context.workspace_root)
         agent_catalog = AgentCatalog(())
-        if subagent_provider_factory is not None:
+        if subagent_provider_factory is not None and not coordinator.enabled:
             if session.session_id is None:
                 session.session_id = f"runtime-{secrets.token_hex(12)}"
             discovery = AgentDiscovery()
@@ -277,9 +313,9 @@ def run_conversation(
 
             runner_holder: dict[str, SubAgentRunner] = {}
             subagent_manager = SubAgentManager(
-                lambda task: runner_holder["runner"](task)
+                integration_barrier.wrap(lambda task: runner_holder["runner"](task)
                 if "runner" in runner_holder
-                else WorkerResult(error_code="subagent_provider_error")
+                else WorkerResult(error_code="subagent_provider_error"))
             )
             if worktree_manager is None:
                 try:
@@ -334,25 +370,91 @@ def run_conversation(
                 worktree_setup_policy=worktree_setup_policy,
             )
             runner_holder["runner"] = subagent_runner
+
+        if team_settings.enabled and worktree_manager is None:
+            # Coordinator 不创建普通 SubAgentManager，但团队仍复用同一受控 Worktree 能力。
+            try:
+                worktree_hooks_temp = tempfile.TemporaryDirectory(prefix="newcode-team-hooks-")
+                hooks_path = Path(worktree_hooks_temp.name).resolve(strict=True)
+                if hooks_path.is_relative_to(tool_context.workspace_root) or tool_context.workspace_root.is_relative_to(hooks_path):
+                    raise TeamError("team_path_invalid")
+                worktree_manager = WorktreeManager(empty_hooks_dir=hooks_path,
+                    git=WorktreeGitAdapter(empty_hooks_dir=hooks_path, timeout_seconds=1), lock_wait_seconds=0.25)
+            except Exception:
+                worktree_manager = None
+        if team_settings.enabled and not agent_catalog.definitions and subagent_provider_factory is not None:
+            agent_catalog = AgentDiscovery().discover(tool_context.workspace_root,
+                user_home=agent_user_home or Path.home(), available_tools=registry.names())
+        if team_settings.enabled and team_attachment.runner_factory is None:
+            from newcode.teams.member import MemberPermissions
+            from newcode.permissions.types import PermissionDecisionValue
+            team_attachment.runner_factory = TeamRunnerFactory(registry=registry, catalog=agent_catalog,
+                provider_factory=subagent_provider_factory, worktree_manager=worktree_manager,
+                default_model=getattr(subagent_provider_factory, "default_model", ""),
+                permissions=MemberPermissions(mode=permission_manager.mode,
+                    local_rules=permission_manager.local_project_rules.rules,
+                    project_rules=permission_manager.project_rules.rules,
+                    user_rules=permission_manager.user_global_rules.rules,
+                    rule_load_errors=permission_manager.rule_load_errors,
+                    session_denies=tuple(r for r in permission_manager.session_rules.rules
+                                         if r.action is PermissionDecisionValue.DENY)))
+            from newcode.teams.tools import TEAM_TOOLS
+            if subagent_provider_factory is not None:
+                team_attachment.runner_factory.catalog = AgentDiscovery().discover(tool_context.workspace_root,
+                    user_home=agent_user_home or Path.home(), available_tools=[*registry.names(), *TEAM_TOOLS])
+
+        if team_settings.enabled and team_attachment.store is None:
+            try:
+                from newcode.teams.paths import TeamPaths
+                from newcode.teams.store import TeamStore
+                # 启动阶段完成只读绑定；slash handler 绝不执行 Git。
+                if worktree_manager is None:
+                    raise TeamError("team_backend_unavailable")
+                git = worktree_manager._git
+                common = git.common_git_dir(tool_context.workspace_root)
+                root = git.repository_root(tool_context.workspace_root)
+                if root != tool_context.workspace_root:
+                    raise TeamError("team_workspace_mismatch")
+                team_attachment.store = TeamStore(TeamPaths(root, common_git_dir=common,
+                    user_home=agent_user_home or Path.home()), sensitive_values=tool_context.sensitive_values)
+            except Exception:
+                print("Team 状态不可用：team_store_unavailable", file=error_output)
+
+        if team_settings.enabled:
+            team_attachment.integration_worktrees = worktree_manager
+            team_attachment.lead_barrier = team_attachment.lead_barrier or integration_barrier.hold
+            team_attachment.single_writer_confirm = (team_attachment.single_writer_confirm
+                or (lambda bound: _confirm_team_integration(permission_manager, tool_context, bound)))
+
+        def team_command(arguments):
+            nonlocal registry, loop
+            if not team_settings.enabled or team_attachment.store is None:
+                raise TeamError("team_coordinator_unavailable")
+            result = team_attachment.command(arguments)
+            registry = registry_without_team_tools(registry)
+            register_team_tools(registry, team_attachment)
+            loop = None
+            return json.dumps(result, ensure_ascii=False)
         command_dispatcher = SkillCommandDispatcher(
             CommandDispatcher(command_registry),
             SkillCommandOverlay(command_registry, skill_state),
         )
         command_ui = CLIUIControl(output=output, error_output=error_output)
         try:
-            hook_config = load_hook_rules(tool_context.workspace_root)
-            for diagnostic in hook_config.diagnostics:
+            hook_config = None if coordinator.enabled else load_hook_rules(tool_context.workspace_root)
+            for diagnostic in hook_config.diagnostics if hook_config is not None else ():
                 print(f"Hook 配置跳过：{diagnostic.code}", file=error_output)
-            if hook_config.rules:
+            if hook_config is not None and hook_config.rules:
                 http_enabled = hook_config.network.enabled and bool(hook_config.network.allow_hosts)
+                transport = PinnedHttpsTransport() if http_enabled else None
+                integration_barrier.http_transport = transport
+                gateway = HookToolGateway(permission_manager, registry, tool_context,
+                    tool_visible=lambda name: name in visible_tool_names(mode, registry, skill_state))
                 hook_actions = HookActionRunner(
                     network=hook_config.network,
                     resolver=BoundedHostResolver() if http_enabled else None,
-                    http_transport=PinnedHttpsTransport() if http_enabled else None,
-                    shell_gateway=HookToolGateway(
-                        permission_manager, registry, tool_context,
-                        tool_visible=lambda name: name in visible_tool_names(mode, registry, skill_state),
-                    ),
+                    http_transport=SimpleNamespace(request_pinned=integration_barrier.wrap(transport.request_pinned)) if transport else None,
+                    shell_gateway=SimpleNamespace(run_shell=integration_barrier.wrap(gateway.run_shell)),
                     sensitive_values=tool_context.sensitive_values,
                 )
                 hook_engine = HookEngine(
@@ -366,6 +468,7 @@ def run_conversation(
             hook_engine = None
             print("Hook 配置跳过：hook_config_invalid", file=error_output)
     except BaseException:
+        _safe_team_detach(team_attachment)
         _safe_subagent_shutdown(subagent_manager, subagent_scope)
         if worktree_hooks_temp is not None:
             try:
@@ -424,6 +527,7 @@ def run_conversation(
                     permission_manager,
                     mcp_status_summary,
                     provider,
+                    team_command,
                 ),
                 command_ui,
             )
@@ -431,9 +535,13 @@ def run_conversation(
                 continue
             if outcome.kind is CommandOutcomeKind.MODE_CHANGE:
                 mode = AgentMode(outcome.mode or AgentMode.DO.value)
+                if team_settings.enabled:
+                    team_attachment.publish(visible_tool_names(mode, registry, skill_state), mode)
                 command_ui.set_mode(mode.value)
                 continue
             if outcome.kind is CommandOutcomeKind.CLEAR_SESSION:
+                _safe_team_detach(team_attachment)
+                registry = registry_without_team_tools(registry)
                 _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_END, session, mode, tool_context)
                 session_open = False
                 _remember_subagent_task_ids(session, subagent_task_ids)
@@ -466,6 +574,8 @@ def run_conversation(
                 if restored is None:
                     command_ui.error("session_restore_failed", "会话不可恢复。")
                     continue
+                _safe_team_detach(team_attachment)
+                registry = registry_without_team_tools(registry)
                 _safe_emit_cli_hook(hook_engine, HookEvent.SESSION_END, session, mode, tool_context)
                 session_open = False
                 _remember_subagent_task_ids(session, subagent_task_ids)
@@ -500,6 +610,9 @@ def run_conversation(
             if outcome.kind is CommandOutcomeKind.AI_INPUT:
                 text = outcome.ai_input or ""
             elif outcome.kind is CommandOutcomeKind.SKILL_REQUEST:
+                if coordinator.enabled:
+                    command_ui.error("disallowed_tool", "Coordinator 不允许 Skill 执行。")
+                    continue
                 activation = next(
                     (item for item in skill_state.activations if item.loaded.metadata.frontmatter.name == outcome.skill_name),
                     None,
@@ -545,6 +658,7 @@ def run_conversation(
                 subagent_manager=subagent_manager,
                 subagent_scope=subagent_scope,
                 agent_catalog=agent_catalog,
+                team_runtime=team_attachment if team_settings.enabled else None,
             )
 
         try:
@@ -563,6 +677,7 @@ def run_conversation(
             _remember_subagent_task_ids(session, subagent_task_ids)
         print("", file=output)
     finally:
+        _safe_team_detach(team_attachment)
         try:
             skill_state.clear()
         except Exception:
@@ -596,6 +711,7 @@ def _command_runtime(
     permission_manager: PermissionManager,
     mcp_status_summary: str,
     provider: ChatProvider,
+    team_command=None,
 ) -> CommandRuntime:
     """仅把既有的受控本地查询与生命周期能力交给内置命令。"""
 
@@ -652,7 +768,16 @@ def _command_runtime(
         list_memory=list_memory,
         permission_summary=permission_summary,
         status_summary=status_summary,
+        team_command=team_command,
     )
+
+
+def _safe_team_detach(attachment):
+    if attachment is not None:
+        try:
+            attachment.detach()
+        except Exception:
+            pass
 
 
 def _clear_session(

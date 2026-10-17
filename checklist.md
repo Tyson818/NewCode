@@ -1,124 +1,143 @@
-# Chapter 14：Git Worktree —— 验收清单
+# Chapter 15：Agent Teams —— 验收清单
 
-> 每项须有测试输出/本地 repo 证据；未验证的 OS、Git 或路径安全能力标记为未通过，不以代码审阅替代执行证据。
+> 按 Phase 1→7 顺序逐项勾选。每个 targeted test 文件必须已由对应 Phase 的较早 Task 创建；每 Phase 退出门全过才可继续。所有 basetemp 位于 `$env:TEMP`。
 
-## 通用安全前置
+## 全章安全前置
 
-- [ ] 确认使用临时 home/workspace 和临时本地 Git repository；未访问 remote、未 push、未使用生产 secret/真实 MCP/生产 Git hook/tmux。
-- [ ] 确认实现没有 `os.chdir`、shell 拼接、`shell=True` Git 调用、`git worktree prune`、force/remove/reset/clean/fetch/push。
-- [ ] 确认当前 shared Definition/Fork Agent 行为与 Chapter 13 回归一致。
-- [ ] 确认 Worktree 不被描述为 OS sandbox；若 command sandbox 未实测通过，则 Worktree child 的 `run_command` 零执行、不可见或明确 fail closed。
+- [ ] 测试只使用 fake Provider/backend、临时 home/workspace、临时本地 Git repo 和 fake/local IPC；无 remote/push、生产 secret、第三方 MCP、生产 hooks、全局 Git 配置修改。
+- [ ] Provider 不导入 Team；AgentLoop 仍经 mode/visibility → Permission → ToolScheduler → executor；Team tools 不可绕过 Skill/MCP/Context/Memory/Hook/Command 现有边界。
+- [ ] 普通 CLI/普通 SubAgent 没有 Team collaboration tools；Team Member 没有 Lead-only spawn/approve/integrate；固定 schema 不按成员动态生成。
+- [ ] 未设置 user Teams enable 时功能关闭；project config 不能 enable；coordinator 同时需要 user config 与 `NEWCODE_TEAM_COORDINATOR=1`。
+- [ ] Chapter12 Hook subagent placeholder 仍 unavailable；Team 不会由 Hook 自动创建或递归调度。
+- [ ] pane 后端必须有真实 tmux pane + 独立 process + IPC 验收证据；fake backend/mock 不得标成真实运行通过。
 
-## Phase 1：模型、路径、Git runner、配置（T1–T4）
+## Phase 1：模型、路径与持久化（T1–T4）
 
-- [ ] T1：Definition 默认 isolation 为 `shared`；合法值 `worktree` 可读，非法值只隔离对应定义，旧 Definition/Fork 行为不变。
-- [ ] T2：目录路径由 `<repo>/.newcode/worktrees/<agent-slug>/<task-id>` 生成；slug/task/branch独立校验；空段、dot段、过长、反斜杠、绝对/盘符/UNC、junction/symlink与root escape均拒绝。
-- [ ] T3：Git adapter 仅固定 argv、`shell=False`、固定 cwd、有限 timeout/输出；每条 Manager Git argv 都强制 empty hooks path 并禁用 system/global config；Git stderr/异常脱敏，网络/任意命令零调用。
-- [ ] T4：`~/.newcode/worktree.yaml` 建立权限上限，项目 `.newcode/worktree.yaml` 只能缩小；hard deny 优先；`.gitignore` 只新增 `.newcode/worktrees/`，不忽略指令文件/其它 `.newcode` 内容。
+- [ ] **T1** 类型/错误/状态/资源固定；P0启动上限、Pt只收窄快照、At审批门独立；事务commit/投影/delivery proof JSON-safe，无secret/权限运行对象。
+- [ ] **T2** Team store root/name/config校验；workspace binding/reparse containment有效；项目配置只收窄；默认 Teams disabled。
+- [ ] **T3** owner锁/CAS内单提交记录含业务after-image/outbox/幂等/sequence/完整广播；fsync及目录持久化后才投影/wake；每步crash/replay无静默丢信/重复业务变更；日志损坏拒绝、投影可重建；不靠mtime回收锁。
+- [ ] **T4** Chapter9脱敏/配对/指纹/预算正确；processed-ID与有效checkpoint同发布单元，Context压缩不丢去重元数据；他人/旧generation/截断观察不能证明交付，权限确认不持久化。
 
 Phase 1 命令：
 
 ```powershell
 .venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest tests/test_subagents_discovery.py tests/test_worktrees_paths.py tests/test_worktrees_git.py tests/test_worktrees_config.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-phase1"
+.venv\Scripts\python.exe -m pytest tests/test_teams_types.py tests/test_teams_paths.py tests/test_teams_store.py tests/test_teams_checkpoints.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-phase1"
 git -c safe.directory=F:/agent/Newcode diff --check
 ```
 
-**Phase 1 退出門：** 4 项全通过；path/reparse containment 不确定则停止，不创建 Worktree。
+**Phase 1 退出门：** 四项通过；路径、ACL 或跨进程锁不确定时不得进入持久 Team write。
 
-## Phase 2：创建、ownership、注册和状态（T5–T8）
+## Phase 2：任务、邮箱、审批（T5–T8）
 
-- [ ] T5：Worktree lease/status/owner marker/进程与跨进程锁只包含安全字段，不写 SessionArchive。
-- [ ] T6：临时 repo 上 `worktree add -b` 创建后 manager 复核注册；repo/user/global fixture `post-checkout` hooks sentinel 均未执行；已存在路径或 branch 不覆盖、不启动 child。
-- [ ] T7：恢复验证同时匹配 manager lease、owner marker、canonical top-level/common-dir、branch、HEAD 和唯一 worktree registration；只读 Git 查询也不触发 fixture hooks；单凭目录存在绝不复用。
-- [ ] T8：创建中断只回滚本次创建且 ownership/registration/cleanliness全通过资源；冲突/状态未知时保留；清理失败不影响其它 task。
+- [ ] **T5** Task CRUD/版本/CAS/状态机正确；重复 claim 幂等、冲突不覆盖。
+- [ ] **T6** DAG 拒绝 missing/self/cycle；依赖未完成不可 claim/执行；delete限制有效。
+- [ ] **T7** read不ack；ack校验本人/有效checkpoint ID/generation；同键异正文拒绝；message ID/幂等/sequence/广播清单/投影/checkpoint/ack每中间步crash验证；系统kind不可伪造；投递去重不宣称LLM/外部副作用exactly-once。
+- [ ] **T8** 仅可信服务提交计划/审批业务+outbox同事务；actor来自runtime，文字“同意”无效；修订使At批准失效，不改变P0/Pt/Permission；DO待批协调写与PLAN不写分开测试。
 
 Phase 2 命令：
 
 ```powershell
 .venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest tests/test_worktrees_git.py tests/test_worktrees_manager.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-phase2"
+.venv\Scripts\python.exe -m pytest tests/test_teams_types.py tests/test_teams_store.py tests/test_teams_tasks.py tests/test_teams_mailbox.py tests/test_teams_approvals.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-phase2"
 git -c safe.directory=F:/agent/Newcode diff --check
 ```
 
-**Phase 2 退出门：** local Git create/list/verify 与故障注入都通过；所有 Manager Git 命令的 fixture hooks 均零执行（包含 add/checkout）；无 force/prune/remote；否则停止。
+**Phase 2 退出门：** task/mailbox/approval race及每提交窗口恢复全过；多记录提交不能仅凭atomic replace宣称一致；owner/lock不明时零覆盖。
 
-## Phase 3：cwd、工具、Permission 与缓存根隔离（T9–T14）
+## Phase 3：运行后端（T9–T11）
 
-- [ ] T9：ToolContext/child context 的 canonical `workspace_root`、`cwd`、identity明确分离；默认 cwd 兼容旧 root；无 `chdir`。
-- [ ] T10：`read_file/write_file/replace_in_file/find_files/search_code` 使用 child root；相对 traversal、absolute path、symlink/junction escape拒绝；主 workspace同名文件不受写入。
-- [ ] T11：Permission request、normalized path、sandbox root全是 child Worktree root；Plan/Do、hard deny、Permission gates不变。
-- [ ] T12：read cache 的 key 含 canonical root、worktree/task identity、absolute file path 与 stat signature；不同 Worktree相同相对路径不命中。
-- [ ] T13：`.git` pointer验证指向当前 task admin dir；只允许受限只读 `status --no-optional-locks`、`diff --no-ext-diff --no-textconv`、`log/show/cat-file/ls-files`、受限 `rev-parse`。`git add/commit/update-ref`、ref/config/worktree 写操作及未列命令拒绝；当前 task admin（含 index/HEAD）与共享 metadata 对 child 全只读。`run_command` 不执行原始 shell；越权写入零副作用，解析/ACL/hooks不能证明则子进程零启动。
-- [ ] T14：现有 context artifact/Memory/instructions/Skill派生状态按 canonical source root区分；child artifact只在自己的 sandbox root写入并清理；Memory/Archive/Hook/parent Skill state不共享。
+- [ ] **T9** backend precedence稳定；probe仅版本/模块--check/能力，无pane/socket创建；start的资源验证单独列出；显式不可用不fallback。
+- [ ] **T10** synchronous AgentLoop 在有界 worker内执行；同一成员串行；idle不发请求；取消和shutdown共享1秒总等待。
+- [ ] **T11** 唯一`newcode/teams/worker.py` / `python -m newcode.teams.worker`实际模块可启动；tmux内层多参数direct-exec、参数原样/特殊字符零注入有真实证据，非仅外层shell=False。错误peer/重复executor拒绝，IPC/pane/握手/lease各步失败只清本次资源，secret只走私有IPC。
 
 Phase 3 命令：
 
 ```powershell
 .venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest tests/test_worktrees_command_sandbox.py tests/test_subagents_worktrees.py tests/test_tools_workspace.py tests/test_permissions_sandbox.py tests/test_context_artifacts.py tests/test_memory_store.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-phase3"
+.venv\Scripts\python.exe -m pytest tests/test_teams_backends.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-phase3"
 git -c safe.directory=F:/agent/Newcode diff --check
 ```
 
-**Phase 3 退出门：** 五个结构化 file/search tools全通过；Git只读 allowlist与 `add/commit/update-ref` 等写命令拒绝矩阵通过；common objects/refs及当前 index/HEAD、config/logs、main/other Worktree admin metadata对 child 均只读，越权操作零副作用；command sandbox/解析/hooks无法证明隔离即保持 fail closed，不可进入宣称完整 Worktree command support。
+**Phase 3 退出门：** lightweight独立通过；模块自检/假后端与真实pane证据分别记录；无tmux则pane unavailable/未验证，不阻塞lightweight、不标两后端均已验收、不自动安装。
 
-## Phase 4：配置初始化、Runner 和结果（T15–T18）
+## Phase 4：成员执行、恢复、Worktree lease（T12–T15）
 
-- [ ] T15：本地 tracked/ignored copy均是精确文件 allowlist；默认空、project只能缩小、秘密/runtime路径即使 allowlisted仍拒绝；无递归目录复制。
-- [ ] T16：dependency link仅 user trusted canonical read-only targets；未知/outside/writable/无法验证的link不创建，安全继续。
-- [ ] T17：Chapter 14 hooks execution allowlist固定为空；repo/user/global hooks sentinel在每种 Manager Git命令（特别 `worktree add`）下均零执行；empty hooks override缺失时 Git命令零启动。
-- [ ] T18：Worktree Definition先创建并验证 lease再启动child；所有结束路径finally finish；返回脱敏状态/branch/path；Fork/shared原行为保持。
+- [ ] **T12** member独立状态/权限且不继承Lead allow；require_confirmation非交互拒绝、executor及主confirmer零调用；存启动B。MCP/Hook实例独立不算隔离，无目录隔离证明则成员MCP/Hook shell/HTTP禁用，stdio cwd不隐式更改。
+- [ ] **T13** natural final先checkpoint再事务发布idle/outbox；read后checkpoint不自动ack、crash恢复去重；pause/stop关闭auto_wake直到显式resume；in-flight工具真实退出后才给静止证明，idle/cancel标记不足；异常保留旧checkpoint。
+- [ ] **T14** CLI重启恢复做 workspace/pairing/budget校验并重建permission；不恢复session allow/provider等runtime object。
+- [ ] **T15** Team-specific lease resume逐项验证owner/marker/path/branch/HEAD/common-dir/唯一registration/锁；unknown时不启动、不回退shared。
 
 Phase 4 命令：
 
 ```powershell
 .venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest tests/test_worktrees_setup.py tests/test_subagents_worktrees.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-phase4"
+.venv\Scripts\python.exe -m pytest tests/test_teams_checkpoints.py tests/test_teams_members.py tests/test_teams_worktree_resume.py tests/test_subagents_worktrees.py tests/test_worktrees_manager.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-phase4"
 git -c safe.directory=F:/agent/Newcode diff --check
 ```
 
-**Phase 4 退出门：** setup任何失败均不泄露文件或破坏主 Agent；结果无diff、secret、stderr/stack trace。
+**Phase 4 退出门：** 不继承临时授权，Worktree owner不明不复用；旧父/新父session不串状态。
 
-## Phase 5：变更保护、过期清理、CLI lifecycle（T19–T22）
+## Phase 5：工具、权限与 CLI role attach（T16–T19）
 
-- [ ] T19：tracked/staged/untracked/ignored 文件或目录、领先 upstream commit导致 preserve；child 创建 ignored file后不得自动删除；no upstream、offline、Git错误/timeout、扫描不完整/状态未知都 preserve；只清理逐项验证的本任务 temp 后重新检查；不 fetch。
-- [ ] T20：30天以上只是候选；path/Git ownership/activity三层门全部通过，且再次确认 tracked/staged/untracked/ignored 均空、root scan完整、upstream安全后才删；main/user/root外/link/unknown/active都拒绝。
-- [ ] T21：EOF、`/exit`、KeyboardInterrupt、异常、startup异常、`/clear`、`/resume`都取消或有限等待旧 task；Worktree cleanup失败不阻断Hook→Memory→Context→MCP。
-- [ ] T22：只有父 AgentLoop主线程安全点按序一次投递结果；session/generation匹配；collect通知互斥；Worktree state不写父archive。
+- [ ] **T16** spec五工具每operation的角色、必填/可选/禁止字段、状态、读写、结果/错误完整矩阵测试；拒绝伪造身份/其它operation字段；target不是actor；普通会话/SubAgent零Team工具。
+- [ ] **T17** 每请求与executor前重算P0∩Pt∩At及全部gate；旧响应在修订/失批/Do→Plan/Skill收窄后零执行；DO待批只准明确协调写、PLAN仅status；成员require_confirmation拒绝、主confirmer零调用；批准不生成grant/恢复收窄能力。
+- [ ] **T18** `/team lead/open/status/close` 静态且workspace-bound；`/clear`/`/resume` detach，不把旧消息注入新session；无Team时CLI行为不变。
+- [ ] **T19** user config AND env开启coordinator，project不可开启；直接allowlist只准读取+五Team工具/本地命令；委派P0独立且不扩权，仍受父mode/Skill/Pt/Permission。ordinary agent/Skill runner/MCP discovery/Hook shell/HTTP及未知入口全拒绝；旧队列/在途动作重验、静止后才进入。
 
 Phase 5 命令：
 
 ```powershell
 .venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest tests/test_worktrees_manager.py tests/test_subagents_worktrees.py tests/test_cli_worktrees.py tests/test_agent_loop_subagents.py tests/test_cli_subagents.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-phase5"
+.venv\Scripts\python.exe -m pytest tests/test_teams_tools.py tests/test_teams_policy.py tests/test_agent_loop_teams.py tests/test_cli_teams.py tests/test_agent_loop.py tests/test_agent_loop_permissions.py tests/test_agent_scheduler.py tests/test_cli_commands.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-phase5"
 git -c safe.directory=F:/agent/Newcode diff --check
 ```
 
-**Phase 5 退出门：** dirty/ahead/ignored/untracked/unknown永不自动删除；ignored scan不完整视为 unknown；各退出 cleanup有限且失败隔离；否则停止最终验收。
+**Phase 5 退出门：** 无 Team 权限旁路；Plan mode无 mutation tool；普通CLI/命令/Skill/MCP语义通过回归。
 
-## Phase 6：完整回归与 local acceptance（T23–T26）
+## Phase 6：受控代码集成（T20–T22）
 
-- [ ] T23：Chapter 14、SubAgent、tools、Permission、Plan/Do、Context、Memory、MCP、Skill、Hook、Commands、CLI targeted regression通过，逐项记录 skip原因。
-- [ ] T24：`compileall newcode` 与全量 pytest通过；所有skip有环境/fixture原因，不隐藏失败。
-- [ ] T25：静态审计确认 Provider不知Worktree、无shell Git injection、每条 Manager Git命令禁hooks、child root贯通；Git命令矩阵只读 allowlist 生效，add/commit/update-ref及未列写操作被拒绝且零副作用；common objects/refs、当前 index/HEAD、main/其他 Worktree admin metadata均不可写；command sandbox有证据或 fail closed；MCP cwd兼容；cleanup三层门含 ignored scan；Cache根隔离；shared行为不变。
-- [ ] T26：fake provider + 临时 repo演示 shared 与 Worktree Definition；读写不污染main；完成后 clean tree被清理，dirty tree保留并返回branch/path；cancel/timeout/clear/resume/EOF/exit/exception安全退出。
+- [ ] **T20** 存B、解析实际目标T/M；executor lease/屏障证明全部工具静止，不凭idle/cancel。单写者用户确认；外部编辑不受Manager锁保护。冻结B相对manifest/blobs含staged+unstaged/新增/删除/二进制，大小/secret/link/ignored冲突拒绝；preview只读、digest不符拒绝。
+- [ ] **T21** B上快照commit S、M上三方merge成I、目标cwd ff-only同步branch/index/worktree并复核；两成员同B与目标已有第一成员提交测试；冲突不选边。每阶段crash/超时、幂等识别S/I、applying_target只读恢复、外部HEAD/index/文件变化和unknown保留全部成果；hooks零执行，无reset/clean/force/删分支，不声称整体原子。
+- [ ] **T22** coordinator只走同一固定integration API；所有其它副作用入口无旁路；Permission拒绝零Git写，单写者/静止/阶段恢复门同样生效。
 
-Phase 6 targeted 与全量命令：
+Phase 6 命令：
 
 ```powershell
 .venv\Scripts\python.exe -m compileall newcode
-.venv\Scripts\python.exe -m pytest tests/test_worktrees_paths.py tests/test_worktrees_git.py tests/test_worktrees_config.py tests/test_worktrees_manager.py tests/test_worktrees_setup.py tests/test_worktrees_command_sandbox.py tests/test_subagents_worktrees.py tests/test_subagents_types.py tests/test_subagents_discovery.py tests/test_subagents_manager.py tests/test_subagents_policy.py tests/test_subagents_runner.py tests/test_subagents_tool.py tests/test_subagents_budget.py tests/test_agent_loop.py tests/test_agent_loop_permissions.py tests/test_agent_loop_subagents.py tests/test_agent_scheduler.py tests/test_agent_modes.py tests/test_cli_worktrees.py tests/test_cli_subagents.py tests/test_tools_file.py tests/test_tools_search.py tests/test_tools_command.py tests/test_tools_executor.py tests/test_permissions_sandbox.py tests/test_permissions_manager.py tests/test_permissions_modes.py tests/test_context_artifacts.py tests/test_context_manager.py tests/test_memory_store.py tests/test_memory_service.py tests/test_mcp_manager.py tests/test_mcp_permissions.py tests/test_skills_loader.py tests/test_skills_state.py tests/test_hooks_engine.py tests/test_commands_registry.py tests/test_commands_dispatcher.py tests/test_deepseek_provider.py tests/test_provider_tool_calls.py tests/test_cli.py tests/test_cli_session.py tests/test_cli_mcp.py tests/test_cli_hooks.py tests/test_cli_context.py tests/test_cli_memory.py tests/test_cli_skills.py tests/test_cli_commands.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-regression"
-.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-final"
+.venv\Scripts\python.exe -m pytest tests/test_teams_integration.py tests/test_teams_policy.py tests/test_worktrees_git.py tests/test_worktrees_manager.py tests/test_worktrees_command_sandbox.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-phase6"
 git -c safe.directory=F:/agent/Newcode diff --check
 ```
 
-**最终退出门：** targeted + full pytest + static audit + local Git/CLI acceptance全部通过；hooks sentinel零执行、共享 Git metadata隔离与 ignored-file preserve 均有回归证据；不使用真实网络、生产 secrets、第三方 MCP、生产 hooks、tmux或全局 Git config。任何不确定状态列为未完成。
+**Phase 6 退出门：** 非main目标与branch/index/worktree全同步、两成员同B/删除/二进制/外部并发/每阶段崩溃测试全过；dirty/真实活动/锁/冲突/unknown均保留；目标没有自动回滚，临时abort也需验证归属。
 
-## 需记录的证据
+## Phase 7：生命周期、全量回归与验收（T23–T26）
 
-- 每个临时 repository 的 `git worktree list --porcelain`、branch、HEAD、common-dir 检查结果（测试输出只保留脱敏必要字段）。
-- 主 workspace和 child root的文件内容对照；sandbox拒绝结果。
-- command sandbox实际证明或 fail-closed零启动证据。
-- dirty/ahead/no-upstream/unknown的保留证明及三层过期过滤证据。
-- CLI退出事件及cleanup顺序、每项是否有界、failure isolation。
-- 全量 pytest通过数、每个skip原因、最终 diff check结果。
+- [ ] **T23** EOF/exit/KeyboardInterrupt/异常/startup failure/clear/resume均有限清理；team failure不阻断SubAgent→Hook→Memory→Context→Worktree→MCP；单一1秒总等待；双重关闭幂等。
+- [ ] **T24** Chapter4–15 targeted与静态审计覆盖全部operation契约、P0/Pt/At/confirmation、邮箱多记录崩溃一致性、coordinator所有入口、B/S/M/I及外部并发局限、pane真实证据；Provider无Team导入，普通会话既有能力兼容，Hook placeholder继续unavailable。
+- [x] **T25** compileall与全量pytest通过；所有skip写明具体平台/fixture原因；`git diff --check`通过。
+- [x] **T26** fake CLI/local Git 验收由既有 CLI、审批/邮箱/恢复、Lead/coordinator 集成用例组合覆盖 create→spawn→task/mailbox/approval→idle/wake/reopen→preview/integrate/cleanup。pane仅真实tmux+process+IPC运行后标通过，否则标未验证。
+
+Chapter15 targeted regression（只引用前序 Phase 已创建的 Team tests）：
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_teams_types.py tests/test_teams_paths.py tests/test_teams_store.py tests/test_teams_checkpoints.py tests/test_teams_tasks.py tests/test_teams_mailbox.py tests/test_teams_approvals.py tests/test_teams_backends.py tests/test_teams_members.py tests/test_teams_worktree_resume.py tests/test_teams_tools.py tests/test_teams_policy.py tests/test_teams_integration.py tests/test_teams_lifecycle.py tests/test_agent_loop_teams.py tests/test_cli_teams.py tests/test_agent_loop_subagents.py tests/test_cli_subagents.py tests/test_worktrees_manager.py tests/test_worktrees_git.py -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-regression"
+```
+
+全量验收：
+
+```powershell
+.venv\Scripts\python.exe -m compileall newcode
+.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-final"
+git -c safe.directory=F:/agent/Newcode diff --check
+```
+
+**最终退出门：** targeted+full pytest、静态审计、本地 Git/CLI acceptance完成；任何真实 pane、symlink/reparse、OS ACL、IPC或锁能力未运行必须明示未验证，不能标为通过。不得暂存、提交或push作为验收步骤。
+
+### Chapter 15 最终执行记录（T25–T26）
+
+- `.venv\Scripts\python.exe -m compileall newcode`：通过。
+- T26 复用专项：`test_cli_real_member_agentloop_through_fake_factory`、结构化计划审批、mail/wake/checkpoint 去重、跨 generation 恢复、pause/resume owner、`test_t21_real_tool_permission_manager_and_local_git`（Lead/coordinator）、双成员同基准集成；**9 passed，491.34s**。覆盖分布在既有用例中，并非单个串联脚本；未重复建立一套 E2E 测试。
+- 全量：`.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-final"`：**1181 passed, 13 skipped, 0 failed，2828.13s**。
+- 13 个 skip：Context artifact、Permission sandbox、tools workspace 的链接 fixture（Windows `WinError 1314`）；Hook loader、instructions、Memory、session persistence、skills、subagents、worktrees 的符号链接 fixture（当前环境 OSError/不支持）；Team backend 真实 pane（未安装 tmux）。symlink/reparse、真实 pane 均未据此记为通过。
+- `git -c safe.directory=F:/agent/Newcode diff --check`：通过。Windows、当前用户权限条件下执行；非 Windows 与真实断电恢复未验证。轻量团队路径验收通过，不代表 pane 等所有后端均验收通过。

@@ -1,292 +1,293 @@
-# Chapter 14：Git Worktree —— 原子任务
+# Chapter 15：Agent Teams —— 原子任务
 
-## 任务约定
+## 执行约定与范围
 
-- 只在 Chapter 14 获批后实施；每个 Phase 内按编号顺序执行，Phase compileall、targeted pytest、`git diff --check` 全过才进入下一 Phase。
-- Git 测试仅用临时本地 repositories/fake executable；不 remote、不 push、不改全局 Git 配置。
-- 当前 Git/ToolContext/Permission/CLI 的实际限制以 `spec.md` 为准：特别是 `run_command` 没有 OS sandbox 时必须 fail closed。
-- 下表是最大文件范围；某任务没有授权的模块不得顺便修改。新增最小测试 fixture 只能放在对应测试文件。
+- 仅在 Chapter 15 四份文档获批后实施。Phase 顺序 Phase 1 → 7；每 Phase 的 compileall、targeted pytest、`git diff --check` 全过才继续。
+- 测试默认 fake Provider/backend、临时 home/workspace、本地 Git repo、fake/local IPC；不访问 remote、不 push、不使用生产 secret、第三方 MCP、生产 Hook，不改全局 Git 配置。
+- 当前 Provider 与 AgentLoop 均同步；不得为了协程重构 Provider。Team 不改变 Chapter13 SubAgent 语义；Hook `subagent` action 保持 unavailable。
+- 单任务允许文件为最大范围，不允许顺带改其他模块。跨 Phase 文件变更必须由具体 Task 明确列出。新增依赖默认禁止。
+- 测试文件先在同 Phase 的第一个相关 Task 中创建；后续任务才可引用。当前环境无 tmux；真实 pane 测试如果仍无可用环境只能标未验证，不能以 fake mock 代替。
 
-## 文件清单
+## 文件目录
 
-| 用途 | 允许新增/修改文件 |
+| 功能 | 允许新增/修改文件 |
 |---|---|
-| Worktree 核心 | `newcode/worktrees/__init__.py`、`types.py`、`paths.py`、`git.py`、`manager.py`、`setup.py`、`command_sandbox.py` |
-| Definition / child | `newcode/subagents/types.py`、`discovery.py`、`runner.py`、必要时 `manager.py`、`policy.py`、`tool.py` |
-| cwd/工具安全 | `newcode/tools/types.py`、`workspace.py`、`file_tools.py`、`search_tools.py`、`command_tool.py`、`newcode/permissions/normalizer.py`、`sandbox.py` |
-| 根身份派生状态 | 必要时 `newcode/context/artifacts.py`、`newcode/memory/store.py` |
-| CLI lifecycle | `newcode/cli.py` |
-| 忽略规则 | `.gitignore`（仅追加 `.newcode/worktrees/`） |
-| 单元测试 | `tests/test_worktrees_paths.py`、`test_worktrees_git.py`、`test_worktrees_config.py`、`test_worktrees_manager.py`、`test_worktrees_setup.py`、`test_worktrees_command_sandbox.py` |
-| 集成测试 | `tests/test_subagents_worktrees.py`、`tests/test_cli_worktrees.py`、必要时 `tests/test_agent_loop_subagents.py`、`test_tools_workspace.py`、`test_permissions_sandbox.py`、`test_context_artifacts.py`、`test_memory_store.py`、`test_mcp_manager.py` |
-
-`pyproject.toml` 仅当测试直接证明新增 production module 无法打包时允许最小改动；本章默认不新增依赖。
-
-## Phase 1：模型、路径、Git runner 与配置校验（T1–T4）
-
-### T1：Definition isolation schema
-
-- **前置条件：** Chapter 13 AgentDefinition/discovery 测试通过；已读定义 frontmatter 当前校验。
-- **允许文件：** `newcode/subagents/types.py`、`newcode/subagents/discovery.py`、`tests/test_subagents_discovery.py`。
-- **实现动作：** 增加 `shared|worktree` 字段；缺省 shared；非法值使单 Definition 隔离失败且不阻断 catalog 其它项；Fork 不读取 isolation。
-- **测试：** 缺省/两合法值/非法值/无效高优先级隔离；已有 Definition/Fork 兼容。
-- **完成判定：** 目录 projection 不暴露额外敏感字段，旧 Agent 行为保持不变。
-- **禁止边界：** 不创建 Worktree，不改主 AgentLoop/CLI/Provider/Permission。
-
-### T2：Worktree 名称与路径校验
-
-- **前置条件：** T1 完成；锁定 spec 的 root 和命名规则。
-- **允许文件：** `newcode/worktrees/__init__.py`、`types.py`、`paths.py`、`tests/test_worktrees_paths.py`。
-- **实现动作：** 校验安全 slug、task ID、slash 段、长度；生成 `<repo>/.newcode/worktrees/<agent-slug>/<task-id>` 与受控 branch；拒绝绝对路径、盘符、UNC、反斜杠、空段、dot 段、链接/junction、非普通文件/目录和 canonical escape。
-- **测试：** 分段、最大长度、slash 深度、Windows drive/UNC、POSIX absolute、junction/symlink（环境不支持则只 skip 创建）、root containment 与 branch unsafe 输入。
-- **完成判定：** 任意非法输入稳定为 `worktree_path_invalid` 或专用冲突码，无文件副作用。
-- **禁止边界：** 不允许模型直接给 filesystem path 或 Git ref；不执行 Git。
-
-### T3：固定 argv Git adapter
-
-- **前置条件：** T2 完成。
-- **允许文件：** `newcode/worktrees/git.py`、`types.py`、`tests/test_worktrees_git.py`。
-- **实现动作：** 注入可执行文件/fake runner；固定 argv、cwd、受控 env、shell=False、timeout、最大输出；每条 manager 命令强制 `-c core.hooksPath=<manager-owned-empty-dir>`、禁用 system/global config、prompt 和 fsmonitor；包装 repo root/common-dir/head/ref/list/status/ignored/upstream/check-ref-format 只读调用。
-- **测试：** fake runner 断言 argv 分项、shell=False、empty hooks override 在所有子命令存在、system/global config 被禁用、无模型参数注入；timeout、异常、非零 exit、畸形/超长输出脱敏。
-- **完成判定：** 不调用网络/Git 任意命令，错误只产生稳定安全码。
-- **禁止边界：** 本任务无 `worktree add/remove` mutation；不暴露 subprocess stderr。
-
-### T4：用户/项目 Worktree 初始化配置
-
-- **前置条件：** T2–T3 完成。
-- **允许文件：** `newcode/worktrees/setup.py`、`types.py`、`tests/test_worktrees_config.py`、`.gitignore`。
-- **实现动作：** strict YAML user trust ceiling 和 project subset；未知字段/坏条目隔离；硬拒绝 secrets/runtime state；只向 `.gitignore` 追加 `.newcode/worktrees/`。
-- **测试：** 两层顺序、project 不扩大 user allowlist、单项坏配置隔离、敏感名即使显式 allow 也拒绝、`git check-ignore` 临时 repo 验证准确忽略 Worktree root 而不忽略 `.newcode/INSTRUCTIONS.md` 等。
-- **完成判定：** config 坏值不会阻断 shared CLI；ignore scope 精确。
-- **禁止边界：** 不复制文件、不调用 `git add`、不覆盖已有 `.gitignore` 规则。
-
-**Phase 1 gate：** `compileall newcode`；`test_subagents_discovery.py test_worktrees_paths.py test_worktrees_git.py test_worktrees_config.py` targeted；`git diff --check`。全通过才进入 T5。
-
-## Phase 2：Manager 创建、注册验证与状态（T5–T8）
-
-### T5：Lease、owner marker、锁和生命周期模型
-
-- **前置条件：** Phase 1 全通过。
-- **允许文件：** `newcode/worktrees/types.py`、`manager.py`、`tests/test_worktrees_manager.py`。
-- **实现动作：** 定义 Worktree lease/status/error/lock interface；ownership marker 存于 canonical common Git dir 的专用 NewCode metadata 子目录，不在 child checkout；marker 含版本、owner token、repo identity、branch/path/task ID；跨进程锁与进程内占用表。
-- **测试：** 状态转换合法/非法、marker schema、task lock 双占、锁释放与 owner mismatch。
-- **完成判定：** marker 不包含 secret，状态不写入 Chapter13 SessionArchive。
-- **禁止边界：** 不扫描/删除任意 Worktree，不在 worker 修改父状态。
-
-### T6：Worktree add 创建路径
-
-- **前置条件：** T5 完成。
-- **允许文件：** `newcode/worktrees/git.py`、`manager.py`、`tests/test_worktrees_manager.py`、`tests/test_worktrees_git.py`。
-- **实现动作：** 锁定 repo/task；验证 non-bare、canonical root/common dir/base HEAD、目标与 ref 未占用；先登记可回滚 owner lease，再经 T3 hook-safe wrapper 固定 argv 执行 `worktree add -b`；成功后查询并校验注册信息才返回 ready lease。
-- **测试：** 临时本地 git init repo 创建成功，两个 worktree branch/path 唯一；repo/bare/invalid HEAD、branch/path collision、git error/timeout fail closed；为 repo `.git/hooks/post-checkout`、user/global hooksPath fixture 放置 sentinel，worktree add checkout 全过程 sentinel 不得创建；不依赖 network。
-- **完成判定：** create 成功唯一返回已验证 lease；拒绝不启动 child。
-- **禁止边界：** 不用 `--force`、shell 字符串、push/fetch、现存分支覆盖。
-
-### T7：注册校验与已有目录拒绝/受控恢复
-
-- **前置条件：** T6 完成。
-- **允许文件：** `newcode/worktrees/git.py`、`manager.py`、`tests/test_worktrees_manager.py`。
-- **实现动作：** 比较 porcelain list、show-toplevel、common-dir、symbolic branch、HEAD、owner marker、Manager lease；仅当前 manager 已登记且未占用的同 task 可复验；其他已存在目标统一拒绝。只读查询也经 T3 hooks/config 隔离 wrapper。
-- **测试：** 删除登记、伪造 marker、别的 common dir、branch/path/head 改变、重复 registration、detached HEAD、已占用、单凭目录存在恢复等拒绝；list/rev-parse 查询不触发 fixture hooks。
-- **完成判定：** 每项拒绝无删除、无启动、无复用副作用。
-- **禁止边界：** 不做跨进程 resume，不调用 prune。
-
-### T8：安全回滚和失败隔离
-
-- **前置条件：** T6–T7 完成。
-- **允许文件：** `newcode/worktrees/manager.py`、`git.py`、`tests/test_worktrees_manager.py`。
-- **实现动作：** create 半途失败时，只对本 manager-created、marker+registry 双重证明、无用户变更且未占用资源做 remove；其它情况 preserve+diagnostic。
-- **测试：** add 前后每阶段注入故障、并发 race、registration 失败、cleanup 命令失败；相邻任务仍可创建/运行。
-- **完成判定：** rollback 永不删除先存目录、分支或他人 worktree。
-- **禁止边界：** 禁止递归删除公共 Worktree root、force remove、自动 branch -D。
-
-**Phase 2 gate：** `compileall newcode`；`test_worktrees_git.py test_worktrees_manager.py` targeted；`git diff --check`。通过后进入 T9。
-
-## Phase 3：cwd、sandbox、内置工具与缓存（T9–T14）
-
-### T9：不可变 child execution context
-
-- **前置条件：** Phase 2 通过。
-- **允许文件：** `newcode/tools/types.py`、`newcode/subagents/types.py`、`newcode/worktrees/types.py`、相应类型测试。
-- **实现动作：** ToolContext 增加 canonical `cwd`、workspace identity；旧构造保持 cwd 默认为 workspace root；Worktree root 与 cwd 一致但语义独立。
-- **测试：** 默认兼容、相对/非 canonical cwd 拒绝或归一、安全 root identity 不可变。
-- **完成判定：** 不调用/修改 process cwd；旧 caller 可继续构造 ToolContext。
-- **禁止边界：** 不全局 `chdir`，不在 ToolContext 放入可变父 session。
-
-### T10：workspace resolver 与文件/搜索工具
+| Team 数据/路径/配置/存储 | `newcode/teams/__init__.py`、`types.py`、`paths.py`、`config.py`、`store.py`、`tasks.py`、`mailbox.py`、`approvals.py` |
+| 后端/成员/工具/集成 | `newcode/teams/backends.py`、`runtime.py`、`member.py`、`tools.py`、`coordinator.py`、`integration.py`、`worker.py` |
+| 既有系统集成 | `newcode/agent/loop.py`、`mode.py`、必要时 `newcode/tools/registry.py`、`newcode/commands/builtins.py`、`newcode/cli.py`、`newcode/permissions/manager.py`、`normalizer.py`、`builtins.py`、`newcode/worktrees/manager.py`、`git.py`、`types.py` |
+| Team 单测 | `tests/test_teams_types.py`、`test_teams_paths.py`、`test_teams_store.py`、`test_teams_checkpoints.py`、`test_teams_tasks.py`、`test_teams_mailbox.py`、`test_teams_approvals.py`、`test_teams_backends.py`、`test_teams_members.py`、`test_teams_worktree_resume.py`、`test_teams_tools.py`、`test_teams_policy.py`、`test_teams_integration.py`、`test_teams_lifecycle.py` |
+| 集成回归 | `tests/test_agent_loop_teams.py`、`tests/test_cli_teams.py`、必要时 `tests/test_agent_loop_subagents.py`、`tests/test_cli_subagents.py`、`tests/test_worktrees_manager.py`、`tests/test_worktrees_git.py` |
+
+## Phase 1：模型、路径和持久化（T1–T4）
+
+### T1：Team/Member/Task/Message/Plan 模型与错误码
+
+- **前置条件：** 已阅读现有 Agent/Permission/Session 类型；确认 session format 和 workspace fingerprint 规则。
+- **允许文件：** `newcode/teams/__init__.py`、`newcode/teams/types.py`、`tests/test_teams_types.py`。
+- **实现动作：** 定义稳定ID、roles、Team/Member/Task/Plan/Message/status/error enum、资源常量、事务commit/投影/交付证明模型；分离启动P0、只收窄Pt及业务审批At。错误码与spec逐operation契约一致；awaiting_approval不等于AgentMode.PLAN。
+- **测试：** 同Task创建types tests；字段严格/边界/无secret runtime、全部合法与非法转换；paused/interrupted可校验恢复、integrated不可恢复，固定错误码。
+- **完成判定：** 所有数据类型可 JSON-safe 表达且稳定序列化/反序列化；Phase 后续只依赖该模型。
+- **禁止边界：** 不写文件、不创建 worker、不改现有通用模型/Provider。
+
+### T2：Team 名称、路径与配置安全
+
+- **前置条件：** T1。
+- **允许文件：** `teams/paths.py`、`teams/config.py`、`tests/test_teams_paths.py`。
+- **实现动作：** 固定 `~/.newcode/teams/<team-id>` 和 YAML 配置入口；校验 Team/member ID/name、workspace fingerprint、canonical containment、普通文件/目录、symlink/junction/reparse 与 ACL；strict user/project config merge，project 只能收窄；配置缺省禁用 Teams。
+- **测试：** 同 Task 创建 `test_teams_paths.py`；覆盖绝对/相对 traversal、盘符/UNC、casefold collision、link escape、ACL unavailable、user/project merge、project 无法启用 Teams/coordinator/放宽限制。
+- **完成判定：** 安全失败在创建/读取前发生，不产生 outside 目标副作用；config 所有字段和默认值有断言。
+- **禁止边界：** 不读取 Provider secret、不修改 AppConfig/Permission 行为、不创建真实用户目录。
+
+### T3：原子 TeamStore、跨进程锁与 CAS
+
+- **前置条件：** T1–T2。
+- **允许文件：** `teams/store.py`、必要时 `types.py/paths.py`、`tests/test_teams_store.py`。
+- **实现动作：** owner OS锁内校验CAS，单个不可变事务含业务after-image/outbox/ID/幂等/sequence/全广播收件人清单；temp+fsync+排他发布commit及目录持久化后才更新投影并通知。实现启动replay先于读写、日志512KiB/事务及8,192条/64MiB上限；commit链损坏拒绝写，投影可重建。不以mtime回收锁。
+- **测试：** 同Task创建store tests；事务生成/发布/投影各步崩溃，commit前不返回成功、commit后重放不重复业务操作；广播中途crash无丢收件人、sequence/幂等恢复；CAS/双进程lock/owner unknown/root替换/容量。有效journal与投影损坏分开测试。
+- **完成判定：** lock/目录持久性不可证明fail closed；单文件替换不宣称多文件原子，重放以已提交事务为事实来源。
+- **禁止边界：** 不删除 Team/Member 文件，不依赖内存锁代替跨进程锁。
+
+### T4：脱敏成员 checkpoint 与恢复适配
+
+- **前置条件：** T3；复用 Chapter9 `SessionArchive` 实际 JSONL 规则。
+- **允许文件：** `teams/member.py`、必要时 `store.py/types.py`、`tests/test_teams_checkpoints.py`。
+- **实现动作：** 每Member专用sessions子根；Chapter9兼容脱敏/工具配对/指纹JSONL与processed-message-ID元数据同次原子发布；绑定team/member/session generation，不能用独立receipt代替有效checkpoint；Lead邮箱同规则。恢复重建ChatSession与预算，不存临时授权。
+- **测试：** 同Task创建checkpoint tests；secret/bad line/未配对截断/跨workspace/失败保留旧checkpoint；processed-ID与正文发布crash、被截断观察不可作为ack证明、Context摘要后去重元数据保留。
+- **完成判定：** 每个 Member 独立 session archive；不写主 SessionArchive。
+- **禁止边界：** 不启动 AgentLoop/后端、不改变 Chapter9 persistence 行为。
+
+**Phase 1 gate：** `compileall newcode`；针对 `test_teams_types.py test_teams_paths.py test_teams_store.py test_teams_checkpoints.py`；`git diff --check`。
+
+## Phase 2：任务、邮箱与计划审批（T5–T8）
+
+### T5：共享 Task CRUD/state machine
+
+- **前置条件：** Phase1通过。
+- **允许文件：** `teams/tasks.py`、`store.py/types.py`、`tests/test_teams_tasks.py`。
+- **实现动作：** task create/list/get/assign/claim/update/complete/delete；CAS revision；固定状态转换；只有 open、无人负责且无下游依赖才可删除；对相同 claim 幂等。
+- **测试：** 同 Task 创建 task tests；并发 claim、重复操作、版本冲突、非法转换、权限角色边界、删除限制。
+- **完成判定：** 错误操作安全错误码且无额外文件变更。
+- **禁止边界：** 不实现自动调度，不由 task 完成直接启动/集成代码。
+
+### T6：依赖 DAG 与可执行前置条件
+
+- **前置条件：** T5。
+- **允许文件：** `teams/tasks.py`、`tests/test_teams_tasks.py`。
+- **实现动作：** 最多 16 个依赖，增边验证存在、无自依赖、无环；dependencies 未完成时 claim/start 拒绝。
+- **测试：** task test 增加 missing/self/cycle/unfinished dependency/边界 case。
+- **完成判定：** 每条依赖更新原子、并发无法提交循环。
+- **禁止边界：** 不做复杂排序算法或跨 machine scheduler。
+
+### T7：Mailbox durable message、broadcast、ack/replay
+
+- **前置条件：** T3、T5。
+- **允许文件：** `teams/mailbox.py`、`store.py/types.py`、`tests/test_teams_mailbox.py`。
+- **实现动作：** runtime注入身份/时间；模型只能send普通kind，事务commit含完整广播/ID/sequence/幂等；read不ack。ack校验当前收件人、消息归属及同generation有效checkpoint中的ID，再提交ack事务；通知只是wake hint。
+- **测试：** 同Task创建mailbox tests；sender/kind伪造拒绝、同键异正文冲突、广播中途崩溃replay、sequence/幂等一致；read不ack、他人/未checkpoint/旧generation ack拒绝、checkpoint后ack前崩溃只补ack；容量/脱敏/wake失败；明确投递去重不保证LLM或外部副作用exactly-once。
+- **完成判定：** 已提交事务及可重建envelope/ack投影为事实；任一步crash不静默丢信、不重复业务变更。
+- **禁止边界：** 不因通知失败丢消息或自动删除未 ack 数据。
+
+### T8：结构化 Plan proposal 与 approval revision
+
+- **前置条件：** T5、T7。
+- **允许文件：** `teams/approvals.py`、`mailbox.py/types.py/store.py`、`tests/test_teams_approvals.py`。
+- **实现动作：** 可信ApprovalService提交业务状态+系统outbox同一事务；actor来自runtime；修订使旧批准superseded并更新At，绝不修改P0/Pt/Permission。
+- **测试：** 同Task创建approval tests；未知字段/伪造actor/系统kind、重复决策/旧revision/普通“同意”；各提交步骤crash恢复不重复批准；DO+awaiting_approval协调写入与PLAN不可写的区别。
+- **完成判定：** 仅 `team_manage` 对当前 revision 的结构化 op 可改状态。
+- **禁止边界：** Approval 不能写 Permission rule、cannot auto allow tools。
+
+**Phase 2 gate：** `compileall newcode`；targets `test_teams_types.py test_teams_store.py test_teams_tasks.py test_teams_mailbox.py test_teams_approvals.py`；diff check。
+
+## Phase 3：后端能力与启动/停止（T9–T11）
+
+### T9：Backend protocol 与 capability/选择
+
+- **前置条件：** Phase2通过。
+- **允许文件：** `teams/backends.py`、`teams/types.py`、`tests/test_teams_backends.py`。
+- **实现动作：** 固定protocol、precedence（explicit→team→user→lightweight）、限额/errors；probe仅静态/版本/模块--check/IPC能力检查，start才创建本次资源并验证，不混称无副作用。
+- **测试：** 同Task创建backend tests；优先级、显式unavailable不fallback、probe零pane/socket/Worktree mutation、超时/错误、并发/队列上限。
+- **完成判定：** probe失败零业务mutation；start失败走本次资源清理，failure code不含路径/环境。
+- **禁止边界：** 不修改 Provider，不安装 tmux、不启动真实 agent。
+
+### T10：Lightweight synchronous thread backend
+
+- **前置条件：** T9。
+- **允许文件：** `teams/backends.py`、`teams/runtime.py`、`tests/test_teams_backends.py`。
+- **实现动作：** 以 bounded worker threads 为同步 AgentLoop 提供串行单-member execution/wake queue；每 CLI 最多 4 active; stop deadline shared; exception isolation。
+- **测试：** fake callable 证明不启动重复 member thread、顺序、不阻塞调用者、cancel/timeout/shutdown 1s 上限、一个 member failure 不影响其它。
+- **完成判定：** idle member 不消耗 model/tool request；worker 不直接写 Lead session。
+- **禁止边界：** 不引入 asyncio/refactor AgentLoop，不绕过 AgentLoop event path。
+
+### T11：Pane process、tmux argv 与 runtime-only IPC
+
+- **前置条件：** T9–T10。
+- **允许文件：** `teams/backends.py`、`teams/worker.py`、`teams/runtime.py`、`tests/test_teams_backends.py`。
+- **实现动作：** 唯一入口`newcode/teams/worker.py`与`python -m newcode.teams.worker`；实际解释器用-I/-B、自检module origin及可信bootstrap cwd，--check无持久mutation。tmux多参数command直接exec Python/argv，不拼shell字符串/send-keys；不仅外层shell=False。IPC/pane验证peer/process/generation/唯一executor锁后才允许Worktree/执行；失败仅回收本次归属资源，secret仅IPC内存。
+- **测试：** 实际Python模块--check/参数解析；假tmux检查argv边界/secret不入参、错误peer、重复executor；真实tmux可用时启动测试参数含空格/引号/分号/$/反引号均原样且sentinel零执行；在IPC/pane/握手/lease每步注入失败，验证清理且不影响既有资源。
+- **完成判定：** 模块真实启动与pane真实执行分开取证；没有tmux/direct-exec/安全IPC证据则pane unavailable/未验证，不能凭mock标通过；lightweight仍可独立验证。
+- **禁止边界：** 不自动安装、无 user shell string、无持久 secret、pane不是 OS sandbox。
+
+**Phase 3 gate：** compileall；`test_teams_backends.py`；diff check。Pane 缺真实环境可继续 lightweight，但必须记录 pane unverified，不得将其能力标为可用通过。
+
+## Phase 4：成员 AgentLoop、checkpoint/idle/recovery（T12–T15）
+
+### T12：TeamMemberRunner 与独立执行上下文
 
-- **前置条件：** T9 完成。
-- **允许文件：** `newcode/tools/workspace.py`、`file_tools.py`、`search_tools.py`、对应既有测试及 `tests/test_subagents_worktrees.py`。
-- **实现动作：** 统一使用 `workspace_root` 解析文件参数；固定 child root containment，扫描时拒绝/跳过逃逸 symlink/junction；find/search 返回 child-relative path。
-- **测试：** read/write/replace/find/search 五工具在不同 temp worktree 执行、绝对/`..`/链接 escape 拒绝、主目录同名文件保持不变。
-- **完成判定：** 六内置工具中的五个文件类工具的所有读写均限 child root。
-- **禁止边界：** 不改变 shared tool schema/语义，不读 common `.git` 元数据。
-
-### T11：Permission 与 sandbox root
+- **前置条件：** Phase3通过。
+- **允许文件：** `teams/member.py`、必要时 `runtime.py`、`tests/test_teams_members.py`。
+- **实现动作：** 新建独立ChatSession/ContextManager/PermissionManager/Skill/usage/cancel，Definition必须worktree；保存启动B/P0及当前Pt/At。使用非交互confirmer，require_confirmation直接拒绝，不能调用主终端或继承Lead session allow。无目录隔离证明时member禁用MCP和Hook shell/HTTP；独立client/runtime不当隔离证明。用角色adapter端口，不传父session。
+- **测试：** 同Task创建member tests；隔离状态、无agent/嵌套Team；confirmation拒绝executor零调用、主confirmer零调用、父session allow无效；MCP client/discovery零创建、Hook副作用/队列零执行、stdio cwd不被隐式改动；角色端口fake验证。
+- **完成判定：** Member 正常 final 与 WorkerResult 关联但不写 Lead ChatSession。
+- **禁止边界：** 不改 Provider；不共享 SubAgentManager state/Permission grants。
+
+### T13：Natural final → checkpoint → idle 与 mailbox wake
+
+- **前置条件：** T12。
+- **允许文件：** `teams/member.py`、`runtime.py`、`mailbox.py`、`tests/test_teams_members.py`。
+- **实现动作：** final checkpoint后同一业务事务更新idle+系统通知；自动投递先checkpoint再ack，模型read观察在下次请求前checkpoint但不自动ack。pause/stop关闭auto_wake，显式resume校验后才重开；stop真实退出后释放运行对象。跟踪in-flight工具/写入及executor lease，安全点屏障不以idle/cancel标签替代。
+- **测试：** checkpoint/idle/outbox每步crash，checkpoint-before-ack、read后不ack、checkpoint后ack前崩溃去重；pause/resume、duplicate wake、未退出工具不能取得静止证明；系统kind无法由模型伪造。
+- **完成判定：** 同一 runtime resume 不创建第二执行者。
+- **禁止边界：** Worker 不写 Lead SessionArchive/ChatSession，不把消息只放内存队列。
 
-- **前置条件：** T9–T10 完成。
-- **允许文件：** `newcode/permissions/normalizer.py`、`sandbox.py`、相关 sandbox/permission tests。
-- **实现动作：** permission request、normalized absolute path 与 sandbox root 一致使用 child workspace root；保持 hard deny、显式 deny、Plan/Do 优先级。
-- **测试：** main path 从 worktree child deny；child path allow/确认照既有策略；symlink root escape deny；MCP/non-file policy unchanged。
-- **完成判定：** common Git dir/main workspace 不会进入 sandbox allowed root。
-- **禁止边界：** 不改变 Permission rules、MCP 或 Plan/Do semantics。
-
-### T12：根身份化 child read cache
-
-- **前置条件：** T9–T11 完成。
-- **允许文件：** `newcode/subagents/runner.py`、`types.py`、`tests/test_subagents_worktrees.py`、`tests/test_subagents_runner.py`。
-- **实现动作：** 缓存 key 加 canonical workspace root、workspace identity、canonical file path、stat signature；每个 Worktree/task 独立 cache。
-- **测试：** 两个 root 相同相对路径不同内容、一个 root 文件变化、cache eviction/invalidation、shared path 不读 Worktree cache。
-- **完成判定：** 目录不同绝不 cache hit；existing permission check 仍先于 cache hit。
-- **禁止边界：** 不跨 child/task 共享缓存。
-
-### T13：run_command sandbox capability
-
-- **前置条件：** T9 完成；先验证目标平台技术能力，不以 cwd 假称隔离。
-- **允许文件：** `newcode/worktrees/command_sandbox.py`、`newcode/tools/command_tool.py`、`types.py`、`tests/test_worktrees_command_sandbox.py`。
-- **实现动作：** command tool 从 ToolContext 获取固定 cwd；Worktree child 只可经结构化解析器和 capability 执行受限只读 Git allowlist：`status --no-optional-locks`、`diff --no-ext-diff --no-textconv`、`log`、`show`、`cat-file`、`ls-files`、受限 `rev-parse`。拒绝 `git add`、`git commit`、`git update-ref`、branch/ref 写入、checkout/switch、reset、clean、fetch、push、config、worktree add/remove/prune 和未列命令。当前 Worktree admin dir（含 index/HEAD/config/logs）及 common metadata 对 child 一律只读；不支持 child commit（没有 task 独占 objects/refs）。不把原始 shell 字符串交给 shell；拒绝 operator、pager、external diff/textconv、helper 和 config override。不能证明解析、ACL、参数及 hooks 隔离时，命令执行前 fail closed；shared 保持既有行为。
-- **测试：** fake backend 记录 cwd=root；验证只读 allowlist 命令可用；逐项尝试 add/commit/update-ref/ref/config/worktree 写命令与未列命令，断言拒绝且 subprocess 零调用或零副作用；确认 common objects/refs、当前 index/HEAD、main 与其他 Worktree admin metadata 均未改变。覆盖 shell operator/命令拼接不能绕过策略。真实隔离 backend（若实现）以临时本地 repo 验证；不能证明 ACL/解析时断言 Git/`run_command` subprocess 零调用。
-- **完成判定：** 只有只读命令矩阵、共享与 task admin metadata 写保护、hooks 隔离全部通过才显示/执行受限 Git 查询；`git add`、`git commit`、`git update-ref` 永远拒绝，不能仅依赖 cwd 或静态文本扫描，也不能 silent fallback。
-- **禁止边界：** 不把静态 shell 文本扫描单独视作完整隔离，不运行真实危险命令。
-
-### T14：派生缓存/Context artifact 根隔离
-
-- **前置条件：** T9–T12 完成。
-- **允许文件：** 必要时 `newcode/context/artifacts.py`、`newcode/memory/store.py`、`newcode/instructions.py`、`newcode/skills/discovery.py`、SubAgent 相关 tests。
-- **实现动作：** 所有已有缓存 key 包含来源 canonical root/workspace fingerprint；project memory fingerprint 使用 worktree root；context artifact 写入/cleanup 锁定当前 child root。没有现存 cache 的模块不新增 cache。
-- **测试：** artifact 仅写 child root 并 cleanup；memory project scope 区分同 repo 的不同 worktree；instructions/project discovery 正确 root；无越界清理。
-- **完成判定：** root 变化时不复用 derived content；user scope仍按当前规则。
-- **禁止边界：** child 不启用 Memory/Archive/Hook/父 Skills，除 Definition SOP 的既有语义。
-
-**Phase 3 gate：** `compileall newcode`；`test_worktrees_command_sandbox.py test_subagents_worktrees.py test_tools_workspace.py test_permissions_sandbox.py test_context_artifacts.py test_memory_store.py` targeted；`git diff --check`。若特定既有测试文件名/结构不同，先定位同等现存测试，不创建重复测试集。
-
-## Phase 4：初始化、安全 Runner 与结果（T15–T18）
-
-### T15：精确配置文件 allowlist 复制
+### T14：跨 CLI restore、预算和权限重建
+
+- **前置条件：** T4、T13。
+- **允许文件：** `teams/member.py`、`store.py/types.py`、`tests/test_teams_checkpoints.py`、`tests/test_teams_members.py`。
+- **实现动作：** 进程启动后 runtime lock 验证前任退出；restore SessionArchive checkpoint、tool exchange截断、Context预算；状态 `interrupted→starting→idle/running`; 重建 mode/permission/Skill/Context，不恢复 session allow；`integrated` 状态拒绝旧 Worktree resume。
+- **测试：** corrupt/stale/wrong workspace/old runtime lease refuse; outstanding tool call truncate; resource cap; restore denies old Permission session allow.
+- **完成判定：** failed restore 不覆盖 checkpoint、不启动 Provider。
+- **禁止边界：** 不跨设备或跨用户恢复。
+
+### T15：Team-specific Worktree lease restore
+
+- **前置条件：** Chapter14 Worktree ownership API 已读；T14。
+- **允许文件：** `newcode/worktrees/manager.py`、`git.py`、`types.py`、`teams/member.py`、`tests/test_teams_worktree_resume.py`、必要时 `tests/test_worktrees_manager.py`。
+- **实现动作：** 增加 Team-owner-only resume API；交叉验证 Team manifest、owner marker、task/member/team id、canonical repo/common-dir/path、branch/head/unique registration、activity lock；恢复后取得新 runtime lock。
+- **测试：** 同 Task 创建 resume tests；跨进程 valid claim、duplicate process lock、altered owner/head/branch/path/common-dir/registration reject with no remove/write。
+- **完成判定：** 不确定时不复用、不退回 shared，保留 worktree。
+- **禁止边界：** 不开放通用 Worktree recovery，不开放 child Git 写入或 run_command。
+
+**Phase 4 gate：** compileall；`test_teams_checkpoints.py test_teams_members.py test_teams_worktree_resume.py test_subagents_worktrees.py test_worktrees_manager.py`；diff check。
+
+## Phase 5：角色 tools、AgentLoop 与 CLI（T16–T19）
+
+### T16：固定 Tool schema 与角色注册矩阵
 
-- **前置条件：** Phase 1–3 全通过。
-- **允许文件：** `newcode/worktrees/setup.py`、`tests/test_worktrees_setup.py`。
-- **实现动作：** user exact allowlist ∩ project request ∩ hard-safe names；copy files / ignored files 仅逐个普通文件复制，不递归；临时文件+原子 rename，reject links。
-- **测试：** allow/deny precedence、`.env`/token/session/memory/artifact/MCP config拒绝、路径穿越拒绝、copy failure无半成品、目录不递归。
-- **完成判定：** 默认复制 0 项，秘密永不进入 child。
-- **禁止边界：** 不复制全部 ignored/untracked、环境变量、父 session。
-
-### T16：dependency link 信任检查
-
-- **前置条件：** T15 完成。
-- **允许文件：** `newcode/worktrees/setup.py`、路径工具、`tests/test_worktrees_setup.py`。
-- **实现动作：** 只解析用户指定的可信只读 dependency roots；project 只能引用登记 ID；target path canonical、可读、不可写且不能被 child 修改，平台不支持 read-only link 则跳过。
-- **测试：** unknown/outside/writable/link-chain/reparse target拒绝；合法 fake trusted root；子 Agent 不能写目标的验证。
-- **完成判定：** 默认无 link，失败继续但依赖不可用并记录 safe code。
-- **禁止边界：** 不 link `.venv` 或任意 workspace/用户目录，不信任 project 提供的绝对路径。
-
-### T17：Git hooks 显式禁用
-
-- **前置条件：** T15–T16 完成。
-- **允许文件：** `newcode/worktrees/setup.py`、`git.py`、`manager.py`、`tests/test_worktrees_setup.py`。
-- **实现动作：** Chapter 14 hook execution allowlist 固定为空；Git adapter 对每条 SubAgentManager 命令固定注入 manager-owned empty hooks dir，并禁用 system/global config；忽略 repo/user/global 设置的 hooksPath。checkout、add、list、status、remove 及失败清理统一走该 wrapper。
-- **测试：** 为 repo `.git/hooks`、user hooksPath 和 global hooksPath 配置写入 fixture sentinel；逐种 Manager Git 命令均验证 sentinel 零执行，重点覆盖 `worktree add` 的 checkout hook；配置覆盖缺失时断言 Git 命令零启动。
-- **完成判定：** 所有 manager Git 入口都可证明 hook 绝不执行；不支持的环境 fail closed。
-- **禁止边界：** 不复制/执行任何 hook，不改仓库/用户/全局 Git 配置，不运行生产 hooks。
-
-### T18：Runner 创建/完成集成与安全结果
-
-- **前置条件：** T5–T17 完成。
-- **允许文件：** `newcode/subagents/runner.py`、必要时 `manager.py`/`types.py`、`tests/test_subagents_worktrees.py`。
-- **实现动作：** Worktree Definition start 前创建并 verify lease，初始化后再建 child ToolContext/AgentLoop；finally 取消/有限等待、finish；结果带脱敏状态/branch/path，保留 Chapter13 budgets/Permission/policy/notifications。
-- **测试：** create failure 不启动 Provider；Definition shared旧路径无变；worktree child cwd/root；final/exception/cancel/timeout分别清理或保留；结果不包含 Git output/secrets。
-- **完成判定：** 主 ChatSession 不被 worker 修改，Manager安全队列负责结果。
-- **禁止边界：** Fork 不创建 Worktree；不合并、不提交、不 push、不变更 Provider。
-
-**Phase 4 gate：** `compileall newcode`；`test_worktrees_setup.py test_subagents_worktrees.py` targeted；`git diff --check`。
-
-## Phase 5：完成保护、过期清理与 CLI 生命周期（T19–T22）
-
-### T19：dirty/upstream outcome
-
-- **前置条件：** Phase 4 通过。
-- **允许文件：** `newcode/worktrees/git.py`、`manager.py`、`types.py`、`tests/test_worktrees_manager.py`。
-- **实现动作：** `status --porcelain=v1 -z --untracked-files=all` 检查 tracked/staged/untracked；另执行 `status --ignored=matching`、`ls-files --others --ignored --exclude-standard -z` 与 no-follow root walk 检查 ignored 文件和目录；只清理 owner manifest 中逐项验证的本 task temp 再重查。validated upstream rev-list 判断 ahead；无 upstream/离线/timeout/异常/输出截断/扫描错误均 unknown preserve。
-- **测试：** clean/no changes, staged/unstaged/untracked/ignored file/ignored directory, ahead commit, no upstream, status/traversal incomplete, network not attempted；child 创建 ignored file 后不得自动删除，tree 必须 preserve。
-- **完成判定：** 任一非空/unknown/扫描不完整均不能 remove；Worktree `.git` pointer 仅在与精确 task admin registration 匹配时视为结构性 metadata。
-- **禁止边界：** 不自动 commit/reset/clean/stash/fetch/push。
-
-### T20：三层过期清理
-
-- **前置条件：** T19 完成。
-- **允许文件：** `newcode/worktrees/manager.py`、`git.py`、`paths.py`、`tests/test_worktrees_manager.py`。
-- **实现动作：** 30 天候选 + path gate + Git/owner gate + activity/cleanliness gate；重检后逐项验证 tracked/staged/untracked/ignored 文件/目录及完整 root walk 为空才 remove，记录安全失败继续其余候选。
-- **测试：** 恰好/超过 30 天；main/user/root/outside/link/unknown owner拒绝；active lock skip；dirty/ahead/no upstream/ignored file or dir/scan error保留；一个 cleanup失败不阻断其它资源。
-- **完成判定：** 清理不遍历/删除公共 root 或 Git metadata；每个删除对象均有完整审计条件。
-- **禁止边界：** 不以 mtime 单独授权，不 `rmtree`，不 prune。
-
-### T21：CLI SubAgent/Worktree lifecycle
-
-- **前置条件：** T18–T20 完成。
-- **允许文件：** `newcode/cli.py`、`tests/test_cli_worktrees.py`、必要时 `tests/test_cli_subagents.py`。
-- **实现动作：** CLI 创建/注入每进程 WorktreeManager；clear/resume 先关闭旧 scope 和 child worktree，再开新 generation；EOF/exit/KeyboardInterrupt/异常统一有限等待，cleanup fail 不阻断 Hook→Memory→Context→MCP。
-- **测试：** 所有退出入口、初始化中异常、clear/resume、多个 task隔离、shutdown顺序及异常注入。
-- **完成判定：** Manager 每 task资源最多 finish 一次；已有 SubAgent/Hook/Memory/Context/MCP语义不变。
-- **禁止边界：** 不新增 slash command、跨会话恢复、MCP cwd更改。
-
-### T22：AgentLoop通知与结果格式回归
-
-- **前置条件：** T18–T21 完成。
-- **允许文件：** `newcode/agent/loop.py` 仅测试明确证明需适配时；`tests/test_subagents_worktrees.py`、`tests/test_agent_loop_subagents.py`。
-- **实现动作：** Worktree outcome 随 task summary安全传递；通知仍只在主 AgentLoop安全点按序一次性写入正确 session/generation。
-- **测试：** completion/collect race、clear后旧通知丢弃、路径/branch脱敏与长度、Context estimate含 notification、Archive不记录task state。
-- **完成判定：** 不改变已有 AgentLoop事件/tool-call次序与 gate。
-- **禁止边界：** 不允许 worker写 parent ChatSession，不绕过 ToolScheduler/Permission。
-
-**Phase 5 gate：** `compileall newcode`；`test_worktrees_manager.py test_subagents_worktrees.py test_cli_worktrees.py test_agent_loop_subagents.py test_cli_subagents.py` targeted；`git diff --check`。
-
-## Phase 6：全回归与验收（T23–T26）
-
-### T23：Chapter 14 targeted regression
-
-- **前置条件：** Phase 1–5 全通过。
-- **允许文件：** 默认无；只允许直接失败证明的 Worktree 生产模块及对应最小回归测试。
-- **实现动作：** 运行 Worktree、SubAgent、Tool、Permission、Context、Memory、MCP、CLI targeted suite。
-- **测试：** 使用 fake provider、local repo 和 local fixtures，覆盖共享 Git metadata 只读 object/禁止共享 refs 等写入、Manager commands 禁 hooks、ignored 内容保留；记录每个 skip 原因。
-- **完成判定：** 所有 targeted 通过；无范围外修复。
-- **禁止边界：** 不真实网络/secret/MCP/hooks/tmux。
-
-### T24：全 Chapter 4–14 和全量 pytest
-
-- **前置条件：** T23 通过。
-- **允许文件：** 默认无；只修直接回归。
-- **实现动作：** compileall、Chapter4–14 regression 与 full pytest，basetemp 使用系统 TEMP。
-- **测试：** `.venv\Scripts\python.exe -m pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter14-final"`。
-- **完成判定：** 全量通过并解释所有 skip。
-- **禁止边界：** 不忽略/隐藏失败，不扩大测试范围外功能。
-
-### T25：静态安全边界审计与 diff
-
-- **前置条件：** T24 通过。
-- **允许文件：** 默认无；审计证明缺陷才最小修复。
-- **实现动作：** 审计 Provider无 Worktree 感知、Git argv 与 empty hooks override、安全目录、cwd/sandbox根、只读 Git 命令 allowlist/写命令 denylist、process sandbox 对 common objects/refs 与当前/其他 Worktree admin metadata 的只读边界及 fail-closed、Permission/Plan/ToolScheduler链、无主 session写入、cache root隔离、tracked/staged/untracked/ignored 全状态清理门、MCP语义不变、shared行为兼容。
-- **测试：** 临时本地 repo 验证只读 Git allowlist；对 `git add/commit/update-ref`、ref/config/worktree 写入及未列命令断言拒绝且无文件/object/ref/index/HEAD 副作用；`git diff --check`；rg/源码审计记录具体证据。
-- **完成判定：** 每项边界均有实现位置与测试佐证；未知标记未完成而非通过。
-- **禁止边界：** 不暂存/提交/全局配置。
-
-### T26：本地 Git + fake CLI acceptance
-
-- **前置条件：** T23–T25 通过。
-- **允许文件：** 默认无；如流程缺陷仅加最小 acceptance regression test 与直接修复。
-- **实现动作：** 临时 home/workspace/local Git repo/fake Provider/command sandbox跑 shared与worktree Definition；工具读写隔离；完成保护、保留信息、cancel/timeout、clear/resume、EOF/exit/error cleanup；确认无网络命令。
-- **测试：** 本地 acceptance fixture 和最终 `git status --short`（只读）。
-- **完成判定：** main repo文件不被 Worktree child写入；Worktree cleanup/preserve结果与 Git 实际状态一致；无真实 tmux时说明环境原因。
-- **禁止边界：** 不修改全局 Git config、不 remote/push、不运行生产 hooks、不给 run_command 未验证 sandbox 权限。
+- **前置条件：** Phase4通过。
+- **允许文件：** `teams/tools.py`、`agent/mode.py`、必要时 `tools/registry.py`、`tests/test_teams_tools.py`。
+- **实现动作：** 逐行实现spec五工具固定契约：每operation的角色、必填/可选/禁止字段、合法状态、读写、结果/错误；所有身份runtime注入，target/recipient仅为目标，拒绝模型team/actor/sender/decision_maker。按混合工具整体serial/non-read-only分类。
+- **测试：** 同Task创建tools tests，以契约表为完整参数化矩阵逐operation覆盖成功/缺字段/跨operation字段/伪造身份/角色/状态/结果/错误；schema不按成员变化，普通会话/SubAgent零协作工具。
+- **完成判定：** 普通会话与普通 SubAgent 无 Team collaboration tools。
+- **禁止边界：** 不修改 ToolScheduler 算法、不允许工具自行扩权。
+
+### T17：AgentLoop mode/Permission/ToolScheduler gate
+
+- **前置条件：** T16。
+- **允许文件：** `agent/loop.py`、`mode.py`、`teams/tools.py/runtime.py/member.py`、必要时 `permissions/normalizer.py`、`manager.py`、`builtins.py`；`tests/test_agent_loop_teams.py`、`tests/test_teams_policy.py`。
+- **实现动作：** 主线程发布认证不可变Pt，P0不变/只收窄，At独立业务门；每请求及executor前用版本屏障重算交集。DO+awaiting_approval仅固定协调写，PLAN仅status；旧响应在计划修订/批准失效/mode或Skill收窄后重验，pane失联fail closed。成员confirmation非交互拒绝，普通工具仍经原链。
+- **测试：** 同Task创建loop/policy tests；批准不能扩P0/恢复Pt/grant；旧请求tool在修订、Do→Plan/Skill收窄后零执行；同步/后台/pane fake confirmation零task/文件/Git/MCP执行及主confirmer零调用；Permission/调度顺序不变。
+- **完成判定：** tool denied 时 TeamStore/Worktree/executor mutation零调用。
+- **禁止边界：** 不绕过 Permission/Plan/Do/ToolScheduler，不改 Provider。
+
+### T18：静态 `/team` 命令与 CLI attach lifecycle
+
+- **前置条件：** T17。
+- **允许文件：** `newcode/commands/builtins.py`、`newcode/cli.py`、`teams/runtime.py`、`tests/test_cli_teams.py`。
+- **实现动作：** 注册 `/team lead|open|status|close` 固定 command；只更新当前 CLI role/Team attachment；Team create仍经 Lead tool；open workspace fingerprint验证；clear/resume detach并有界 pause/checkpoint。
+- **测试：** 同 Task 创建 CLI tests；命令参数、unknown team、workspace mismatch、clear/resume不串 team scope、静态命令优先、不走 Provider。
+- **完成判定：** 无 Team 功能的既有 CLI 保持原行为；普通 CLI tools unchanged。
+- **禁止边界：** 不加自定义命令、slash command不直接执行 Git/AgentLoop。
+
+### T19：Coordinator 双重授权和工具收窄
+
+- **前置条件：** T16–T18。
+- **允许文件：** `teams/config.py`、`coordinator.py`、`tools.py`、`cli.py`、`tests/test_teams_policy.py`、`tests/test_cli_teams.py`。
+- **实现动作：** user config AND env双授权；封闭allowlist仅read_file/find_files/search_code+五固定Team工具及CLI本地命令。禁ordinary agent/load_skill/Skill runner、全部MCP、Hook shell/HTTP及任何未知入口；Team管理/集成是明确委派而非原始写入授权。
+- **测试：** 双开关/项目不能开启；直接集合与启动委派P0分离，member仅在明确P0+Permission内写自身Worktree；父mode/Skill收窄仍生效。禁止入口schema/旧响应双拒绝、MCP discovery及排队Hook零执行、进入前在途动作未退出则不成功；批准/Skill/prompt不能恢复写权限。
+- **完成判定：** coordinator has no arbitrary filesystem/shell write access。
+- **禁止边界：** 不通过 tmux/backend/config绕过双重开关。
+
+**Phase 5 gate：** compileall；`test_teams_tools.py test_teams_policy.py test_agent_loop_teams.py test_cli_teams.py test_agent_loop.py test_agent_loop_permissions.py test_agent_scheduler.py test_cli_commands.py`；diff check。
+
+## Phase 6：Team-only Git integration 与受控 coordinator 操作（T20–T22）
+
+### T20：Integration B/T/M、冻结快照与静止证明
+
+- **前置条件：** Phase4 Worktree resume、Phase5 Team integrate tool/Permission。
+- **允许文件：** `teams/integration.py`、`worktrees/git.py`、`newcode/cli.py`仅注入单写者用户确认端口、`tests/test_teams_integration.py`。
+- **实现动作：** 校验启动B、实际目标symbolic分支T/HEAD M、revision/owner；取得所有executor lease/零in-flight屏障，idle/cancel标签不足。用户确认单写者前提；Manager锁不约束外部Git/编辑器。B→index→最终工作树生成安全manifest，支持新增/删除/普通二进制、记录stage中间hash；固定容量/secret/link/attributes拒绝。preview只读返回digest；integrate重复捕获匹配后原子冻结blobs，目标HEAD/index/内容摘要前后重验。
+- **测试：** 同Task创建integration tests；非main分支/B缺失或改变、真实运行中工具/失联worker、锁竞争、目标dirty/ignored碰撞、secret/link/submodule/超限；staged+unstaged/删除/二进制/rename表示；快照扫描被外部修改拒绝；preview零持久mutation。
+- **完成判定：** 相对B的冻结结果可验证，expected_target_head/digest不匹配拒绝；completed不等于测试或集成授权。
+- **禁止边界：** 不调用 shell、不以message/task completion代替授权。
+
+### T21：B→S、M→I三方集成及目标完整同步/崩溃恢复
+
+- **前置条件：** T20。
+- **允许文件：** `teams/integration.py`、`worktrees/git.py/manager.py/types.py`、`tests/test_teams_integration.py`。
+- **实现动作：** 严格执行spec阶段表：B临时source Worktree仅用冻结blobs形成S；M临时integration Worktree三方merge S形成I；校验S/I parent/tree/事务标记后持久化applying_target，再在真实目标cwd执行固定ff-only，让branch/index/working tree一同更新并复核。业务journal保存integration ID/幂等/B/T/M/digest/S/I/阶段；每阶段crash按表只读识别已写commit，unknown不自动重试或回滚目标。只允许在本次临时merge状态abort，失败保留；成功成员integrated且旧base不可恢复写入。
+- **测试：** 两member同B、第二次目标含第一个提交仍保留非冲突成果，重叠冲突保留；删除/二进制/staged+unstaged；非main目标及目标branch/index/worktree完整同步；每Git调用前后和阶段记录crash、S/I识别防重复commit、safe_not_applied重新确认、partial target/outcome_unknown；外部HEAD/index/工作文件变化、hooks零执行、Permission拒绝零mutation。
+- **完成判定：** 幂等依靠日志+可验证Git对象而非盲重试；目标状态不完整即unknown并保留全部成果。不宣称跨Git/文件系统原子，不reset/clean/force/删分支。
+- **禁止边界：** Child Git 仍 read-only/fail-closed；不访问 remote、无 arbitrary argv。
+
+### T22：Coordinator integration operation only
+
+- **前置条件：** T19、T21。
+- **允许文件：** `teams/coordinator.py/tools.py/integration.py`、`tests/test_teams_policy.py`、`tests/test_teams_integration.py`。
+- **实现动作：** Coordinator只可调用 fixed TeamIntegrationManager，要求 Lead explicit integrate op + Permission gate；没有 Manager/Permission capability时unavailable。
+- **测试：** coordinator封闭集合，无write/command/ordinary agent/Skill runner/MCP/Hook shell/HTTP旁路；integration仅同一Manager；Permission拒绝零Git写，未知能力默认拒绝，plan/Skill仍收窄。
+- **完成判定：** coordinator没有任意 shell或文件写入等价路线。
+- **禁止边界：** 不把 Git 管理命令加入 Agent 通用 shell工具。
+
+**Phase 6 gate：** compileall；`test_teams_integration.py test_teams_policy.py test_worktrees_git.py test_worktrees_manager.py test_worktrees_command_sandbox.py`；diff check。
+
+## Phase 7：生命周期、全回归和最终验收（T23–T26）
+
+### T23：Team/CLI shutdown 与 session switch
+
+- **前置条件：** Phase1–6通过。
+- **允许文件：** `teams/runtime.py/member.py`、`cli.py`、`tests/test_teams_lifecycle.py`、`tests/test_cli_teams.py`。
+- **实现动作：** EOF/exit/KeyboardInterrupt/startup/runtime exception/clear/resume统一停止或checkpoint；总等待<=1秒后继续既有 SubAgent→Hook→Memory→Context→Worktree→MCP cleanup；失败隔离、旧 session通知丢弃。
+- **测试：** 同 Task 创建 lifecycle tests；每路径 cleanup order、shutdown timeout/error isolation、member checkpoint/lease preserve、double close idempotent。
+- **完成判定：** cleanup failure 不阻断后续已有服务，Team/PID不冒充 stopped。
+- **禁止边界：** 不改变既有服务 cleanup owner/order semantics 除明确 required insertion。
+
+### T24：跨章节 targeted regression 与静态审计
+
+- **前置条件：** T23。
+- **允许文件：** 默认无；仅直接失败证明的最小 Team 文件和对应 test。
+- **实现动作：** Provider无Team import；审计固定operation契约、P0/Pt/At重验/confirmation、coordinator封闭集合、成员MCP/Hook隔离、业务journal/checkpoint/ack崩溃顺序、B/S/M/I集成与单写者局限、pane模块/direct-exec证据；运行Chapter4–15 targeted。
+- **测试：** 逐条记录边界/skip；普通会话MCP保持兼容，Team成员缺隔离时禁用；Hook placeholder零Manager调用；不把mock/独立client当真实sandbox/pane证据。
+- **完成判定：** 每条边界都有实现/测试证据，未知注明未验证。
+- **禁止边界：** 不做无关重构，不用 code review代替 runtime evidence。
+
+### T25：全量 compileall/pytest 与 `git diff --check`
+
+- **前置条件：** T24 pass。
+- **允许文件：** 默认无，缺陷修复限最小 Team+test。
+- **实现动作：** 全量 `compileall newcode`、`pytest -q -rs --basetemp "$env:TEMP\newcode-pytest-chapter15-final"`、`git diff --check`。
+- **测试：** 全量 pytest，逐个记录 skip 原因；项目现有 `.venv`。
+- **完成判定：** 无失败；skip环境原因明确，不隐藏。
+- **禁止边界：** 不暂存/提交/push/global git config。
+
+### T26：受控 CLI/local Git acceptance 与 pane 证据
+
+- **前置条件：** T24–T25 pass。
+- **允许文件：** 默认无；仅 acceptance发现的最小直接缺陷。
+- **实现动作：** fake Provider、fake/lightweight backend、临时 home/workspace/local Git repo验收 create team → spawn → tasks/message/approval → idle/wake/resume → preview/integration → close/reopen → clear/resume/EOF/error cleanup；验证 no external network/remote。
+- **测试：** 实际模块--check可独立取证；tmux/安全IPC可用时真实pane direct-exec及特殊字符原样/零注入、错误peer/重复executor/失败清理、成员mailbox/idle/wake/shutdown实测；不可用则pane unavailable/未验证，仅报告lightweight单独验收。local repo覆盖两个member同B与删除/二进制/目标并发/阶段crash。平台symlink/reparse/锁限制逐项记skip。
+- **完成判定：** 主文件不被未经授权修改；Integration只有经过Permission的固定 Manager事务；所有不确定资源保留。
+- **禁止边界：** 不安装 tmux，不使用生产secret/第三方MCP/生产hooks，不push。
+
+**Phase 7 gate：** compileall、Chapter4–15 targeted、全量pytest、静态审核、local Git/CLI acceptance、diff check均记录结果；任何关键隔离/集成不确定状态列为未完成。
 
 ## 执行顺序
 
 ```text
 T1 -> T2 -> T3 -> T4
-                 -> T5 -> T6 -> T7 -> T8
-                                  -> T9 -> T10 -> T11 -> T12 -> T13 -> T14
-                                                                   -> T15 -> T16 -> T17 -> T18
-                                                                                         -> T19 -> T20 -> T21 -> T22
-                                                                                                              -> T23 -> T24 -> T25 -> T26
+              -> T5 -> T6 -> T7 -> T8
+                               -> T9 -> T10 -> T11
+                                                -> T12 -> T13 -> T14 -> T15
+                                                                         -> T16 -> T17 -> T18 -> T19
+                                                                                                  -> T20 -> T21 -> T22
+                                                                                                                   -> T23 -> T24 -> T25 -> T26
 ```
-
-每 Phase 的最后一项必须先完成 targeted pytest、`python -m compileall newcode`、`git diff --check`。任何 sandbox confinement、Git ownership、删除保护或权限链无法证明时停止并报告，不允许跳过退出门。

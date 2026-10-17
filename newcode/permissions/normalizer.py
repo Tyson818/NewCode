@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import re
 
 from newcode.permissions.types import JsonObject, PermissionMode, PermissionRequest
 
@@ -27,6 +28,12 @@ def build_permission_request(
         command = original_args.get("command")
         if isinstance(command, str):
             normalized_args["command"] = command
+
+    if tool_name in {"team_status", "team_manage", "team_tasks", "team_message", "team_integrate"}:
+        operation = original_args.get("operation")
+        if isinstance(operation, str) and re.fullmatch(r"[a-z_]{1,32}", operation):
+            # 复用既有 exact/glob Permission 语法；这是操作身份，不是待执行 shell。
+            normalized_args["command"] = f"{tool_name} {operation}"
 
     if tool_name in FILE_PATH_TOOLS:
         path = original_args.get("path")

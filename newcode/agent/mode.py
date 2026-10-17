@@ -29,7 +29,7 @@ DO_TOOL_NAMES = frozenset(
 
 def allowed_tool_names(mode: AgentMode, registry: ToolRegistry | None = None) -> frozenset[str]:
     if mode is AgentMode.PLAN:
-        return PLAN_TOOL_NAMES
+        return PLAN_TOOL_NAMES | ({"team_status"} if registry is not None and registry.get("team_status") is not None else set())
     if registry is not None:
         return registry.do_visible_names()
     return DO_TOOL_NAMES

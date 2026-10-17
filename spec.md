@@ -1,161 +1,242 @@
-# Chapter 14：Git Worktree —— 子 Agent 工作目录隔离
+# Chapter 15：Agent Teams —— 持久化团队与协作
 
-## 背景与当前实现
+## 背景与源码事实
 
-NewCode 的 Chapter 13 已提供 Definition/Fork 子 Agent、受限 SubAgentManager、独立 child ChatSession/Context/Permission state、工具交集策略以及 AgentLoop 主线程结果通知。当前 `ToolContext` 只有 canonical `workspace_root`，没有独立 `cwd`；六个文件/搜索工具从 `workspace_root` 建立 Workspace，`run_command` 使用 `subprocess.run(..., cwd=workspace_root, shell=True)`。Permission 的 workspace sandbox 对结构化文件路径检查 workspace root，但它不是操作系统级文件隔离。
+NewCode 当前的 `AgentLoop.run()` 是同步事件迭代器，Provider 通过同步 `stream_chat()` 返回事件迭代器；当前只有 MCP runtime 自己拥有 asyncio loop。ToolScheduler 将只读工具分批并发、将副作用工具串行执行。Chapter 13 SubAgentManager 是进程内、有界的一次性 worker/任务管理器，任务结果回到父 AgentLoop 安全点；它没有团队花名册、长期任务/邮箱、成员 idle 后保留对话并恢复的语义。
 
-当前没有 Worktree 管理器、Worktree 恢复验证、child cwd、跨根缓存隔离或环境复制策略。MCP stdio 参数不含 cwd，当前语义是子进程继承 NewCode 进程工作目录。Chapter 14 不得声称这些能力已经存在。
+Chapter 9 的 SessionArchive 提供脱敏 JSONL、workspace fingerprint、坏行跳过与不完整 tool exchange 截断。Chapter 14 WorktreeManager 只恢复本进程 lease；child `run_command` 目前因缺乏 OS 级进程 sandbox 而 fail closed，child 不允许 Git 写操作。CLI 的 Hook → Memory → Context → MCP cleanup 已有顺序与异常隔离。Chapter 12 Hook 的 `subagent` action 当前明确是 `hook_subagent_not_available`，本章不改变它。当前依赖没有 tmux；环境中也未检测到 tmux 命令，因此文档不声称独立 pane 后端已实测。
 
-## 目标
+本章新增的持久团队、团队成员 runtime、协作工具和受控集成是新增能力，不是上述现有能力的别名。Provider interface 保持对 Team 无感知。
 
-为显式声明 `isolation: worktree` 的 Definition child，在同一非 bare Git repository 中创建唯一 Git worktree 和专属分支；子 Agent 的文件工具以该 worktree 为 sandbox 根，所有进程 cwd 显式绑定该 worktree，不使用 `os.chdir`。主 worktree 的项目文件不被该 child 的文件工具修改。`isolation: shared` 保持 Chapter 13 行为不变。
+## 目标与角色
 
-Worktree 是 Git 工作树隔离，不是恶意代码的 OS sandbox。不能证明命令进程、链接目标或配置副作用受限时，相关能力必须 fail closed；不得将固定 cwd 描述为足以限制任意 shell 的安全边界。
+团队是绑定单一 canonical workspace 的持久实体，有稳定 Team ID、Lead、成员 roster、共享任务、计划审批记录与邮箱。成员可以自然完成一轮后进入 `idle`，保留脱敏 session checkpoint；新消息可令其从当前进程中的原上下文继续，或在新 CLI 进程中从 checkpoint 重建上下文。每个成员有独立 ChatSession、ContextManager/artifact root、PermissionManager、Skill state、取消状态、usage 统计和 Worktree lease；不得共享父 session 或权限授权。
 
-## 术语与固定默认值
+角色工具集合固定如下，按角色注册，不按成员或任务动态改 schema：
 
-- **主 workspace**：CLI 启动时 canonical 的项目目录；**repository root**：`git rev-parse --show-toplevel` 返回并校验的根；**common Git dir**：`git rev-parse --git-common-dir` 解析后的 canonical Git 管理目录。
-- **Worktree root**：固定为 `<repository-root>/.newcode/worktrees/`。Phase 1 必须只在 `.gitignore` 中追加精确规则 `.newcode/worktrees/`，不忽略 `.newcode/` 整体，不覆盖或清理已存在的用户内容。
-- **child sandbox root 与 cwd**：Worktree child 都是该 task worktree 的 canonical absolute path；共享模式两者仍为主 workspace root。两个字段分开传递，禁止依赖进程级 cwd。
-- Definition frontmatter `isolation` 允许 `shared` 或 `worktree`，缺省为 `shared`；非法值使该 Definition 按 Chapter 13 的单文件隔离规则跳过，不降级成 shared 执行。
-- Worktree 目录相对 Worktree root 的名字由管理器生成：`<agent-slug>/<task-id>`。slug 使用 `[a-z0-9][a-z0-9_-]{0,47}`；task ID 使用 Chapter 13 生成的安全 task ID 字符集且长度不超过 64。目录名最多 2 段，以 `/` 分隔；通用 validator 可测试最多 3 段，但生产 WorktreeManager 只接受上述两段格式。总相对长度不超过 160 字符。
-- Git 分支固定为 `newcode/subagent/<task-id>`，不是模型可设置字段。branch 在 argv 参数中独立通过 `git check-ref-format --branch` 校验；同名存在即冲突失败，不删除、覆盖或强制复用。
-- 所有 Git 命令使用固定可执行文件和 argv 列表，`shell=False`、固定 cwd、有限超时与受控环境；禁止拼接命令字符串、`shell=True`、模型提供参数或隐式 fetch/push。
-- 每条 SubAgentManager 发起的 Git 命令（包括 `worktree add`、checkout/list/status/remove 和失败清理）均显式覆盖 hooks 配置：在 argv 中固定 `-c core.hooksPath=<manager-owned-empty-hooks-dir>`，并禁用 system/global Git config、交互式 prompt 与 fsmonitor；empty hooks dir 必须由 Manager 创建、校验为空且 child 不可写。仓库 `.git/config`、用户 config 或全局 config 中的 `core.hooksPath` 均不得覆盖此设置。无法证明配置覆盖生效时不运行 Git 命令。
+| 角色 | Team 工具 | 普通工具 |
+|---|---|---|
+| 普通 CLI 会话 | 无 | 既有工具集合 |
+| Team Lead | `team_status`、`team_manage`、`team_tasks`、`team_message`、`team_integrate` | 受当前 Plan/Do、Permission、Skill whitelist 和成员/模式政策收窄后的普通工具 |
+| Team Member | `team_status`、`team_tasks`、`team_message` | 由其有效 Definition allowlist 与父策略、Plan/Do、Permission 等共同决定 |
+| 普通 SubAgent | 无 | Chapter 13 子 Agent 原有工具交集；不得嵌套 Team |
 
-## 功能需求
+`team_status` 为只读；其余 Team tool 的 schema 含持久化/状态写操作，整体按非只读注册并串行调度（具体 operation 是否写入见契约表）。Team 状态变化的锁/版本比较是最终并发保护。Team 工具无论角色均经过 AgentLoop mode/visibility、PermissionManager、ToolScheduler、executor。`AgentMode.PLAN` 只暴露 `team_status`，不暴露 Team 写工具。`awaiting_approval` 是成员业务状态，不是 PLAN 的别名：成员可以在 DO + awaiting_approval 下使用已授权的提交计划/消息协调能力，但普通文件、命令与外部副作用仍受审批门禁止；处于 PLAN 时必须由用户显式切换 DO 才能使用这些协调写操作，批准本身不改变 mode。
 
-### F1：定义与兼容
+普通 CLI 只有经静态 `/team lead` 或 `/team open <team-id>` 明确进入 Lead 角色后才取得 Lead tools；`/team close` 脱离团队并安全暂停/收尾当前成员。打开团队时必须核对用户级 Team store 与当前 workspace 身份。新建团队仍由 Lead 的固定 `team_manage.create` 操作完成；不创建用户自定义命令。
 
-Definition schema 新增 `isolation`，值为 `shared|worktree`，默认 `shared`。Fork 始终保持 Chapter 13 的快照行为，不自动创建 Worktree；本章不提供 Fork + Worktree 的组合。Definition 的模型、工具 allow/deny、权限、轮次与 SOP 语义不变。无 isolation 字段的既有 Agent 完全兼容。
+## 身份、路径与持久化
 
-### F2：仓库发现及输入校验
+- Team store 固定在 `~/.newcode/teams/<team-id>/`。Team ID 由安全随机数生成，为 `team-` + 32 位小写十六进制；不得以用户输入拼成路径。团队 display name 限 80 个 Unicode 字符、去控制字符且非空；独立 slug 为 `[a-z][a-z0-9-]{0,47}`。Member ID 为 `[a-z][a-z0-9_-]{0,31}`；重名按 casefold 拒绝。task/message/session 文件名均由生成 ID 产生。
+- Team 与唯一 workspace fingerprint 绑定。fingerprint 为 canonical workspace root 与 canonical Git common-dir 的规范化 SHA-256；manifest 不需保存可注入路径。跨 workspace `/team open` 与 worker resume 返回 `team_workspace_mismatch`，不迁移、不复制团队数据。
+- Team 根、每级子目录与文件都必须验证普通目录/普通文件、canonical containment、无 symlink/junction/reparse point 逃逸；无法识别 reparse point、ACL 或 owner 时 fail closed。路径检查在创建、读取、原子替换、恢复及清理前重做。
+- POSIX 根目录/文件权限为用户专有；Windows 必须验证只有当前用户和系统管理主体可访问。平台无法证明私有 ACL 时禁止写入 Team store。
+- 推荐布局：`team.json`（versioned manifest/roster/revision）、`transactions/<commit-sequence>-<transaction-id>.json`（业务提交事实）、`tasks/<task-id>.json`、`messages/<message-id>.json`、`acks/<member-id>.json`（可重建投影）、`members/<member-id>/sessions/<session-id>.jsonl`、`integrations/<integration-id>/` 与 `locks/`。只保存 JSON-safe、已脱敏的业务状态和 Chapter 9 兼容会话记录；不保存 API key、MCP headers/tokens、完整 env、Permission session allow、Provider client、Tool/Manager/Context 对象、PID 或其他长期进程句柄、IPC credential 或 Hook/Skill runtime object。仅短暂的 OS 锁 owner 记录可含 process identity、启动 nonce 与 scope；owner 释放并验证后删除，不能当作恢复凭据。
+- 文件采用同目录临时文件、flush/fsync、原子 replace；新 ID 文件用排他创建。更新由 TeamStore revision/CAS 与跨进程 advisory lock 串行化。锁记录 owner process identity、启动 nonce 和 scope；只能由内核锁证明所有者已释放后清除，绝不单凭 mtime 判断 stale。锁超时/owner 无法确认时安全拒绝且不覆盖。
+- 跨进程锁须在当前 OS 上有自动化竞争测试；不支持安全 advisory locking 时，独立进程后端不可用，不能改用仅靠目录存在或 mtime 的“锁”。
 
-启动 task 前确认 workspace 位于有效、非 bare Git repository 中，解析 canonical repository root/common dir/base commit。所有解析输出必须是单行、无控制字符且符合预期格式。Git 缺失、仓库损坏、detached/无效 HEAD、权限错误、超时或输出无法解析均返回稳定安全错误，不创建目录、不退回 shared。
+## 团队配置与资源上限
 
-路径解析先验证原始相对名称，再对 root 与候选路径做 canonical containment；逐段拒绝空段、`.`、`..`、绝对路径、盘符、冒号、反斜杠、控制字符、符号链接、junction/reparse point、非普通父项及 root 外路径。平台无法识别或验证 reparse point 时拒绝。目标目录或分支已存在时不覆盖。
+现有 `config.yaml` 是 Provider/workspace/timeout/Permission 的 AppConfig；本章不把 Team secret 或动态规则扩展到该文件。新增严格 YAML：用户级 `~/.newcode/teams.yaml` 建立能力上限；可选项目级 `<workspace>/.newcode/teams.yaml` 只能收窄用户配置，不能启用 Teams/coordinator、增加资源上限、放宽审批或权限。
 
-### F3：Worktree 创建、归属与受控恢复
+- Team 功能默认关闭；用户级配置显式 `enabled: true` 后可使用 `/team`。新团队默认 backend 为 `lightweight`，成员默认需计划审批、Definition 必须显式声明 `isolation: worktree`。
+- user config 可设置 `backend_default: lightweight|pane`、低于固定上限的 `max_members` / `max_running_members` / `require_plan_approval`；project config 只能更保守。未知字段或类型错误以稳定脱敏诊断隔离，不从 project 自动打开功能。
+- `coordinator.enabled` 仅接受用户级 true，且用户启动 CLI 时显式设置 `NEWCODE_TEAM_COORDINATOR=1` 才生效；两者缺一即关闭。project 文件不能开启。环境变量值不是 Team state，不落盘。
+- 固定限制：每个用户最多 32 个 Team；每 Team 最多 8 个 worker members（另 1 个 Lead）；每 CLI session 最多 4 个正在运行/恢复的 members；member 启动等待队列最多 16；Team task 最多 256 条；每 task 最多 16 个 dependency；每 Team 最多保留 4,096 封消息、未确认邮箱最多 1,024 封；正文最多 16 KiB UTF-8、task 标题 240 字符、说明 8 KiB；member checkpoint 最多 8 MiB。每Team提交日志最多8,192条或64 MiB，任一触顶拒绝新事务，不自动压缩/删除提交证据。触顶时稳定拒绝新写入，不静默丢弃未确认内容。
+- 沿用 Chapter 13 单次 member activation 的 8 轮、300 秒、16K 近似 token 上限；每次恢复重新计算，累计 usage 仅作统计，不恢复超额授权。一般 wait 上限 30 秒。Team shutdown 使用单一全局 1 秒等待预算，不按成员数累加。
 
-WorktreeManager 创建目录前取得仓库级锁和 task 锁，验证目标不存在、branch 不存在，写入仅供管理器使用的 ownership marker，再通过 hooks 显式禁用的 `git worktree add -b <branch> <path> <base-commit>` 创建；特别地，add/checkout 即使会触发 post-checkout 等 hook，也必须使用 Manager-owned empty hooks dir。失败必须回滚只删除本次创建、仍可证明归属且未含用户数据的目标。不得调用 `git worktree prune`、`--force`、任意 branch 删除或 Git 命令代理。
+## 后端与成员生命周期
 
-目录已存在绝不构成恢复依据。恢复只允许当前进程内由该 Manager 创建、已登记且未被占用的同 task 记录；如产品需跨进程恢复，应独立审批，不属于本章。管理器仍须进行只读注册验证：`git -C <repo> worktree list --porcelain`，并在候选 worktree 上运行 `git rev-parse --show-toplevel`、`git rev-parse --git-common-dir`、`git symbolic-ref --quiet --short HEAD` 与 `git rev-parse HEAD`。canonical top-level/common-dir、预期 branch、marker task/owner、HEAD 和 Manager 记录必须一致。任一查询失败、Detached HEAD、branch/path 冲突、marker 不合法、注册缺失/重复或 task 已占用均拒绝复用。所有查询只对临时本地 Git 仓库测试，无网络。
+`AgentLoop`/Provider 同步 API 不为“协程”概念重构。`lightweight` backend 在本进程有界 worker 中以每 member 单线程串行驱动 AgentLoop；idle member 等待 mailbox signal，不在 idle 时发模型请求。当前 CLI session 关闭时取消、checkpoint 并释放该进程 worker；Team 数据留存，下一次 open 重新构造 runtime。
 
-### F4：生命周期与状态
+`pane` backend 的唯一文件入口为 `newcode/teams/worker.py`，模块路径为 `python -m newcode.teams.worker`。成员输出不作为消息事实来源。无副作用 probe 只检查 tmux 可执行文件/版本、可信绝对 Python、worker 的 `--check` 模块自检、OS 锁/IPC 能力，不创建 pane/socket、不运行 Agent。随后 startup validation 才创建本次 IPC/pane、握手并取得唯一 executor lease；通过后才初始化 Worktree 并启动成员。
 
-每项资源状态至少为：`requested → validating → creating → ready → running → completed|failed|cancelled|timed_out`；完成后 Worktree 结果为 `cleaned|preserved`。验证/创建阶段还可转 `cleanup_failed`。非法转换返回稳定错误码。Worktree 状态与 Chapter 13 task 状态分开保存，task 终态不得伪造 Worktree 已清理。
+tmux 必须支持并经真实测试证明多参数 command 的直接 exec：外层固定 argv 为 `tmux split-window -d -P -F '#{pane_id}' -c <trusted-bootstrap-cwd> -- <absolute-python> -I -B -m newcode.teams.worker --team-id <generated-id> --member-id <validated-id> --endpoint <generated-endpoint> --generation <runtime-generation>`，所有command/args分别传递，不能合成shell-command字符串。bootstrap cwd/模块来源必须来自可信NewCode安装而非成员Worktree；`-I`隔离Python路径、`-B`禁止启动写bytecode，同一解释器/参数执行--check并核对module origin；未安装/来源不可信则unavailable，不能导入成员文件冒充worker。--check不创建用户配置或运行对象。成员工具cwd仍显式传Worktree，不使用进程chdir。要求tmux内层exec argv，禁止sh -c、cmd /c、send-keys或插值；仅外层shell=False不算证据。任何平台/版本不能证明此行为则pane unavailable。非secret参数也逐项校验；特殊字符原样传递测试不得执行额外命令。
 
-创建成功后才启动 child；工具 cwd/root 注入完成后进入 running。cancel/timeout 先设置 child cancel 标志并按 Chapter 13 有界等待，再由同一 Manager 串行清理/保留。创建失败只影响本 task。CLI `/clear`、`/resume`、EOF、`/exit`、KeyboardInterrupt、异常及正常退出关闭旧 task scope；活动 Worktree 先取消并有限等待。任何清理步骤异常不能阻断 Hook、Memory、Context、MCP 的既有关闭流程。
+启动验证必须绑定 OS peer identity、已启动 worker process、member/generation 与唯一运行锁；错误 peer/重复 executor 拒绝。任一步失败只终止本次已验证归属的 worker/pane、关闭 IPC 并撤回本次 provisional 状态；不碰既有 pane/lease，清理不确定则保留占用标记和诊断。worker 不可用、pane 创建失败或 secure IPC 不可用时返回稳定错误；不得静默改用 lightweight。默认 lightweight，不自动安装 tmux/其它软件。tmux pane 不是 OS sandbox。当前无 tmux 时 pane unavailable/未验证，lightweight 可独立验收，不得宣称两种后端均已验收。
 
-### F5：完成后的保留/删除
+pane worker 不得在命令行、tmux environment、持久配置或 Team 文件传递 API key/MCP headers。CLI 建立当前用户 ACL 限定的本地 named pipe（Windows）或权限 0600 的 Unix socket，使用 OS peer identity 校验同一用户和已登记 member；运行期 Provider/MCP 配置只经此通道进入 worker 内存。若平台未验证 IPC ACL/peer 身份或配置安全传递，pane backend fail closed。仅限制同一 OS 用户之外的威胁；Team 不声称抵御同用户恶意进程。
 
-task 结束后先验证归属，再计算改动：`git status --porcelain=v1 -z --untracked-files=all` 检测 tracked/untracked/冲突改动；另用 `git status --porcelain=v1 -z --ignored=matching` 与 `git ls-files --others --ignored --exclude-standard -z` 检查 ignored 文件/目录，并用不跟随链接的有界文件系统遍历校验 Worktree root 无未枚举内容。状态不得被 `.gitignore` 隐藏。只有 manifest 中逐项登记、由当前 task 创建且已验证身份的临时文件可先安全清理，再重新执行全部状态检查；除此之外任何 ignored/untracked 内容（含 ignored 目录）均意味着 preserve。Worktree 根部 Git 写入的 `.git` pointer file 不是 task 文件，但必须与注册记录指向的 task-specific Git admin directory 精确匹配，不能作为可删除内容。
+能力选择顺序固定：调用参数明确指定 backend > 已持久化 Team backend > 用户级 `backend_default` > `lightweight`。只探测选中的后端；显式选择不可用即失败，不 fallback。无副作用 probe 必须先于业务持久 mutation；有资源创建的 startup validation 不称为无副作用，失败按本次资源清单回滚。Worktree 创建和成员执行在 startup validation 成功之后。
 
-是否存在领先 upstream 的 commit 由 `git rev-list --count @{upstream}..HEAD` 判定。参数必须由 Manager 固定生成，不接受输入。无 upstream、远端配置不可用、任何 Git 查询/目录遍历失败或超时、输出截断/无法完整解析、锁冲突或归属不明一律视为“状态未知并保留”。本章不访问网络，也不执行 fetch。
+Team 状态为 `ready → active → closing → ready|closed`，`closed` 只表示显式归档/关闭，不删除资料，之后可重新打开。Member 状态：`created → starting → awaiting_approval|running → pausing → paused → resuming → running`，以及自然完成 `running → idle`；完成受控集成后转终态 `integrated`。非终态可进入 `stopping → idle|interrupted|failed`。自然最终回答后 checkpoint 成功才 `idle`；pause 在安全点 checkpoint 后才 `paused`。Provider/tool 异常为 `failed`；checkpoint 失败为 `failed` 且保存上一个有效 checkpoint；进程崩溃后运行锁确认释放，未完成 runtime 状态变为 `interrupted`，不伪装 idle。`failed/interrupted` 不能直接恢复执行，必须先校验 checkpoint、工具交换、策略与 Worktree ownership，再经显式 resume 转 `starting`。`integrated` member 不可在旧 base 上恢复写入；需继续工作必须创建新 member/worktree。非法状态迁移返回稳定码。
 
-仅当工作树无 tracked/staged/untracked/ignored 内容、无领先 upstream 的 commit 且注册/ownership 均有效时，Manager 才可以正常自动移除。存在任意改动、未登记 ignored/untracked 内容、领先 commit、无 upstream 或状态未知时设为 `preserved`，并将脱敏的 canonical 路径、branch 与原因码加入 child 安全结果；不把 Git status 的文件名、diff、凭据或异常文本回灌模型。Chapter 14 不提供丢弃式删除/确认命令；任何需要删除有改动/领先 commit 的 tree 必须 fail closed。
+同一时刻每member只有一个执行者。自然idle可消息唤醒；pause/stop把持久`auto_wake`设false，显式resume并校验成功后才重新打开，不能用新邮件绕过暂停。stop在真实退出后释放运行对象，不删除checkpoint。CLI重启先验证checkpoint/tool-pair、Worktree owner/registry和当前策略，再创建runtime。恢复得到新PermissionManager、ToolContext、ContextManager、Skill state、取消flag和usage accumulator；不恢复Session allow/确认、Hook pending injection、Provider client或运行句柄。Context prepare在恢复/新请求前重算预算；不完整工具交换依Chapter9截断。
 
-### F6：显式 cwd 与工具安全链
+## 共享任务、消息邮箱与审批协议
 
-新增明确的 child execution context，至少含 canonical `workspace_root`、canonical absolute `cwd` 和 workspace identity。AgentLoop/ToolContext/Permission request 必须使用 child 的值；不使用 `os.chdir`。permission sandbox root 必须是当前 child worktree root，不能用 common Git dir 或 main workspace 放大访问范围。
+### Shared Tasks
 
-`read_file`、`write_file`、`replace_in_file`、`find_files`、`search_code` 均基于 child Workspace resolver；相对路径穿越、绝对路径、symlink/junction 逃逸必须拒绝。`run_command` 的 subprocess cwd 必须显式是 child cwd。**但现有 `shell=True` 命令执行不是 OS sandbox**：Worktree 本身不能阻止 shell 使用 `..`、绝对路径、脚本解释器或子进程访问 main workspace。Worktree child 的 `run_command` 只有在平台 backend 能通过隔离测试证明进程文件访问被限制在 Worktree root 时才允许执行；否则工具在 child registry 中不可用/每次调用 fail closed，绝不退回主 cwd。共享 Agent 的现有命令语义保持不变。
+Task 字段：生成的 `task_id`、title/description、creator、optional assignee、status、dependency IDs、revision、created/updated timestamps、可选 completion summary。状态为 `open → assigned → in_progress → blocked|completed|cancelled`；`blocked → assigned|in_progress|cancelled`。任何终态不可被重复完成或删除。删除仅允许 open、无 assignee、无被引用下游依赖的 task。任务更新要求 `expected_revision`，CAS 冲突返回 `team_task_conflict`；同一成员重复 claim 是幂等返回，其他成员已领取则冲突。依赖必须存在、不能自依赖，增边前检测循环；任何依赖未 completed 时拒绝 claim/执行。Team 本章不自动调度 task 到 Agent，不实现跨机队列或复杂 DAG scheduler；Lead 显式分配并触发成员。
 
-工具仍经过 AgentLoop、Plan/Do、PermissionManager、ToolScheduler、executor。Worktree lifecycle Git 操作是固定内部能力，不暴露给模型为任意 Git 命令；安全策略拒绝时不得创建/删除资源。
+### Mailbox
 
-#### Worktree `.git` 指针与共享 Git 元数据隔离
+`TeamMessage` 固定字段：`message_id`、`team_id`、由 runtime 注入的 `sender_member_id`、recipient member ID 或 `broadcast_id`、kind、脱敏正文/结构化 payload、UTC 时间戳、sequence、read/ack 状态和安全摘要。模型不能指定/覆盖 sender、team、时间、sequence 或 read 状态。recipient 只能从当前 roster 选择；广播在锁内按 roster 顺序生成 idempotent per-recipient envelope。
 
-Worktree 根的 `.git` 是指向 common Git dir 下 task-specific admin dir 的普通 pointer file。child 可读取该 pointer、当前 Worktree 的 admin metadata（包括 HEAD/index）及 common object database，以执行明确列出的只读 Git 查询；这些读取权限不意味着任一 Git metadata 可写。
+模型 `send/broadcast` 只能产生 `team.message.v1`，不能提供 kind。`team.task.assigned.v1`、`team.task.completed.v1` 只由 TaskService，`team.plan.submitted.v1`、`team.plan.decision.v1` 只由 ApprovalService，`team.member.idle.v1`、`team.member.failed.v1` 只由 MemberRunner 产生。接收同名协议只是读取已提交业务状态的通知，不再次执行业务操作；伪造 kind/身份安全拒绝。自然语言“同意/批准”不修改 approval。
 
-Git 命令采用固定 allowlist：仅允许经命令解析器识别并限制参数的 `git status --no-optional-locks`、`git diff --no-ext-diff --no-textconv`、`git log`、`git show`、`git cat-file`、`git ls-files` 与受限 `git rev-parse` 只读查询。不得开放 `git add`、`git commit`、`git update-ref`、branch/ref 写入、checkout/switch、reset、clean、fetch、push、config、worktree add/remove/prune，或任何未列出的 Git 子命令。`git add` 会写当前 index 且可能写共享 object database；`git commit` 需要写 objects 与共享 refs；本章没有 task 独占的 object/ref store，因此不支持 child commit，也不把 Worktree 描述为支持提交。
+单文件 atomic replace 不提供多记录事务。本章采用最小提交日志方案：所有 task/plan/member 状态变化、关联 outbox、消息分配、idempotency 映射及 ack 更新，都在 Team owner lock 下生成单个有界事务记录（上限 512 KiB），记录 expected/new revisions、业务 after-image、runtime mutation ID、幂等键、消息 ID、完整广播收件人 envelope 清单和 sequence 区间。事务 ID/消息 ID 使用安全随机生成；消息 sequence 在锁内按已提交最大值递增，广播按当时 roster 的固定顺序分配。模型可提供的 idempotency_key 只是不超过 64 个 ASCII 安全字符的请求标签，实际键为 runtime team + sender + operation + key；同键异正文/收件人返回 `team_idempotency_conflict`。
 
-当前 Worktree 专属 admin dir（包括其 HEAD、index、config、logs 与其他 metadata）对 child 一律只读；不得写入该目录，更不得访问或修改 main/其他 Worktree 的 admin dir。common objects、refs/packed-refs、common config/hooks、main workspace metadata 同样不可写。child 的 `run_command` 不得把原始 shell 字符串交给 shell：只能经结构化解析与 capability 执行上述只读查询，拒绝 shell operator、pager、external diff/textconv、helper、config override 及命令拼接。若无法证明解析、参数限制、路径 ACL 与 hooks 环境均有效，则 Worktree child 的 Git 查询及 `run_command` 必须在启动子进程前 fail closed；仅设置 cwd 不构成隔离证明。
+提交顺序固定：①校验锁/容量/revision并生成完整事务；②同目录临时写入、flush/fsync，再排他发布不可变transaction commit文件并确保目录项持久化；此时才是唯一业务提交点；③更新可重建tasks/messages/acks/manifest/幂等索引投影；④返回成功/发送wake hint。`commit_sequence`为每次事务递增的独立序号并带previous-commit-ID链；消息`sequence`为单独递增的整数，事务保存分配区间和新高水位，无邮件事务不消耗消息序号。目录持久性不能证明则store unavailable。提交前崩溃忽略临时文件且未返回成功；提交后投影/wake前崩溃，启动先在锁内按commit序列校验重放，再服务读写，不重新分配ID/sequence、不重复业务变更。投影缺失可重建，提交记录损坏/revision链不完整则fail closed，不跳过后继续写。日志/投影容量不足拒绝新事务，不删未确认邮件，不做在线日志压缩。邮箱事实来源为已提交事务与其envelope投影，wake失败不影响提交。
 
-Manager 自身 Git 调用使用独立的受控 capability，不继承 child sandbox 的写权限，但只允许本 spec 固定的 lifecycle argv。所有 Manager Git 调用都通过一个 central wrapper 注入 empty hooks path，并禁用 system/global config 和交互行为；其权限也不能写 main workspace 内容、用户配置或全局配置。child 通过 `run_command` 发起 Git 时必须走 sandbox 提供的 Git capability wrapper；不能保证共享 metadata ACL 与 hooks 环境时零执行。
+模型 `read` 不自动 ack。自动投递先把 envelope 加入成员 session，在同一份有效 Team checkpoint 中保存消息及 processed-message-ID 元数据，再持久化 ack 事务；模型 read 的 ToolResult 则先按原序进入 session，runner 在下次主请求前持久化包含该观察的 checkpoint，随后模型才可显式 ack。有效 checkpoint 使用原子发布的完整 JSONL，沿用 Chapter9 配对/脱敏规则；processed ID 元数据与消息正文在同一发布单元，Context 压缩不能删除该去重元数据。Lead 自身邮箱同样使用绑定当前 Lead session 的 Team checkpoint adapter；不是只写一个与 session 脱节的 receipt 文件。
 
-MCP adapter 不改变。stdio MCP 继续采用现有配置语义（命令/args/env 且继承 NewCode 进程 cwd）；不得隐式将 MCP 子进程 cwd 改成 Worktree。MCP tool 的本地路径语义由服务器自身决定，不能宣称受 child Worktree sandbox 约束。若某 MCP server 不能满足边界，由既有 Permission/allowlist 禁用该工具；不得为隔离而更改用户配置语义。
+ack 必须检查runtime当前收件人、消息确为其envelope、checkpoint绑定同Team/member/session generation，且ID已在该有效checkpoint；未入checkpoint、旧generation、他人消息均拒绝。重启先校验旧checkpoint并重建当前generation的有效checkpoint，再补ack，不能直接使用旧generation receipt。checkpoint前崩溃重新投递；checkpoint后ack前崩溃只补ack、不重复追加；ack已提交则幂等返回。重复inbox scan按sequence和message ID去重。恢复坏行/配对截断会使相应delivery proof无效，不能据它ack；不覆盖原始有效checkpoint。未确认消息不淘汰。这里保证的是持久消息投递去重，不保证LLM请求或外部工具副作用exactly-once；调用后checkpoint前崩溃须报告可能重复，不自动重放副作用。
 
-### F7：缓存与根身份隔离
+### Plan Approval
 
-至少 child file-read cache key 必须包含 canonical absolute workspace root、canonical absolute file path、文件 stat signature 和 repository/worktree identity；每个 child cache 独立，不能在主 workspace、另一 Worktree 或另一个 task 间复用。Context artifact 固定落在 child workspace root 下的 `.newcode/context-artifacts/<child-session-id>/` 并由其 ContextManager 清理。
+Plan proposal 字段为生成 `plan_id`、member ID、monotonic `revision`、内容、submitted timestamp、status `pending|approved|rejected|superseded`、decision member/Lead ID、decision timestamp 与关联 message ID。Member 每次修改 plan 必须创建 revision+1，新 revision 自动使旧批准 superseded。Lead 只可对当前 pending revision 通过固定 `team_manage.approve_plan|reject_plan` 操作提交 `plan_id + expected_revision + structured decision + bounded reason`；并发重复决策以 CAS 决定，旧 revision 返回 `team_plan_stale`。自由文本和邮箱文本不会生成批准状态。
 
-Instructions、Memory、Skill/Agent discovery、Prompt/context 派生缓存若存在，cache key 必须包含其实际 canonical source root/workspace fingerprint；项目级记忆 fingerprint 使用 Worktree root，不因 common Git dir 相同而共享。user-level instructions/notes 可按现有 user scope读取，但自动记忆服务、SessionArchive、父 session、已激活 Skill state、Hook state 与 Context artifacts 不得在 child/main 之间共享。Worktree 目录不含父 `.newcode` 忽略运行数据。
+需审批的 member 在 DO + awaiting_approval 下，普通能力只允许 `read_file/find_files/search_code`，协调能力只允许 `team_status`、`team_tasks.submit_plan` 及 `team_message.send/broadcast/read/ack`；每条 operation 仍需 Permission。协调写入限于受控 Team store，不是普通文件/外部副作用授权。固定 schema 可以含审批后 operation，executor 必须按 operation 拒绝审批前的 task 修改，不动态改 schema。PLAN 只保留只读工具与 `team_status`，不能靠业务审批状态放宽。
 
-### F8：初始化内容的显式 allowlist
+权限计算分三层：启动时不可变父级工具/Permission 上限 `P0`（包括明确委派的角色能力）；由 Lead 主线程发布、带 generation/revision 的当前收窄快照 `Pt`（单调取交集，不能撤销已收窄项）；当前计划审批门 `At`（可从待批变为已批，只解除业务限制）。实际能力每次主请求及 executor 开始每个工具前均重新计算：`Registry ∩ P0 ∩ Pt ∩ Definition/role allow − deny ∩ member mode ∩ Skill whitelist ∩ At ∩ isolation/backend/coordinator limits`，最后再经过独立 PermissionManager/hard deny/sandbox。普通工具 Definition allow 与固定角色委派集合分开建模，角色委派也受 P0/Pt 和所有 gate 限制。批准不能增大 P0、恢复 Pt 已移除工具或产生 Permission grant。主进程按 scope 向 pane 发布经过认证的快照，worker 不读取 Lead 可变对象；缺快照、失联或 generation 不符即拒绝新工具。
 
-Worktree checkout 默认只包含 Git 跟踪文件。用户级可选配置入口固定为 `~/.newcode/worktree.yaml`，项目请求入口固定为 `<repository-root>/.newcode/worktree.yaml`。user config 为权限上限；project config 只能选择其子集，不能扩权。均为安全 YAML、schema 严格拒绝未知字段，单文件错误产生安全诊断且回退到空初始化 allowlist。
+计划修订/批准撤销和父级收窄都递增策略版本；旧模型响应中的调用仍在executor开始前重验。策略发布与工具准入共享Manager屏障，pane每次工具必须经认证IPC申请当前版本的执行lease，不得只靠本地推送快照离线执行；失联拒绝。lease登记是逻辑准入点并计入in-flight，收窄后不得给旧许可新增准入；已准入调用尽力取消、等真实退出，不能声称撤销能回滚副作用，不能将它们误判为静止。所有后台/独立进程成员使用非交互confirmer：`require_confirmation` 必须返回安全拒绝、executor零调用，不调用主终端HITL、不自动允许、不继承Lead session allow。用户若要允许能力，须预先配置明确Permission规则。
 
-- `copy_files` 与 `copy_ignored_files` 只接受 repository-relative 的精确普通文件路径列表，不接收 glob、绝对路径或目录递归；project 所选路径必须同时出现在 user allowlist 和内建安全路径 allowlist 中。
-- 始终拒绝 `.env*`、凭据/token/key、私钥/证书、`.git/**`、`.newcode/{sessions,memory,context-artifacts,skills-state}/**`、MCP headers/tokens、session/archive、cache、日志、临时文件、符号链接/junction 与任何运行时目录；敏感模式 deny 优先于显式 allowlist。
-- `dependency_links` 默认空，只接受 user 明确列出的 canonical trusted read-only dependency roots；project 配置不能添加目标。只允许通过平台验证的只读链接/junction，目标必须在可信 allowlist 中且不可由 child 写入；不能证明只读、稳定和不会逃逸 sandbox 时不创建链接，继续运行但依赖不可用。
-- Chapter 14 的 hook execution allowlist 固定为空：仓库 `.git/hooks`、用户 hooks path、system/global config 指向的 hooks 均不执行，也不复制到 child。每条 Manager Git argv 显式指定 Manager-owned empty hooks dir，并禁用 system/global config；对 `worktree add` 的 checkout-hook sentinel 必须证明零执行。child Git 仅在 command sandbox 能保证相同 hooks override 且不能由命令覆盖时可用；否则 child Git/`run_command` fail closed。本章不支持需执行 Git hook 的工作流。
-- 配置复制、忽略文件复制与 hook 初始化必须在启动 Agent 前完成；逐文件 O_EXCL/原子写，不跟随链接。失败清理本次资源或保留安全标记并失败该 child，不影响主 Agent。
+成员运行对象不与Lead共享，独立实例本身也不证明文件隔离。MCP stdio cwd沿用现有配置语义，不能悄悄改成Worktree；本章缺少可验证的remote/MCP文件范围限制，因此Worktree成员禁用MCP工具（不创建client/session、不启动stdio/HTTP discovery）及Hook shell/HTTP action（含排队/旁路触发），直至另有经过验证的隔离能力获批，不以只读标记推断安全。独立Hook runtime只允许原有request-only prompt injection/诊断及unavailable subagent placeholder；独立Skill/Context/artifact不共享Lead MemoryService，成员Skill只收窄工具且不能嵌套ordinary agent或激活可逃逸runner。
 
-### F9：过期清理
+## 工具 schema 与并发
 
-仅清理年龄超过 **30 天** 的资源；mtime 仅作候选筛选，不是删除授权。自动删除要求 tracked/staged/untracked/ignored 文件和目录检查均完整且为空；忽略状态不可查询、扫描不完整、存在未知目录/条目均保留。删除前必须同时通过三层独立门：
+五个 schema 固定且 `additionalProperties=false`。下表每行均必填 `operation`，另列该行必填/可选参数；**禁止字段=除 operation 与该行列出的必填/可选之外的全部字段**，不能把其他 operation 的合法字段带入。全局禁止 `team_id/member_id/sender/actor/role/decision_maker/session_id/generation/permission/mode/kind/sequence/read_state`；这些身份与授权字段只从可信 runtime 注入。`target_member_id`、`recipient` 是校验 roster 后的操作目标，不可用来改变调用者身份。审批决策者来自当前 Lead runtime，operation 本身表达 approve/reject。
 
-1. **路径门**：canonical 目标严格位于 `<repository-root>/.newcode/worktrees/` 内，且逐段无 symlink/junction/reparse point；目标不是 root、main worktree、metadata/owner 目录或 link target。
-2. **Git/归属门**：只读 Worktree list 显示唯一注册；common-dir、top-level、branch、marker 与 Manager-owned task ID 全部匹配；不删除无 marker、用户创建或无法证明归属项。
-3. **活动/状态门**：跨进程锁确认无活动 task，当前 Manager 无 lease/占用；先清理 manifest 验证过的本任务临时内容，再重新查询 tracked/staged/untracked/ignored 文件与目录、upstream ahead，并完成不跟随链接的 root 遍历；所有状态必须明确为空且扫描完整。无 upstream、Git 不可用、锁竞争、命令输出不完整、扫描错误或状态未知均保留。
+公共类型：所有ID为经注册表验证的受控字符串；revision为正整数，未知ID不创建资源。`dependencies`是至多16项的不重复task ID字符串数组；`require_plan_approval`为bool。`limit`为1–50、默认20，cursor是当前Team+调用者+查询绑定的opaque token，过期/跨scope拒绝；每页正文合计最多16KiB，溢出带next_cursor。title/body/content/reason必填时非空，description允许空字符串；reason/summary最多2,000字符、content最多8KiB，其它沿用资源上限。`expected_target_head`是当前仓库object format的完整40/64位小写hex commit ID，`snapshot_digest`为64位小写hex。`backend=lightweight|pane`；`confirmation`必须bool true，仅表达模型操作意图，不替代用户确认；`idempotency_key`固定`[A-Za-z0-9_-]{1,64}`。
 
-每个候选独立失败隔离并产出安全 diagnostic；不能递归清理整个根目录，不能跟随链接删除根外对象，不能调用 `git worktree prune` 替代验证。child 新建 ignored 文件/目录必须导致保留，除非其是 manifest 中明确的本 task 临时项、先按安全删除流程清理且复查后为空。
+合法调用状态缩写：`L0`=用户已进入 Lead 角色但未绑定 Team；`L`=Lead 已绑定 ready/active Team；`LR`=Lead 已绑定 ready/active/closed Team；`M`=当前 executor lease/generation 有效的 running 或 awaiting_approval 成员；`MA`=M 且当前计划已批准或用户配置明确免审批。角色不在该行即拒绝；paused/idle/failed/interrupted/integrated 成员不执行模型工具，须先按生命周期唤醒。所有写 operation 仅 DO；M 的 awaiting_approval 仅允许下表明确标识的协调操作。`team_status` 可 PLAN/DO；混合读写工具整体串行/非只读，不因某个 read/preview 临时改变注册分类。
 
-### F10：子 Agent 结果与用户可见信息
+所有结果为安全ToolResult：成功data带当前revision，失败仅error_code与有限阶段标签。公共错误按顺序为参数 `team_arguments_invalid` → 角色/身份 `team_role_denied/team_scope_invalid` → mode/策略/审批 `disallowed_tool/team_policy_changed/team_approval_required` → `permission_denied` → 状态/CAS/存储 `team_state_invalid/team_revision_conflict/team_store_busy/team_store_corrupt`。校验失败不执行operation；需读状态才能决定的分支只允许受控只读查询。表中“写入”指持久业务/Git变更，不把读取期间OS锁的受控临时元数据算业务写入。下表增量错误加上公共错误适用于每行。
 
-成功/失败结果保持 Chapter 13 固定格式与脱敏上限；Worktree 子任务附加状态 `cleaned|preserved|unavailable`、branch 和相对 Worktree path（必要时安全展示 absolute path），不得附 diff、文件清单、秘密、完整 Git 输出、stack trace。完成通知只由主 AgentLoop 安全点按 parent session/generation 投递一次；worktree 内容不写入父 SessionArchive，除 AgentLoop 原有安全结果摘要外不持久化 task state。
+### team_status（只读）
 
-## 错误模型
+| operation | 允许角色/合法状态 | 必填字段 | 可选字段 | 写入 | 成功 data | 增量错误 |
+|---|---|---|---|---|---|---|
+| status | Lead L0/LR；Member M | 无 | 无 | 否 | 当前绑定/角色、Team/member安全状态、容量；L0无绑定 | team_workspace_mismatch |
+| roster | Lead LR；Member M | 无 | cursor, limit | 否 | 成员ID、角色、审批/运行状态及revision | team_cursor_invalid |
+| tasks | Lead LR；Member M | 无 | task_id, cursor, limit | 否 | task_id给单项否则分页；Member仅所属Team安全任务摘要；单项时禁止cursor/limit | team_task_not_found, team_cursor_invalid |
+| inbox | Lead LR；Member M | 无 | cursor, limit | 否 | 仅当前调用者邮件元数据/安全摘要；不投递正文、不ack | team_cursor_invalid |
+| plan | Lead LR；Member M | plan_id | 无 | 否 | Lead可查所属Team；Member仅自己的计划正文/版本/状态 | team_plan_not_found, team_plan_access_denied |
 
-对模型与日志暴露稳定、短小、脱敏的错误码，至少包括：`worktree_repo_unavailable`、`worktree_path_invalid`、`worktree_path_conflict`、`worktree_branch_conflict`、`worktree_git_failed`、`worktree_git_timeout`、`worktree_registration_invalid`、`worktree_owner_invalid`、`worktree_busy`、`worktree_setup_failed`、`worktree_command_sandbox_unavailable`、`worktree_state_unknown`、`worktree_preserved_changes`、`worktree_cleanup_denied`、`worktree_cleanup_failed`。Git stderr、路径中的用户名、命令环境、diff、hook 输出与异常堆栈不得直接暴露；诊断仅记录错误码和允许的非敏感阶段信息。
+### team_manage（Lead-only，串行）
 
-创建或安全验证失败时不启动 Worktree child、不回退 shared、不改其他任务。完成清理失败时保留目录并报告安全错误，不影响主 Agent、其他 child 或 CLI cleanup。策略拒绝优先于文件副作用。
+| operation | 合法状态 | 必填字段 | 可选字段 | 写入 | 成功 data | 增量错误 |
+|---|---|---|---|---|---|---|
+| create | L0 | team_name | backend | 是 | 生成team_id、Lead绑定、revision；Lead身份runtime生成 | team_limit_exceeded, team_backend_unavailable |
+| spawn | L；目标task为open、无assignee且依赖完成、无运行执行者 | member_name, agent_name, task_id, expected_team_revision | backend, require_plan_approval | 是 | 生成member_id、starting状态、revision；任务绑定新成员 | team_name_conflict, team_definition_invalid, team_task_not_ready, team_backend_start_failed |
+| pause | L；目标running/awaiting_approval/pausing/paused | target_member_id, expected_member_revision | 无 | 是 | pausing或已paused；只在真实安全点checkpoint后标paused | team_member_not_found, team_member_busy |
+| resume | L；目标idle/paused/failed/interrupted | target_member_id, expected_member_revision | task_id | 是 | resuming/starting与revision；task_id如给出须已分配给目标且依赖完成 | team_member_busy, team_task_not_ready, team_backend_unavailable, team_restore_invalid |
+| stop | L；目标created/starting/awaiting_approval/running/pausing/paused/resuming/idle/interrupted/failed/stopping | target_member_id, expected_member_revision | 无 | 是 | stopping或已确认idle/interrupted/failed；不是杀进程已成功的虚假承诺 | team_member_not_found, team_shutdown_timeout |
+| approve_plan | L；当前计划pending、所属成员非integrated | plan_id, expected_plan_revision | reason | 是 | 当前revision approved、业务审批门更新、decision消息ID | team_plan_not_found, team_plan_stale |
+| reject_plan | L；当前计划pending、所属成员非integrated | plan_id, expected_plan_revision, reason | 无 | 是 | 当前revision rejected、decision消息ID | team_plan_not_found, team_plan_stale |
+| archive | L；不存在未静止executor、无未决integration | expected_team_revision | 无 | 是 | closed、保留所有资料；活动时拒绝，先显式stop/pause | team_member_busy, team_integration_pending |
 
-## 非目标
+`member_name` 遵循 Member ID 名称格式但只是创建时的花名；runtime 分配稳定 member ID 并保存名称注册映射。`require_plan_approval` 只能设 true 加严，false 若弱于用户/项目政策则拒绝，不能由模型免审批。stop重复调用只对同一 runtime mutation ID 幂等，真实状态不明仍busy/timeout。
 
-- Worktree 间 merge、cherry-pick 回主分支、同步/自动提交或推送。
-- Worktree 跨进程/跨会话恢复、跨会话 task 持久化、后台服务守护。
-- Agent Teams、多个 child 的 Git 协作、Worktree 分支 UI/命令。
-- Git 任意命令代理、远端访问、自动 fetch/push、自动解决冲突。
-- 将 Git Worktree 视为通用 OS sandbox；无可验证共享 Git metadata 与 process confinement 时 child Git/`run_command` fail closed。
-- 改写 MCP stdio cwd 语义、Provider orchestration、Permission policy、主 AgentLoop 的 gates、Chapter 13 tool policy/预算/取消/通知规则。
-- 默认复制 ignored 文件、秘密、session、Memory、Context artifact 或任意 Git hooks。
+### team_tasks（串行）
 
-## 测试范围与验收标准
+| operation | 允许角色/合法状态 | 必填字段 | 可选字段 | 写入 | 成功 data | 增量错误 |
+|---|---|---|---|---|---|---|
+| create | Lead L | title, description, dependencies | 无 | 是 | open task_id、revision；dependencies可为空 | team_limit_exceeded, team_task_dependency_invalid, team_task_dependency_cycle |
+| claim | Member MA；task open/assigned给自己，依赖完成 | task_id, expected_task_revision | 无 | 是 | assignee=runtime成员、assigned及revision；重复同人claim幂等 | team_task_conflict, team_task_not_ready |
+| assign | Lead L；task open/assigned/blocked、依赖完成且无活动executor | task_id, target_member_id, expected_task_revision | 无 | 是 | 目标成员绑定、assigned和revision | team_member_not_found, team_member_busy, team_task_not_ready |
+| update | Lead L；Member MA且task属于自己；task非终态 | task_id, expected_task_revision, changes | 无 | 是 | 更新task/revision；changes为下述严格对象 | team_task_conflict, team_task_dependency_invalid, team_task_dependency_cycle, team_task_not_ready |
+| complete | Lead L；Member MA且task属于自己；task in_progress、依赖完成 | task_id, expected_task_revision, summary | 无 | 是 | completed/revision、系统completed消息ID；verification=not_verified | team_task_conflict, team_task_not_ready |
+| delete | Lead L；task open、无负责人、无下游引用 | task_id, expected_task_revision | 无 | 是 | tombstone/revision，不删除审计提交 | team_task_delete_denied |
+| submit_plan | Member M（允许DO+awaiting_approval）；task已分配给自己且非终态 | task_id, content | plan_id, expected_plan_revision | 是 | 初次生成pending plan_id/revision；修订使旧批准失效 | team_task_conflict, team_plan_stale |
 
-所有测试使用临时 home/workspace 和本地临时 Git repository；禁止网络 remote、push、生产 secret、真实 MCP 与生产 Git hooks。使用 fake Git executable/clock/lock/command sandbox fixture 验证失败、timeout 与平台行为。平台不支持 junction/symlink 创建时仅 skip 对应创建 fixture；拒绝路径、错误码和 fail-closed 行为仍必须在所有平台测试。
+`changes` 至少一项且 `additionalProperties=false`：Lead允许 `title/description/dependencies/status`，Member仅允许 `status`；status值仅 `in_progress/blocked/cancelled`，成员不可cancelled（须Lead处理）。in_progress必须当前assigned/blocked且依赖完成；blocked必须当前in_progress/assigned；cancelled须无活动executor。title/description/dependencies仅Lead且task open/assigned、无活动executor时可改。禁止更改assignee/ID/creator/completed。submit_plan初次禁止plan_id/expected_plan_revision；修订必须两者同时提供且计划属于runtime成员与task。任何不存在依赖、自依赖、环均拒绝。相同runtime mutation ID先返回原提交结果，不重新执行；claim同一成员且仍为assigned时可幂等返回当前状态，不能用此例外越过其它状态/revision保护。
 
-必须覆盖：
+### team_message（串行；read也不自动ack）
 
-1. schema 缺省 `shared`、合法 `worktree`、非法值隔离和既有 shared 回归。
-2. 路径各非法段、层级/长度边界、branch ref validation、canonical containment、盘符/UNC/绝对路径、symlink/junction/root escape 与目标冲突。
-3. 临时 repo 创建与注册检查、验证后启动、已有目录不能凭存在恢复、同 task/branch 占用冲突、common-dir/branch/HEAD/marker 不匹配拒绝、argv 无 shell/注入。
-4. 全六工具 cwd；文件工具相对路径 escape 被拒绝；`run_command` 的真实 cwd 及进程 sandbox 有效时的 escape 阻断；无 sandbox 时零命令执行。MCP stdio cwd 保持原配置语义。
-5. 主 workspace、不同 worktree/task 的 read cache 与 instructions/Memory/Context 派生源隔离；Memory project fingerprint 与 child root 对应。
-6. 配置 allowlist 合并和密钥/运行时排除；dependency link 目标 allowlist、写权限和 escape 拒绝；默认不链接。所有 Manager Git command hooks sentinel 零执行。
-7. 清洁 Worktree 可清理；未提交 tracked/staged/untracked/ignored 文件/目录、领先 upstream commit、无 upstream、离线/查询失败/扫描不完整、注册未知均保留；child 创建 ignored 文件的回归证明不自动删除；用户目录/main/root 外目标绝不删除。
-8. 三层过期过滤、活动锁、年龄边界、cleanup race、失败隔离；cancel/timeout/provider exception/CLI 所有退出路径中的有限资源清理。
-9. Worktree completion result 脱敏、安全路径/branch、通知只投递给正确父 session/generation 一次；child state 不进入父 Archive。
-10. Git 命令矩阵验证只读 allowlist 可用；`git add/commit/update-ref`、ref/config/worktree 写入和全部未列出命令在启动子进程前拒绝，越权尝试对 objects、refs、index、HEAD、main/其他 Worktree admin metadata 均零副作用。
-11. 当前 Worktree admin dir（含 index/HEAD）与 common Git metadata 对 child 只读；若命令解析、ACL 或 hooks 隔离无法证明，Git 与 `run_command` 零子进程调用。
-12. Chapter 4–13 Provider、AgentLoop、工具、Permission、Plan/Do、Context、Memory、MCP、Skill、Hook、Commands、CLI 与完整 pytest 回归。
+| operation | 允许角色/合法状态 | 必填字段 | 可选字段 | 写入 | 成功 data | 增量错误 |
+|---|---|---|---|---|---|---|
+| send | Lead L；Member M（允许awaiting_approval） | recipient, body, idempotency_key | 无 | 是 | 提交后的message_id/sequence；kind固定team.message.v1 | team_recipient_invalid, team_mailbox_full, team_idempotency_conflict |
+| broadcast | Lead L；Member M（允许awaiting_approval） | body, idempotency_key | 无 | 是 | 固定roster收件人清单（除本人）、broadcast_id/envelope IDs | team_mailbox_full, team_idempotency_conflict |
+| read | Lead L；Member M（允许awaiting_approval） | 无 | cursor, limit | 否 | 仅本人邮件正文/envelope/next_cursor；不改变ack状态 | team_cursor_invalid |
+| ack | Lead L；Member M（允许awaiting_approval） | message_id | 无 | 是 | 本人有效checkpoint已含ID才acked；重复幂等 | team_message_not_found, team_message_not_owned, team_ack_checkpoint_required |
 
-验收时，六个内置工具仍经既有安全链；shared Agent 行为不变；Worktree child 绝不访问 main workspace 文件。`run_command` 若没有通过平台 sandbox 验证，明确不可用而不是假装隔离。所有 Git 命令在临时本地仓库运行，无远端与全局 Git 配置变更。
+### team_integrate（Lead-only，串行；仅DO）
 
-## 架构边界与数据流
+| operation | 合法状态 | 必填字段 | 可选字段 | 写入 | 成功 data | 增量错误 |
+|---|---|---|---|---|---|---|
+| preview | L；目标idle且所有executor/工具真实静止、lease有效 | target_member_id, expected_member_revision | 无 | 否 | B、实际目标branch/M、安全文件统计、snapshot_digest、verification=not_verified | team_member_busy, team_worktree_owner_invalid, team_target_dirty, team_snapshot_invalid |
+| integrate | L；满足preview条件且单写者/目标HEAD/快照仍匹配 | target_member_id, expected_member_revision, expected_target_head, snapshot_digest, idempotency_key, confirmation | 无 | 是 | integration_id、阶段、B/M/S/I、target同步结果、保留成果、安全错误或not_verified | team_target_changed, team_single_writer_required, team_integration_conflict, team_integration_pending, team_integration_outcome_unknown |
 
-```text
-Definition(isolation=worktree)
-  -> SubAgentManager task lease / fixed policy snapshot
-  -> WorktreeManager: validate repo/path/branch -> safe git argv -> verify registration
-  -> optional exact allowlisted setup -> child ToolContext(root=cwd=worktree)
-  -> existing child AgentLoop -> Permission -> ToolScheduler -> executor
-  -> child result + Worktree cleaned/preserved metadata
-  -> Manager bounded result queue -> parent AgentLoop safe-point notification
-```
+target branch始终由当前绑定workspace实际symbolic HEAD解析，禁止模型指定分支、路径、argv或提交说明。preview不持久写snapshot；integrate重新捕获并比较digest，变化需重新preview。所有业务mutation带runtime生成的mutation ID；同ID只返回原提交结果，CAS和幂等映射不能由模型身份字段替代。五个工具每个operation均须有成功、缺字段、未知/跨operation字段、角色、状态、返回与错误矩阵测试。
 
-WorktreeManager owns Git lifecycle and ownership metadata. Child AgentLoop continues to own independent messages, Permission, budget, cancellation, Context and read cache. ToolContext owns immutable root/cwd identity. CLI owns manager lifetime and invokes cleanup without blocking existing Hook → Memory → Context → MCP cleanup. Provider remains unaware of Worktree. No worker mutates the parent ChatSession.
+工具内部锁负责同一 Team 的提交日志/revision修改；ToolScheduler 对混合写工具整体串行执行，来自pane的并发更新由store owner lock和事务提交序列化。所有写操作在Permission允许前零mutation；read/preview不生成持久化副作用。事务提交后投影失败按Mailbox恢复协议处理，不重新执行业务操作。
 
-## 完成定义
+## Worktree 与受控代码集成
 
-四个 Chapter 14 文档审核通过后，实施各 Phase。每 Phase compileall 与 targeted pytest 通过才可继续；最终 targeted regression、full pytest、静态边界审计、`git diff --check` 和 fake CLI/local Git acceptance 全部通过。未验证的安全能力按 fail-closed 处理并列为未完成，不以文档承诺替代测试证据。
+Team Member 默认且必须使用声明 `isolation: worktree` 的 Definition；`shared` Definition 不可用于可写 Team member，避免多个成员直接争用主工作区。member worktree 仍使用 Chapter14 root、owner marker、registration、锁和 dirty/ignored/ahead protect；child `run_command` 仍 fail closed，成员不能 `git add/commit/update-ref`。不能为了 Teams 放宽 Chapter14 child 权限。
+
+现有 Chapter14 不支持跨进程 lease 恢复或 Git 写集成。Chapter15 必须新增仅用于 Team 的 `resume_team_lease` 校验 API，核对 team/member owner marker、当前 user Team manifest、canonical workspace/common-dir、path、branch、HEAD、唯一 registration 与跨进程锁；这不是通用 Worktree recovery。修改后无法确认唯一 ownership 时不复用，保留文件并返回错误。
+
+### 固定基准、快照与单写者前提
+
+Member启动时持久保存经验证的基准commit `B`（Worktree创建时HEAD）。集成目标是当前绑定workspace实际 `symbolic-ref HEAD` 分支 `T`，集成前记录HEAD `M`；不硬编码main。detached HEAD、B不可读取、member HEAD不再等于B、B不是M的ancestor、目标registry/branch不明则拒绝。preview digest绑定B/T/M与来源快照；切换目标分支即使HEAD相同也要重新preview。集成变更始终相对B，不把当前目标文件当成member旧版本直接覆盖。
+
+集成前必须暂停所有member及Lead其它潜在写入者，取得唯一executor lease及worker barrier回执，验证对应generation的模型/工具/Hook/MCP调用实际退出、in-flight计数为0、无写句柄；当前负责集成的Manager控制调用不计入被暂停的成员调用。未返回的调用/失联pane/未知executor都拒绝。取消flag、idle标签或进程PID存在与否不足以证明静止。冻结期间禁止唤醒/新工具；同用户外部编辑器不受此屏障保护。
+
+Manager锁仅协调NewCode自身。用户通过现有CLI confirmer交互必须接受“目标workspace及成员目录在本次事务期间由NewCode单写，外部Git/编辑器停止写入”的前提，确认绑定integration ID/B/T/M/digest；可与Permission确认同次展示。Permission规则allow不等于这项确认，模型confirmation字段也不能替代；没有交互/有效用户确认返回 `team_single_writer_required`。此确认不产生Permission grant，后台成员不调用它。程序前后重复校验branch/HEAD、index tree/校验和、tracked内容摘要和untracked/ignored冲突集合；外部变化被检测即停止，未知已写结果进入outcome_unknown。没有跨Git/ref/index/文件系统整体原子性承诺，也不能声称这些复核阻止了所有外部竞争。
+
+冻结快照为 `B + path manifest + blobs`：收集B→index及index→working tree的tracked/staged/unstaged变化、非ignored新增和删除；以最终working-tree字节为集成结果，stage中间版本不单独提交但其hash计入来源验证。rename固定表示delete+add。支持普通文本及二进制regular file（最多1 MiB/文件、16 MiB/快照），删除记录存在性与B blob ID；超限、symlink/reparse、submodule、special、secret/runtime/`.git`路径、未知Git属性过滤器/外部diff/merge驱动全部拒绝。ignored文件不集成、不删除；任何与目标路径冲突的ignored内容拒绝。若只有index意图而最终树与B相同，则返回no_code_changes并保留原index，不把成员标integrated。双次扫描stat+hash与index验证稳定后，快照原子发布到受控integration根，记录digest、文件mode、B、member revision/generation及完整manifest；不能验证稳定就拒绝。之后只读冻结blobs，不再从可变source文件生成commit。
+
+### 集成阶段与目标同步
+
+`TeamIntegrationManager` 是唯一受控Git写能力，所有命令固定argv、explicit cwd、`shell=False`、有限超时、受控配置与环境；每次启动禁hooks、签名、外部driver/filters、remote访问，不使用模型命令/分支/提交说明。流程固定：
+
+1. **authorized/frozen：** Lead显式调用，Permission允许、单写者确认、B/T/M/owner/registration/静止证明/revision及preview digest全部匹配；目标tracked/staged/untracked必须clean，ignored保留且无碰撞。权限拒绝在任何Git mutation前返回。生成integration ID，绑定runtime team/member + scoped idempotency key + snapshot digest + B/T/M。将阶段记录持久化后才写Git。
+2. **source_committed：** 在Manager独占、禁hooks的临时source Worktree以B为基准应用冻结manifest（包含明确删除与二进制），固定literal pathspec `git add -A -- <validated paths>`并commit为 `S`，parent必须B、tree必须精确等于快照期望tree。受控commit标记含integration ID，提交元数据固定，不运行用户配置代码。绝不把快照文件直接复制到目标workspace。
+3. **merged：** 另一个临时integration Worktree从M创建，用固定 `git merge --no-ff --no-commit S` 做基于共同基准的三方集成；冲突仅留在临时目录并返回 `team_integration_conflict`，不覆盖目标。合并成功后受控commit得到 `I`，验证parent为M/S及预期tree。两成员同B时，第二次仍创建B→S2，再将S2与已含第一成员提交的最新M合并，保留不冲突成果；相同路径冲突必须交回Lead，不自动选边。
+4. **applying_target：** 重验真实静止和单写者条件，T仍指向M、目标index/worktree仍clean且hash一致；写入包含T/M/I/目标状态摘要的applying_target记录并持久化。随后**在目标workspace cwd**执行固定 `git merge --ff-only --no-edit I`，让Git同步更新目标分支、index和工作区；不使用单独 `update-ref` 冒充集成成功，不用force/reset/clean。Git失败/超时后只做只读核对，不能盲目重复或在目标执行abort/回滚。只有本次临时目录的merge状态可经验证后固定 `merge --abort`，abort失败也保留。
+5. **completed：** 验证实际T/HEAD=I、index tree=I tree、tracked工作区与I一致、无新untracked冲突、ignored未受损、registration仍匹配，再持久化completed及系统结果。source member转终态integrated，保留其B分支/Worktree/checkpoint且不可继续写旧base；继续工作必须新建member/worktree。返回 `verification=not_verified`：task completed/成功merge均不代表已运行测试。
+
+### 崩溃恢复与幂等
+
+每个integration阶段都保存到Team提交日志及可重建record；S/I还须有integration ID、expected parent/tree/digest的可验证证据，Git共享对象/临时refs可能在失败时保留，不删除分支。固定恢复表：
+
+| 最后持久阶段 | 恢复行为 |
+|---|---|
+| authorized/frozen，尚无目标写 | 校验冻结blob/lease，读取受控临时branch及commit标记识别已生成S；能证明归属和tree才续做，否则保留并失败；不因重试重复commit |
+| source_committed/merged | 按S/I的parent/tree/事务标记重用；重新取锁和Permission/单写者确认，重验M。M变化则team_target_changed，需重新preview及新事务，不沿用旧批准；冲突保持临时资源 |
+| applying_target | 在任何新Git写前只读核对：若T=I且index/worktree与I完全一致、归属与单写者事实可确认，则补completed；若T=M且原index/worktree摘要完全不变，标safe_not_applied，必须重新确认后显式续做；任何混合、外部变化、查询错误均outcome_unknown，禁止自动重试/回滚 |
+| completed | 相同幂等键只返回原结果，不再次写Git；同键异快照/参数冲突 |
+| conflict/outcome_unknown | 保留所有source/temporary/目标成果和阶段诊断，拒绝新的相关集成；需用户在本章外人工核对，不执行reset/clean/force/delete branch |
+
+每个阶段及Git调用前后注入崩溃/超时测试；stage record与Git更新不能假定是同一事务。检测到外部并发变化时不追写目标、不自动撤销用户改变。集成期间冻结member的恢复/停止必须解除事务占用后按状态操作，unknown时保留占用并禁止继续写。用户未确认或状态未知始终保留成果。
+
+## Coordinator 模式
+
+Coordinator 是 Team Lead 的权限收窄子模式。仅用户级 `coordinator.enabled=true` 与用户主动设置 `NEWCODE_TEAM_COORDINATOR=1` 同时满足时打开；project 不能设置开关。能力采用封闭allowlist：普通读取 `read_file/find_files/search_code` 加五个固定Team工具（仍按其operation/角色/mode/审批契约），以及CLI原有纯本地生命周期/状态命令。Team管理与受控集成是明确授权的委派能力，不是普通文件写入许可。其它工具默认不可见且executor拒绝：包括write_file/replace_in_file/run_command、ordinary agent、load_skill/Skill runner、全部MCP（含未知/自称只读）、Hook shell/HTTP和任何未列出的副作用入口。request-only prompt注入不能改变该allowlist。没有可验证受控能力时拒绝，不能恢复原始shell；所有允许能力仍与Plan/Do、Permission、Skill whitelist和父级限制取交集。
+
+Coordinator的直接能力集合与委派上限分开：member的P0取用户已授权Team委派范围、Definition及父级原有mode/Skill/Permission上限交集，启动即固定；不能把“Lead直接隐藏写工具”转换为任意委派权限，也不因该界面过滤将显式授权的Worktree文件委派抹除。member仍可在P0明确包含且独立Permission允许时写自己的Worktree；父mode/Skill/政策收窄持续发布Pt，计划批准不增加委派范围。禁shell/MCP/Hook副作用和嵌套Agent的隔离限制始终保留。coordinator不启动MCP discovery；角色进入前关闭旧副作用准入、重验排队Hook/旧工具调用并等待在途动作安全退出，无法证明静止则不宣告进入成功。
+
+## CLI 与生命周期
+
+- `/team lead` 进入无绑定 Team 的 Lead 模式；`team_manage.create` 成功后绑定当前 Team。`/team open <id>` 附着已存在且 workspace 匹配的 Team；`/team status` 仅显示安全状态；`/team close` 解除 Lead attachment 并停止/收尾本 CLI scope。命令注册为 Chapter10 静态命令，静态命令优先，不支持 overlay/custom command。
+- `/clear` 与 `/resume` 在旧主 session checkpoint 前将成员取消到安全点、写 member checkpoint、将可恢复 member 设为 idle/interrupted，关闭 Team runtime/通知 generation 并 detach Team；不删除 Team/task/mailbox/worktree，也不把旧通知注入新 session。用户需显式 `/team open` 重新 attach。
+- EOF、`/exit`、`/quit`、KeyboardInterrupt、正常退出、CLI 启动后异常均有限停止 Team workers/panes。team finalizer 使用总计 1 秒等待预算，failure-isolated，不阻塞现有 SubAgent → Hook → Memory → Context → Worktree → MCP 清理。无法停止的 pane 记录安全 `team_shutdown_timeout`、保持 lease/lock 标记为占用或 interrupted，不允许第二 worker 接管。
+- 关闭/重启只停止 runtime，不删持久 roster/task/message/session。活动成员先收到取消并尽力 checkpoint；如果 checkpoint 未完成则保留上个完整文件和 Worktree，状态 interrupted。成员在下一次 CLI session 经 workspace/owner/Permission 重校验后才可恢复。
+- 不对接 Chapter12 `subagent` Hook action；其 placeholder 继续返回 unavailable，零 Team 创建或调度。Team 生命周期不让 Hook action 递归启动 Agent。
+
+## 错误模型、非目标与验收
+
+安全错误码以工具契约表为完整operation错误集合，另含配置/生命周期错误 `team_config_invalid`、`team_path_invalid`、`team_store_unavailable`、`team_workspace_mismatch`、`team_limit_exceeded`、`team_worker_failed`、`team_shutdown_timeout`、`team_message_invalid`、`team_coordinator_unavailable`、`team_integration_failed`。Permission链复用 `permission_denied`，目标脏状态统一 `team_target_dirty`，不用main命名。UI/model/log 不暴露 secret、绝对用户路径、完整消息/工具输出、raw Git stderr、stack trace、IPC credential；诊断仅使用码与有限阶段标签。
+
+非目标：远程 Team/跨设备同步、团队市场/插件、跨机器 scheduler、Agent Teams 自我编排、Agent Teams 之间嵌套、Worktree 间任意 Git 操作、成员 shell/Git commit 能力、自动 merge/冲突解决、自动验证代码、团队记忆合并、MCP/Hook 权限旁路、Provider 改造、自动安装 tmux。
+
+验收标准：
+
+- AC1：Team ID/路径/workspace 绑定与私有 store 防止跨 workspace、reparse/symlink escape、损坏文件覆盖；多进程锁竞争安全失败。
+- AC2：user/project 配置合并和默认关闭符合权限单调收窄；coordinator仅双重授权且采用封闭能力集合，MCP/Hook shell/HTTP/ordinary agent/Skill runner未知入口不能旁路。
+- AC3：唯一入口newcode.teams.worker可实际模块自检；无副作用probe与有资源startup分离；真实tmux内层exec argv/特殊字符零注入、错误peer、重复执行者、启动失败清理均有证据。无tmux时pane unavailable/未验证，lightweight单独验收，不宣称两backend均通过。
+- AC4：任务状态、CAS、DAG、依赖门、删除限制并发测试通过。
+- AC5：可信系统协议不可由模型伪造；read不ack、他人/未有效checkpoint消息不可ack；事务/幂等/sequence/完整广播/投影/有效checkpoint/ack各步崩溃恢复不静默丢信、不重复业务变更；投递去重不声称LLM/外部工具exactly-once。
+- AC6：P0启动上限、Pt单调收窄及At业务审批分离；DO+awaiting_approval仅允许明确协调写入，PLAN不放宽。计划修改/失效、Do→Plan/Skill收窄后旧响应在executor前重验；批准不扩权；后台require_confirmation非交互拒绝且零执行，不继承Lead授权。
+- AC7：member final → checkpoint → idle → 消息唤醒/重启恢复；pairing、预算、scope 和权限重建正确。
+- AC8：五个固定工具每个operation的角色、字段/禁止字段、状态、读写、返回及错误矩阵全测；身份只runtime注入。原有执行链完整；Worktree成员MCP/Hook副作用无隔离证据时禁用，独立client不算隔离；普通SubAgent/会话无团队协作工具。
+- AC9：固定B→S与M→I三方集成，实际目标分支、冻结快照、静止证明及Permission/单写者确认完整；更新目标branch/index/worktree并复核。两成员同B、目标已有另一成员提交、删除/二进制/staged+unstaged、目标外部并发、每阶段崩溃/幂等/unknown本地测试通过；无reset/clean/force/delete branch，保留成果且不声称整体原子或已验证代码。
+- AC10：`/clear`、`/resume`、正常退出、异常、EOF、`/exit`、KeyboardInterrupt 清理有界且失败隔离。
+- AC11：Provider 不导入 Team；Hook subagent placeholder 无动作；MCP/Skill/Permission/Plan/Do/Context/Memory/Command 语义回归。
+- AC12：fake/local fixtures 的 Chapter 4–15 targeted、全量 pytest、compileall、diff check 和受控 CLI acceptance 全过；所有 skip 有原因。
+
+测试必须使用 fake Provider/backend、临时 home/workspace、临时本地 Git repo 和 fake/本地 IPC。不得访问远端、不 push、不使用生产 secret、第三方 MCP 或生产 hooks、不修改全局 Git 配置。真实 pane backend 未执行时 checklist 必须写“未验证”，不能由 fake tmux mock 代替。

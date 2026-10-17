@@ -30,9 +30,10 @@ class CommandRuntime:
     list_memory: Callable[[str], tuple[Any, ...]]
     permission_summary: Callable[[], str]
     status_summary: Callable[[], str]
+    team_command: Callable[[tuple[str, ...]], str] | None = None
 
 
-def create_builtin_registry() -> CommandRegistry:
+def create_builtin_registry(*, include_team: bool = False) -> CommandRegistry:
     """创建唯一的固定十项命令表；不读取配置或运行时输入。"""
 
     return CommandRegistry(
@@ -47,8 +48,26 @@ def create_builtin_registry() -> CommandRegistry:
             _definition("/permission", (), "查看当前权限安全摘要", "/permission", "", _permission),
             _definition("/status", (), "查看当前会话与服务安全状态", "/status", "", _status),
             _definition("/review", (), "以固定请求审查当前工作区变更", "/review", "", _review),
+            *((_definition("/team", (), "切换团队角色与本地 attachment", "/team lead|open <team-id>|status|close",
+                           "lead | open <team-id> | status | close", _team),) if include_team else ()),
         )
     )
+
+
+def _team(runtime: CommandRuntime, parsed: ParsedCommand, ui: UIControl) -> CommandOutcome:
+    args = parsed.arguments
+    if not args or not ((args[0] in {"lead", "status", "close"} and len(args) == 1)
+                        or (args[0] == "open" and len(args) == 2)):
+        return _invalid(ui, "/team lead|open <team-id>|status|close")
+    if runtime.team_command is None:
+        ui.error("team_coordinator_unavailable", "团队功能不可用。")
+        return _handled()
+    try:
+        ui.info(runtime.team_command(args))
+    except Exception:
+        # 不把存储路径、后台异常或模型参数原文交给终端。
+        ui.error("team_scope_invalid", "团队 attachment 操作未完成。")
+    return _handled()
 
 
 def _definition(

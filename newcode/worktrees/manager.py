@@ -70,9 +70,146 @@ class WorktreeManager:
         with self._lock:
             return tuple(self._leases[key] for key in sorted(self._leases))
 
+    def claim_team_member(self, store, scope, agent_slug: str) -> WorktreeLease:
+        """仅 Team 可信运行时可恢复；用户级绑定与 Git marker 双重证明归属。
+
+        调用者必须已持有成员 executor lease；此处再持有 Git task 活动锁，
+        跨进程接管不依赖 PID/mtime，也不删除任何未知资源。
+        """
+        from newcode.teams.types import MemberState, RecordChange, TeamError, TeamMemberRecord, new_id
+        validate_agent_slug(agent_slug)
+        with store.paths.guard(scope.team_id), store.lock(scope.team_id):
+            view, _, _ = store._recover_locked(scope.team_id)
+            value = view.get("members", {}).get(scope.member_id)
+            if value is None:
+                raise TeamError("team_member_not_found")
+            member = TeamMemberRecord.from_dict(value)
+            if member.state is MemberState.INTEGRATED or member.agent_name != agent_slug:
+                raise TeamError("team_worktree_owner_invalid")
+            repo = store.paths.workspace_root
+            common = self._git.common_git_dir(repo)
+            if self._git.repository_root(repo) != repo or common != store.paths.common_git_dir:
+                raise TeamError("team_worktree_owner_invalid")
+            task_id = "team-" + hashlib.sha256(f"{scope.team_id}:{scope.member_id}".encode()).hexdigest()[:32]
+            parts = (scope.team_id, "members", scope.member_id, "worktree.json")
+            binding_path = store.paths.checked(*parts, missing=True)
+            if member.worktree_relative is None:
+                if binding_path.exists():
+                    raise TeamError("team_worktree_owner_invalid")
+                lease = self.create(WorktreeRequest(repo, agent_slug, task_id))
+                binding = {"version": 1, "team_id": scope.team_id, "member_id": scope.member_id,
+                           "workspace": store.paths.workspace_fingerprint,
+                           "marker_digest": _team_marker_digest(lease)}
+                store.paths.mkdir(*parts[:-1])
+                store.atomic_write(parts, json.dumps(binding, sort_keys=True).encode(), replace=False)
+                member = replace(member, revision=member.revision + 1,
+                                 worktree_relative=f"{agent_slug}/{task_id}", base_commit=lease.base_commit)
+                manifest = view["team"][scope.team_id]
+                store._commit_locked(scope.team_id, manifest["revision"], new_id("mutation"),
+                                     (RecordChange("members", member.member_id, member.to_dict()),), None)
+            else:
+                binding = json.loads(store.read_bytes(parts, maximum=OWNER_MARKER_MAX_BYTES))
+                if (set(binding) != {"version", "team_id", "member_id", "workspace", "marker_digest"}
+                        or binding["version"] != 1 or binding["team_id"] != scope.team_id
+                        or binding["member_id"] != scope.member_id
+                        or binding["workspace"] != store.paths.workspace_fingerprint):
+                    raise TeamError("team_worktree_owner_invalid")
+                _validate_plain_directory(_metadata_root(common) / "owners", common)
+                _validate_plain_directory(_metadata_root(common) / "locks", common)
+                marker = _marker_file(_metadata_root(common), task_id)
+                lease = _lease_from_marker(marker, repo, common)
+                if (binding["marker_digest"] != _team_marker_digest(lease) or lease.task_id != task_id
+                        or lease.agent_slug != agent_slug or member.base_commit != lease.base_commit
+                        or member.worktree_relative != f"{agent_slug}/{task_id}"):
+                    raise TeamError("team_worktree_owner_invalid")
+                _validate_owned_worktree_path(lease)
+                if not self._verify_registration(lease):
+                    raise TeamError("team_worktree_owner_invalid")
+                lease = replace(lease, state=WorktreeState.READY)
+                with self._lock:
+                    if task_id in self._occupied:
+                        raise TeamError("team_member_busy")
+                    self._leases[task_id] = lease
+            # claim 取得跨进程活动锁；取得后重新检查所有可变注册信息。
+            running = self.claim(lease)
+            try:
+                _validate_owned_worktree_path(running)
+                if not self._verify_registration(running):
+                    raise TeamError("team_worktree_owner_invalid")
+                return running
+            except BaseException:
+                self.release(running, WorktreeState.FAILED)
+                raise
+
     def is_tracked_source_path(self, repository_root: Path, relative_path: str) -> bool:
         """固定只读 Git 查询：仅用于区分用户已授权的 tracked 输入文件。"""
         return self._git.is_tracked_path(Path(repository_root), relative_path)
+
+    def integration_resource(self, repository: Path, integration_id: str, kind: str,
+                             base: str, *, create: bool = False) -> WorktreeLease:
+        """仅 TeamIntegrationManager 持有 repo/native 锁时调用；不删除失败资源。"""
+        import re
+        if not re.fullmatch(r"integration-[0-9a-f]{32}", integration_id) or kind not in {"source", "merge"}:
+            raise WorktreeError(WorktreeErrorCode.OWNER_INVALID)
+        repo = Path(repository).resolve(strict=True)
+        common = self._git.common_git_dir(repo)
+        task_id = "i" + integration_id.removeprefix("integration-") + ("s" if kind == "source" else "m")
+        request = WorktreeRequest(repo, "integration", task_id)
+        expected_path = repo / ".newcode" / "worktrees" / "integration" / task_id
+        expected_branch = f"newcode/subagent/{task_id}"
+        marker = _marker_file(_metadata_root(common), task_id)
+        if marker.exists():
+            lease = _lease_from_marker(marker, repo, common)
+            if (lease.base_commit != base or lease.path != expected_path
+                    or lease.branch != expected_branch or lease.agent_slug != "integration"):
+                raise WorktreeError(WorktreeErrorCode.OWNER_INVALID)
+            _validate_owned_worktree_path(lease)
+            if not self._verify_registration(lease, expected_head=self._git.head(lease.path)):
+                raise WorktreeError(WorktreeErrorCode.REGISTRATION_INVALID)
+            return lease
+        if not create or expected_path.exists() or self._git.branch_exists(repo, expected_branch):
+            raise WorktreeError(WorktreeErrorCode.OWNER_INVALID)
+        return self._create_locked(request, repo, common, _metadata_root(common), base_commit=base, preserve_failure=True)
+
+    def integration_member(self, store, team_id, member):
+        """只读恢复 Team 归属证明；调用方另持真实 executor/task 锁。"""
+        task_id = "team-" + hashlib.sha256(f"{team_id}:{member.member_id}".encode()).hexdigest()[:32]
+        repo, common = store.paths.workspace_root, store.paths.common_git_dir
+        lease = _lease_from_marker(_marker_file(_metadata_root(common), task_id), repo, common)
+        binding = json.loads(store.read_bytes((team_id, "members", member.member_id, "worktree.json"), maximum=8192))
+        if (binding.get("team_id") != team_id or binding.get("member_id") != member.member_id
+                or binding.get("workspace") != store.paths.workspace_fingerprint
+                or binding.get("marker_digest") != _team_marker_digest(lease)
+                or member.base_commit != lease.base_commit or member.worktree_relative != f"{lease.agent_slug}/{task_id}"):
+            raise WorktreeError(WorktreeErrorCode.OWNER_INVALID)
+        _validate_owned_worktree_path(lease)
+        if not self._verify_registration(lease):
+            raise WorktreeError(WorktreeErrorCode.REGISTRATION_INVALID)
+        return lease
+
+    def verify_team_member(self, store, scope, lease: WorktreeLease) -> None:
+        """同一 runtime 的下一次激活也复验；已有活动锁不能被当作静态身份替代。"""
+        from newcode.teams.types import MemberState, TeamError
+        with store.paths.guard(scope.team_id), store.lock(scope.team_id), self._lock:
+            view, _, _ = store._recover_locked(scope.team_id)
+            member = view.get("members", {}).get(scope.member_id)
+            if (member is None or member["state"] == MemberState.INTEGRATED.value
+                    or member.get("runtime_generation") != scope.generation
+                    or member["base_commit"] != lease.base_commit
+                    or member["worktree_relative"] != f"{lease.agent_slug}/{lease.task_id}"
+                    or self._leases.get(lease.task_id) != lease or lease.task_id not in self._active_locks):
+                raise TeamError("team_worktree_owner_invalid")
+            parts = (scope.team_id, "members", scope.member_id, "worktree.json")
+            binding = json.loads(store.read_bytes(parts, maximum=OWNER_MARKER_MAX_BYTES))
+            if (binding.get("team_id") != scope.team_id or binding.get("member_id") != scope.member_id
+                    or binding.get("workspace") != store.paths.workspace_fingerprint
+                    or binding.get("marker_digest") != _team_marker_digest(lease)
+                    or self._git.repository_root(store.paths.workspace_root) != lease.repository_root
+                    or self._git.common_git_dir(store.paths.workspace_root) != lease.common_git_dir):
+                raise TeamError("team_worktree_owner_invalid")
+            _validate_owned_worktree_path(lease)
+            if not self._verify_registration(lease):
+                raise TeamError("team_worktree_owner_invalid")
 
     def is_ignored_source_path(self, repository_root: Path, relative_path: str) -> bool:
         """固定只读 Git 查询：仅用于区分用户已授权的 ignored 输入文件。"""
@@ -263,8 +400,11 @@ class WorktreeManager:
         repository_root: Path,
         common_dir: Path,
         metadata_root: Path,
+        *, base_commit: str | None = None, preserve_failure: bool = False,
     ) -> WorktreeLease:
-        head = self._git.head(repository_root)
+        head = base_commit or self._git.head(repository_root)
+        if base_commit is not None:
+            self._git.integration_tree(repository_root, head)
         branch = f"newcode/subagent/{request.task_id}"
         # Directory builder validates the manager-owned slug/task path before any worktree write.
         generated = build_worktree_path(repository_root, request.agent_slug, request.task_id)
@@ -306,7 +446,7 @@ class WorktreeManager:
             return ready
         except Exception as exc:
             rolled_back = False
-            if marker_created or add_attempted:
+            if not preserve_failure and (marker_created or add_attempted):
                 rolled_back = self._rollback_failed_create(lease, marker, marker_created)
             with self._lock:
                 if rolled_back:
@@ -319,7 +459,7 @@ class WorktreeManager:
                 raise
             raise WorktreeError(WorktreeErrorCode.GIT_FAILED) from exc
 
-    def _verify_registration(self, lease: WorktreeLease) -> bool:
+    def _verify_registration(self, lease: WorktreeLease, *, expected_head: str | None = None) -> bool:
         marker = _marker_file(_metadata_root(lease.common_git_dir), lease.task_id)
         if not _marker_matches(marker, lease):
             return False
@@ -329,6 +469,8 @@ class WorktreeManager:
             return False
         fields = _record_fields(matching[0])
         if fields.get("branch") != f"refs/heads/{lease.branch}":
+            return False
+        if fields.get("HEAD") != (expected_head or lease.base_commit):
             return False
         branch_matches = sum(
             1 for record in records
@@ -342,7 +484,7 @@ class WorktreeManager:
             return False
         if self._git.current_branch(lease.path) != lease.branch:
             return False
-        if self._git.head(lease.path) != lease.base_commit:
+        if self._git.head(lease.path) != (expected_head or lease.base_commit):
             return False
         return True
 
@@ -525,6 +667,12 @@ def _marker_document(lease: WorktreeLease) -> dict[str, object]:
         "worktree_path": str(lease.path),
         "base_commit": lease.base_commit,
     }
+
+
+def _team_marker_digest(lease: WorktreeLease) -> str:
+    """Team 只持久化绑定摘要；不复制 Chapter14 marker 中的 PID/owner token。"""
+    raw = json.dumps(_marker_document(lease), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _write_owner_marker(path: Path, document: dict[str, object]) -> None:
